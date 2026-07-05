@@ -1,0 +1,35 @@
+[project]
+name = "binance-trading-skill-system"
+version = "5.0.0"
+description = "V5 PDF-distilled Binance Futures trading system"
+requires-python = ">=3.11"
+dependencies = [
+    "certifi>=2025.0.0",
+    "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.5.0",
+    "types-requests>=2.32.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+ignore_missing_imports = true
+packages = ["trading_system"]

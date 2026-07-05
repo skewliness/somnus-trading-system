@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.somnus.kline-cache-maintenance</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/ma7/binance-trading-skill-system/scripts/macos_run_somnus_service.sh</string>
+		<string>kline-cache-maintenance</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/ma7/binance-trading-skill-system</string>
+	<key>StandardOutPath</key>
+	<string>/Users/ma7/binance-trading-skill-system/data/trading_system/logs/launchd/kline-cache-maintenance.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ma7/binance-trading-skill-system/data/trading_system/logs/launchd/kline-cache-maintenance.err.log</string>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StartInterval</key>
+	<integer>86400</integer>
+	<key>UserName</key>
+	<string>ma7</string>
+	<key>GroupName</key>
+	<string>staff</string>
+</dict>
+</plist>

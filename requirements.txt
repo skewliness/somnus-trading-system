@@ -1,0 +1,4 @@
+certifi>=2025.0.0
+requests>=2.32.0
+pytest>=8.0.0
+python-socks
