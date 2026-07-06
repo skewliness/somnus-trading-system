@@ -1,0 +1,4 @@
+group,n,tp2_sl2_win_pct,tp3_sl3_win_pct,tp6_sl3_win_pct,final_24h_positive_pct,avg_final_24h_pct,final_48h_positive_pct,avg_final_48h_pct,avg_mfe_48h_pct,avg_mae_48h_pct
+overall,2744,35.9,40.52,28.75,56.63,0.6121,62.57,1.3498,4.7519,-3.4357
+open_long,1838,48.75,54.41,39.88,69.48,1.8211,85.47,3.8487,6.006,-2.221
+open_short,906,9.82,12.36,6.18,30.57,-1.8407,16.11,-3.7196,2.2077,-5.9

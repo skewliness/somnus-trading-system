@@ -10,6 +10,7 @@ The main questions:
 2. How should Gann be integrated without becoming an unsafe hard execution gate?
 3. Why do close/flatten operations sometimes leave tiny residual balances or split into many small reduce-only closes?
 4. What refactor should separate signal, macro factor, sizing, execution, ledger reconciliation, and Telegram reporting more cleanly?
+5. Is V6 currently over-gated by serial thresholds across model probability, symbol profile, 15M/4H BB/MA, Fib, Gann, and macro direction?
 
 ## Current Code Entry Points
 
@@ -50,6 +51,45 @@ Gann currently belongs in the macro/sizing layer, not as a direct hard gate.
   - `transition_notional_multiplier(...)`
 
 This is the current mechanism for converting selected over-gated blocks into reduced-size probes. It is disabled by default.
+
+## Validation Seed Data Included in This PR
+
+Small, sanitized summary files are included under:
+
+`reports/fable5_validation_data/`
+
+These files are provided so Fable5 can quickly inspect the prior evidence before
+rerunning the tests. They are not raw training data, raw smart-signal payloads,
+private API responses, or full signal-history exports.
+
+| File | Review dimension |
+|---|---|
+| `v6_gann_ab_table.csv` | V6 baseline vs V6 + Gann A/B |
+| `gann_zone_stratification_multi_summary.csv` | Gann zone outcomes across ETH/SOL/BNB/HYPE/ZEC |
+| `v6_model_threshold_block_action_summary.csv` | model probability / threshold blocked candidates by action |
+| `v6_model_threshold_block_symbol_top.csv` | model probability / threshold blocked candidates by symbol-action |
+| `v6_current_strategy_gate_summary.csv` | current gate coverage and top rejection reasons |
+| `hype_profile_blocked_level_summary_top.csv` | symbol profile blocked-level outcomes for HYPE |
+| `fib_confluence_top_summary.csv` | prior Fib + MA/BB confluence summaries |
+
+Use these files to review:
+
+- model-probability thresholds
+- symbol profile allowed/blocked levels
+- 15M and 4H BB/MA entry structures
+- Fib confluence
+- Gann macro zone
+- macro direction mismatch or neutrality
+
+If you disagree with the current transition-gate design, return a code
+refactor. Do not respond only with prose. The expected direction is to replace
+unnecessary serial hard gates with layered risk handling:
+
+- true hard-risk gate
+- soft score penalty
+- reduced-size probe
+- position-size modifier
+- watchlist-only state
 
 ## Existing V6 + Gann A/B Table
 

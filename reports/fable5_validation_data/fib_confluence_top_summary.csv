@@ -1,0 +1,9 @@
+symbol,side,horizon,best_combo,fib_level,n,win_rate_pct,avg_return_pct,avg_mfe_pct,avg_mae_pct,source_note
+BTCUSDT,long,48h,fib_strong_ma_bb_btc_eth_confirm,Fib0.236,58,70.7,1.37,3.22,-1.36,prior 4H Fib+MA/BB BTC/ETH study
+BTCUSDT,short,48h,fib_ma_bb,Fib0.618,13,84.6,2.48,5.15,-1.78,prior 4H Fib+MA/BB BTC/ETH study
+ETHUSDT,long,48h,fib_strong_ma_bb_btc_eth_confirm,Fib0.5,23,73.9,3.50,6.16,-1.81,prior 4H Fib+MA/BB BTC/ETH study
+ETHUSDT,short,48h,fib_ma_bb_btc_eth_confirm,Fib0.382,18,94.4,2.24,5.96,-2.10,prior 4H Fib+MA/BB BTC/ETH study
+BNBUSDT,long,48h,fib_ma_bb,Fib0.382,51,64.7,1.49,2.79,-1.48,prior 4H Fib+MA/BB BNB/ZEC study
+BNBUSDT,short,48h,fib_ma_bb_btc_eth_confirm,Fib0.382,32,68.8,0.72,2.81,-1.65,prior 4H Fib+MA/BB BNB/ZEC study
+ZECUSDT,long,48h,fib_strong_ma_bb_btc_eth_confirm,Fib0.886,19,89.5,7.90,10.84,-2.36,prior 4H Fib+MA/BB BNB/ZEC study
+ZECUSDT,short,48h,fib_ma_bb,Fib0.382,17,82.4,4.58,19.91,-6.06,prior 4H Fib+MA/BB BNB/ZEC study

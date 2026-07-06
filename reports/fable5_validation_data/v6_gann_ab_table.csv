@@ -1,0 +1,5 @@
+version,total_return_pct,max_drawdown_pct,profit_factor,win_rate_pct,avg_return_pct,worst_trade_pct,trade_count,skipped_full,skipped_same_symbol,final_equity,candidate_count
+V6 baseline,0.550312,-0.6,1.906694,50.0,1.393139,-3.0,2,0,12,1.00550312,14
+V6 + Gann low_weight_scoring,0.550312,-0.6,1.906694,50.0,1.393139,-3.0,2,0,12,1.00550312,14
+V6 + Gann position_sizing,0.83789,-0.6,2.376571,50.0,1.393139,-3.0,2,0,12,1.0083789,14
+V6 + Gann hard_filter,1.157256,0.0,999.0,100.0,5.786279,5.786279,1,0,1,1.01157256,2

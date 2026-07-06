@@ -1,0 +1,17 @@
+action,level,strict_block_count,valid_n,win_rate_pct,avg_ret_pct,median_ret_pct,avg_8x_pct,avg_mfe_pct,avg_mfe_8x_pct,avg_mae_pct,stop_rate_pct,partial_avg,top_exit_reasons
+ALL,ALL,162,215,7.4419,-2.314723,-3.0,-18.517788,2.171153,17.369227,-3.219177,93.9535,0.3488,protective_stop_loss_touched:202
+open_short,ma20_15m,24,24,0.0,-2.349263,-2.912621,-18.794106,3.362251,26.898005,-3.049641,100.0,0.4167,protective_stop_loss_touched:24
+open_long,ma7_15m,22,29,6.8966,-2.398589,-3.0,-19.188714,1.179032,9.43226,-3.207102,89.6552,0.3103,protective_stop_loss_touched:26
+open_long,bb1920_mid_15m,13,16,31.25,-1.855971,-3.0,-14.847769,2.19831,17.586477,-3.222617,100.0,0.625,protective_stop_loss_touched:16
+open_short,ma7_15m,12,18,5.5556,-2.309674,-2.912621,-18.477389,2.535374,20.28299,-2.949632,88.8889,0.3333,protective_stop_loss_touched:16
+open_long,ma20_15m,9,9,33.3333,-0.530598,-3.0,-4.244786,2.652033,21.216266,-2.622819,66.6667,1,protective_stop_loss_touched:6
+open_long,bb96_mid_15m,8,14,0.0,-3.0,-3.0,-24.0,0.906462,7.251696,-4.010668,100.0,0,protective_stop_loss_touched:14
+open_short,ma60_15m,8,10,0.0,-2.912621,-2.912621,-23.300971,2.773688,22.189504,-3.533168,100.0,0,protective_stop_loss_touched:10
+open_long,bb96_upper_15m,7,7,14.2857,-1.562691,-0.898502,-12.501529,3.223988,25.791902,-3.289424,100.0,0.7143,protective_stop_loss_touched:7
+open_long,bb105_mid_15m,6,10,0.0,-3.0,-3.0,-24.0,1.075999,8.607994,-3.347923,100.0,0,protective_stop_loss_touched:10
+open_long,bb2880_mid_15m,6,12,0.0,-2.827237,-3.0,-22.617896,1.626388,13.011106,-3.25299,100.0,0.0833,protective_stop_loss_touched:12
+open_short,bb300_mid_15m,5,8,0.0,-1.417853,-1.784158,-11.342821,3.595761,28.766087,-2.797748,87.5,1,protective_stop_loss_touched:7
+open_long,bb120_mid_15m,5,7,0.0,-3.0,-3.0,-24.0,0.960763,7.686101,-3.305899,100.0,0,protective_stop_loss_touched:7
+open_short,bb96_lower_15m,5,5,0.0,-2.912621,-2.912621,-23.300971,2.512803,20.102423,-3.207764,100.0,0,protective_stop_loss_touched:5
+open_long,bb210_mid_15m,4,5,0.0,-2.863063,-3.0,-22.904504,1.162087,9.296699,-3.05958,80.0,0.2,protective_stop_loss_touched:4
+open_long,bb672_mid_15m,3,3,100.0,5.53408,5.560838,44.272642,6.791455,54.331639,-0.092132,0.0,4,bb120_mid_4h_bb210_mid_4h_bb1440_upper_4h:3

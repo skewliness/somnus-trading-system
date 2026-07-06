@@ -1,0 +1,12 @@
+symbol_action,n,tp3_sl3_win_pct,final_48h_positive_pct,avg_final_48h_pct,avg_mfe_48h_pct,avg_mae_48h_pct
+HYPEUSDT_open_long,557,50.45,81.69,3.8538,6.5294,-2.8817
+SOLUSDT_open_long,529,61.81,94.71,4.3973,6.2367,-1.6023
+SOLUSDT_open_short,408,0.25,5.64,-4.6551,1.5095,-6.2981
+ZECUSDT_open_long,353,52.41,92.92,5.2727,7.8829,-2.787
+HYPEUSDT_open_short,320,31.25,29.69,-2.4746,3.2763,-5.3178
+ETHUSDT_open_long,225,64.44,75.56,2.4977,4.1083,-1.3235
+ZECUSDT_open_short,142,5.63,4.93,-4.7782,2.1867,-7.2938
+BTCUSDT_open_long,112,45.54,71.43,1.1533,2.5301,-1.9079
+BNBUSDT_open_long,62,17.74,59.68,0.785,1.8162,-2.1657
+ETHUSDT_open_short,33,0.0,54.55,-0.1307,0.3813,-1.1356
+BNBUSDT_open_short,3,100.0,100.0,1.3443,4.2721,-0.2835
