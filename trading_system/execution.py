@@ -12,7 +12,10 @@ from pathlib import Path
 from trading_system.config import StrategyConfig
 from trading_system.models import MarketSnapshot, Position, TradePlan
 from trading_system.persistence import atomic_write_state, load_state
-from trading_system.smart_money_panel import get_smart_money_panel_payload
+try:
+    from trading_system.smart_money_panel import get_smart_money_panel_payload
+except ModuleNotFoundError:
+    from trading_system.optional_integrations import get_smart_money_panel_payload
 from trading_system.panel_blend import blend_panel_score
 from trading_system.coin_scout_model import CoinFeatures, FeatureEngine
 

@@ -10,6 +10,12 @@ from trading_system.config import StrategyConfig
 from trading_system.logging_config import configure_logging
 
 
+def _print_optional_command_unavailable(command: str, module_name: str) -> None:
+    from trading_system.optional_integrations import optional_command_unavailable
+
+    print(json.dumps(optional_command_unavailable(command, module_name), ensure_ascii=False, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Meme/AI Binance trading system")
     parser.add_argument(
@@ -307,7 +313,11 @@ def main() -> None:
         return
 
     if args.command == "smart-money-panel":
-        from trading_system.smart_money_panel import serve_smart_money_panel
+        try:
+            from trading_system.smart_money_panel import serve_smart_money_panel
+        except ModuleNotFoundError:
+            _print_optional_command_unavailable(args.command, "trading_system.smart_money_panel")
+            return
 
         print(json.dumps({"status": "starting", "url": f"http://{args.host}:{args.port}"}, ensure_ascii=False))
         serve_smart_money_panel(host=args.host, port=args.port)
@@ -315,7 +325,11 @@ def main() -> None:
 
     if args.command == "train-coin-scout":
         # Default: use 4H klines labeler (recommended)
-        from trading_system.coin_scout_4h_labeler import build_and_train_4h
+        try:
+            from trading_system.coin_scout_4h_labeler import build_and_train_4h
+        except ModuleNotFoundError:
+            _print_optional_command_unavailable(args.command, "trading_system.coin_scout_4h_labeler")
+            return
 
         ds_path = args.input_file or "data/trading_system/model_training/paper_replay_autolearn/paper_decision_samples.jsonl"
         model_dir = args.output_dir or "data/trading_system/model_training/coin_scout"
@@ -328,7 +342,11 @@ def main() -> None:
         return
 
     if args.command == "train-coin-scout-4h":
-        from trading_system.coin_scout_4h_labeler import build_and_train_4h
+        try:
+            from trading_system.coin_scout_4h_labeler import build_and_train_4h
+        except ModuleNotFoundError:
+            _print_optional_command_unavailable(args.command, "trading_system.coin_scout_4h_labeler")
+            return
 
         ds_path = args.input_file or "data/trading_system/model_training/paper_replay_autolearn/paper_decision_samples.jsonl"
         model_dir = args.output_dir or "data/trading_system/model_training/coin_scout"
@@ -342,13 +360,21 @@ def main() -> None:
         return
 
     if args.command == "distill-lanaai-square":
-        from trading_system.lanaai_square_distiller import run_distill_once, print_result
+        try:
+            from trading_system.lanaai_square_distiller import run_distill_once, print_result
+        except ModuleNotFoundError:
+            _print_optional_command_unavailable(args.command, "trading_system.lanaai_square_distiller")
+            return
         result = run_distill_once(dry_run=False)
         print_result(result)
         return
 
     if args.command == "whale-scout-scan":
-        from trading_system.whale_scout_scan import run_whale_scout_scan, print_results
+        try:
+            from trading_system.whale_scout_scan import run_whale_scout_scan, print_results
+        except ModuleNotFoundError:
+            _print_optional_command_unavailable(args.command, "trading_system.whale_scout_scan")
+            return
 
         result = run_whale_scout_scan(
             model_dir=args.output_dir or "data/trading_system/model_training/whale_scout",
@@ -362,7 +388,11 @@ def main() -> None:
         return
 
     if args.command == "train-whale-scout":
-        from trading_system.train_from_matched import main as train_main
+        try:
+            from trading_system.train_from_matched import main as train_main
+        except ModuleNotFoundError:
+            _print_optional_command_unavailable(args.command, "trading_system.train_from_matched")
+            return
         train_main()
         return
 

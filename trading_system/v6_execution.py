@@ -30,6 +30,7 @@ from trading_system.binance_public_guard import (
     throttle_binance_public_request,
 )
 from trading_system.coin_scout_model import CoinFeatures
+from trading_system.gate_registry import GateEventRecorder
 from trading_system.h4_structure import compute_h4_structure
 from trading_system.persistence import append_text_line, atomic_write_json, load_json, timed_file_lock
 from trading_system.redaction import redact_sensitive_text
@@ -2411,6 +2412,7 @@ class V6ExecutionEngine:
         self._v5_sentiment_metadata_cache: dict[str, dict[str, Any]] | None = None
         self._v5_momentum_panel_cache: dict[str, dict[str, dict[str, Any]]] | None = None
         self._smart_signal_cache: dict[str, dict[str, Any]] | None = None
+        self.gate_recorder = GateEventRecorder.from_env()
 
     def close(self) -> None:
         self.client.close()
@@ -6782,14 +6784,14 @@ class V6ExecutionEngine:
         candidates.sort(key=lambda item: (float(item.get("abs_distance_pct") or 0.0), int(item.get("period") or 0)))
         return candidates[0]
 
-    @staticmethod
-    def apply_entry_structure_block(signal: V6Signal, block: dict[str, Any]) -> None:
+    def apply_entry_structure_block(self, signal: V6Signal, block: dict[str, Any]) -> None:
         levels = signal.levels if isinstance(signal.levels, dict) else {}
         levels["entry_structure_filter"] = dict(block)
         signal.levels = levels
         message = str(block.get("message") or block.get("reason") or "entry blocked by structure filter")
         if message and message not in signal.reasons:
             signal.reasons.append(message)
+        self.gate_recorder.record_entry_block(signal, block)
 
     def open_intent(self, signal: V6Signal, action: str) -> V6OrderIntent:
         side = "SELL" if action == "open_short" else "BUY"

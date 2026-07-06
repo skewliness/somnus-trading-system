@@ -21,7 +21,10 @@ if str(ROOT) not in sys.path:
 
 from playwright.sync_api import sync_playwright
 
-from trading_system.coin_scout_4h_labeler import CoinScout4HLabeler, INTERVAL_MS
+try:
+    from trading_system.coin_scout_4h_labeler import CoinScout4HLabeler, INTERVAL_MS
+except ModuleNotFoundError:
+    from trading_system.optional_integrations import CoinScout4HLabeler, INTERVAL_MS
 
 
 ASSET_DIR = ROOT / "data/trading_system/telegram_monitor/assets"

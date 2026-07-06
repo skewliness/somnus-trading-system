@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import scripts.telegram_monitor_v5_v6 as tg
 from scripts.telegram_monitor_v5_v6 import (
@@ -224,3 +225,67 @@ def test_fetch_command_klines_refreshes_api_instead_of_command_cache(monkeypatch
 
     assert rows == fresh_rows
     assert calls and calls[0]["force_refresh"] is True
+
+
+class FakeTelegramClient:
+    chat_id = "100"
+
+    def __init__(self, updates):
+        self.updates = updates
+        self.sent: list[tuple[str, object]] = []
+
+    def username(self):
+        return "maomao_bot"
+
+    def get_updates(self, offset=None):
+        return self.updates
+
+    def send(self, text, chat_id=None):
+        self.sent.append((text, chat_id))
+
+
+def test_execution_only_v5_v6_bot_ignores_unmentioned_manual_commands() -> None:
+    client = FakeTelegramClient(
+        [
+            {
+                "update_id": 1,
+                "message": {"chat": {"id": 100}, "text": "p"},
+            }
+        ]
+    )
+    args = SimpleNamespace(
+        disable_commands=False,
+        dry_run=False,
+        require_command_mention=True,
+        execution_only_commands=True,
+        scope="v6",
+        disable_intel_commands=False,
+    )
+    state = {"telegram_update_offset": 1}
+
+    assert tg.handle_telegram_commands(args, client, state) == 0
+    assert client.sent == []
+
+
+def test_execution_only_v5_v6_bot_hands_mentioned_manual_commands_to_xuejian() -> None:
+    client = FakeTelegramClient(
+        [
+            {
+                "update_id": 1,
+                "message": {"chat": {"id": 100}, "text": "@maomao_bot p"},
+            }
+        ]
+    )
+    args = SimpleNamespace(
+        disable_commands=False,
+        dry_run=False,
+        require_command_mention=True,
+        execution_only_commands=True,
+        scope="v6",
+        disable_intel_commands=False,
+    )
+    state = {"telegram_update_offset": 1}
+
+    assert tg.handle_telegram_commands(args, client, state) == 1
+    assert len(client.sent) == 1
+    assert "V5/V6" in client.sent[0][0]

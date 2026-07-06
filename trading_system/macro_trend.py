@@ -246,6 +246,7 @@ def _btc_hourly_ma_signal(client: BinanceFuturesClient) -> dict[str, float | boo
     ma210_24h_ago = _mean(closes[-234:-24]) if len(closes) >= 234 else ma210
     ma672_24h_ago = _mean(closes[-696:-24]) if len(closes) >= 696 else ma672
     return {
+        "sample_count": len(closes),
         "ma210": round(ma210, 2),
         "ma672": round(ma672, 2),
         "distance_ma210_pct": round(_pct(price, ma210), 4),
@@ -258,6 +259,8 @@ def _btc_hourly_ma_signal(client: BinanceFuturesClient) -> dict[str, float | boo
 
 def _btc_only_macro_direction(btc_daily_trend: str, btc_hourly: dict) -> tuple[str, str]:
     """BTC is the sole directional indicator for macro judgment."""
+    if int(btc_hourly.get("sample_count") or 0) < 210 and btc_daily_trend in {"bullish", "bearish"}:
+        return btc_daily_trend, "high"
     bullish_count = 0
     if btc_daily_trend == "bullish":
         bullish_count += 2

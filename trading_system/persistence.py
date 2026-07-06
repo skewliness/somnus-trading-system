@@ -1,16 +1,33 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-import fcntl
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Iterator
 
+try:
+    import fcntl
+except ModuleNotFoundError:  # pragma: no cover - exercised on Windows test hosts
+    fcntl = None  # type: ignore[assignment]
+
 
 STATE_SCHEMA_VERSION = 1
+_LOCAL_LOCKS: dict[str, threading.RLock] = {}
+_LOCAL_LOCKS_GUARD = threading.Lock()
+
+
+def _local_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _LOCAL_LOCKS_GUARD:
+        lock = _LOCAL_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCAL_LOCKS[key] = lock
+        return lock
 
 
 def _lock_path(path: Path) -> Path:
@@ -21,6 +38,10 @@ def _lock_path(path: Path) -> Path:
 def file_lock(path: Path) -> Iterator[None]:
     lock_path = _lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        with _local_lock(lock_path):
+            yield
+        return
     with lock_path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -39,6 +60,19 @@ def timed_file_lock(
     lock_path = _lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    if fcntl is None:
+        lock = _local_lock(lock_path)
+        while True:
+            if lock.acquire(blocking=False):
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for lock {lock_path}")
+            time.sleep(max(0.01, float(poll_seconds)))
+        try:
+            yield
+        finally:
+            lock.release()
+        return
     with lock_path.open("a+", encoding="utf-8") as handle:
         while True:
             try:

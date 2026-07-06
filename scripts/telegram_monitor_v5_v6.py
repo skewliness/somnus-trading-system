@@ -34,7 +34,10 @@ from trading_system.binance_public_guard import (
     note_binance_public_response,
     throttle_binance_public_request,
 )
-from trading_system.coin_scout_4h_labeler import CoinScout4HLabeler, INTERVAL_MS
+try:
+    from trading_system.coin_scout_4h_labeler import CoinScout4HLabeler, INTERVAL_MS
+except ModuleNotFoundError:
+    from trading_system.optional_integrations import CoinScout4HLabeler, INTERVAL_MS
 from trading_system.config import StrategyConfig
 from trading_system.v6_execution import V6BinanceClient, V6ExecutionConfig, V6ExecutionEngine, canonical_order_mode
 
@@ -118,6 +121,13 @@ def _build_url_opener() -> urllib.request.OpenerDirector:
 
 
 URL_OPENER = _build_url_opener()
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def open_url(request: str | urllib.request.Request, *, timeout: float):
@@ -5057,6 +5067,21 @@ def build_command_response(text: str) -> str:
     return "\n".join(lines)
 
 
+def is_manual_command_text(text: str) -> bool:
+    clean = strip_bot_mentions(str(text or ""))
+    if not clean:
+        return False
+    if parse_position_command_text(clean) is not None:
+        return True
+    if parse_news_command_text(clean):
+        return True
+    if parse_report_command_text(clean) is not None:
+        return True
+    if parse_chart_command_text(clean) is not None:
+        return True
+    return parse_command_text(clean) is not None
+
+
 def handle_telegram_commands(args: argparse.Namespace, client: TelegramClient, state: dict[str, Any]) -> int:
     if args.disable_commands:
         return 0
@@ -5092,6 +5117,13 @@ def handle_telegram_commands(args: argparse.Namespace, client: TelegramClient, s
         mentions_any_bot = text_mentions_any_bot(text)
         mentioned_command_text = strip_bot_mentions(text) if mentions_current_bot else ""
         original_command_text = strip_bot_mentions(text) if mentions_current_bot else text
+
+        if getattr(args, "execution_only_commands", True):
+            command_text = mentioned_command_text if mentions_current_bot else original_command_text
+            if mentions_current_bot and is_manual_command_text(command_text):
+                client.send(command_help(), chat_id=chat_id)
+                sent += 1
+            continue
 
         position_text = mentioned_command_text if mentions_current_bot else ""
         position_target = parse_position_command_text(position_text)
@@ -5614,6 +5646,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Disable manual Telegram command responses while keeping scheduled alerts/activity broadcasts.",
     )
     parser.add_argument(
+        "--execution-only-commands",
+        action="store_true",
+        default=env_flag("TS_TELEGRAM_MONITOR_EXECUTION_ONLY_COMMANDS", True),
+        help="Keep V5/V6 bots execution-only; manual p/fc/report/news commands are handed off to Xuejian.",
+    )
+    parser.add_argument(
+        "--enable-manual-commands",
+        dest="execution_only_commands",
+        action="store_false",
+        help="Allow this bot to answer manual p/fc/report/news commands again.",
+    )
+    parser.add_argument(
         "--disable-intel-commands",
         action="store_true",
         default=str(os.getenv("TS_TELEGRAM_MONITOR_DISABLE_INTEL_COMMANDS", "")).lower() in {"1", "true", "yes", "on"},
@@ -5676,6 +5720,9 @@ def main(argv: list[str]) -> int:
 
     if args.simulate_command:
         if args.disable_commands:
+            return 0
+        if getattr(args, "execution_only_commands", True) and is_manual_command_text(args.simulate_command):
+            client.send(command_help())
             return 0
         if parse_news_command_text(args.simulate_command):
             if args.disable_intel_commands:
