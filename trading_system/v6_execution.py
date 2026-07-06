@@ -30,6 +30,11 @@ from trading_system.binance_public_guard import (
     throttle_binance_public_request,
 )
 from trading_system.coin_scout_model import CoinFeatures
+from trading_system.close_resolver import (
+    CloseQuantityDecision,
+    coalesce_close_intents,
+    resolve_close_quantity as resolve_close_quantity_decision,
+)
 from trading_system.gate_registry import GateEventRecorder
 from trading_system.gann_feature import gann_position_multiplier
 from trading_system.h4_structure import compute_h4_structure
@@ -469,6 +474,8 @@ class V6ExecutionConfig:
     fib_structure_confirmation_near_pct: float = 1.0
     fib_structure_confirmation_lookback_4h: int = 2190
     transition_gate_policy_enabled: bool = False
+    close_resolver_enabled: bool = False
+    close_intent_coalescing_enabled: bool = False
     transition_gate_min_notional_usdt: float = 5.0
     gann_position_sizing_enabled: bool = False
     entry_confluence_hold_enabled: bool = True
@@ -681,6 +688,8 @@ class V6ExecutionConfig:
             fib_structure_confirmation_near_pct=_env_float("TS_V6_FIB_STRUCTURE_CONFIRMATION_NEAR_PCT", 1.0),
             fib_structure_confirmation_lookback_4h=_env_int("TS_V6_FIB_STRUCTURE_CONFIRMATION_LOOKBACK_4H", 2190),
             transition_gate_policy_enabled=_env_bool("TS_V6_TRANSITION_GATE_POLICY_ENABLED", False),
+            close_resolver_enabled=_env_bool("TS_V6_CLOSE_RESOLVER_ENABLED", False),
+            close_intent_coalescing_enabled=_env_bool("TS_V6_CLOSE_COALESCE_ENABLED", False),
             transition_gate_min_notional_usdt=_env_float("TS_V6_TRANSITION_GATE_MIN_NOTIONAL_USDT", 5.0),
             gann_position_sizing_enabled=_env_bool("TS_V6_GANN_POSITION_SIZING_ENABLED", False),
             entry_confluence_hold_enabled=_env_bool("TS_V6_ENTRY_CONFLUENCE_HOLD_ENABLED", True),
@@ -1733,6 +1742,8 @@ class V6BinanceClient:
         return self.format_decimal(qty)
 
     def resolve_close_quantity(self, intent: V6OrderIntent) -> str:
+        if getattr(self.config, "close_resolver_enabled", False):
+            return self.resolve_close_quantity_via_resolver(intent)
         actual = self.actual_position_for_intent(intent)
         if actual is None:
             raise V6ExecutionError(f"no exchange position found for {intent.symbol} {intent.action}")
@@ -1755,6 +1766,50 @@ class V6BinanceClient:
         else:
             quantity = self.round_down_to_step(quantity, step)
         return self.format_decimal(quantity)
+
+    def resolve_close_quantity_via_resolver(self, intent: V6OrderIntent) -> str:
+        actual = self.actual_position_for_intent(intent)
+        step, min_notional = self.quantity_rules(intent.symbol)
+        mark_price = 0.0
+        if actual is not None:
+            try:
+                mark_price = float(actual.get("markPrice") or 0.0)
+            except (TypeError, ValueError):
+                mark_price = 0.0
+        if mark_price <= 0:
+            mark_price = float(intent.entry_price or 0.0)
+        dust_threshold = max(
+            0.0,
+            float(self.config.dust_position_notional_usdt or 0.0),
+            float(getattr(self.config, "strategy_dust_position_notional_usdt", 0.0) or 0.0),
+        )
+        decision = resolve_close_quantity_decision(
+            symbol=intent.symbol,
+            side="short" if intent.action == "close_short" else "long",
+            requested_fraction=clamp(float(intent.close_fraction or 1.0), 0.0, 1.0),
+            local_position={},
+            exchange_position=actual,
+            mark_price=mark_price,
+            step_size=step,
+            min_notional_usdt=min_notional,
+            dust_notional_usdt=dust_threshold,
+        )
+        risk_plan = dict(intent.risk_plan or {})
+        risk_plan["close_decision"] = asdict(decision)
+        intent.risk_plan = risk_plan
+        if decision.mode == "skip_missing_exchange_position":
+            # Phrase must stay aligned with the reconcile branch matching
+            # "no exchange position found" in run_once.
+            raise V6ExecutionError(
+                f"no exchange position found for {intent.symbol} {intent.action} (close_resolver: {decision.reason})"
+            )
+        if decision.mode == "skip_zero":
+            # Phrase must stay aligned with the reconcile branch matching
+            # "resolved zero partial close quantity" in run_once.
+            raise V6ExecutionError(
+                f"resolved zero partial close quantity for {intent.symbol} {intent.action} (close_resolver: {decision.reason})"
+            )
+        return decision.quantity
 
     def actual_position_for_intent(self, intent: V6OrderIntent) -> dict[str, Any] | None:
         expected_side = "short" if intent.action in {"open_short", "close_short"} else "long"
@@ -2506,6 +2561,22 @@ class V6ExecutionEngine:
         for signal_data in compact_signal_dicts:
             append_text_line(self.config.signals_file, json.dumps(signal_data, ensure_ascii=False))
         should_commit_dry = self.config.commit_dry_run_state if commit_dry_run_state is None else commit_dry_run_state
+        if getattr(self.config, "close_intent_coalescing_enabled", False):
+            pre_coalesce_count = len(intents)
+            intents = coalesce_close_intents(intents)
+            if len(intents) != pre_coalesce_count:
+                append_text_line(
+                    self.config.orders_file,
+                    json.dumps(
+                        {
+                            "event": "close_intents_coalesced",
+                            "before_count": pre_coalesce_count,
+                            "after_count": len(intents),
+                            "coalesced_at": utc_now_iso(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
         for intent in intents:
             result: dict[str, Any]
             existing_position: dict[str, Any] | None = None
@@ -11320,6 +11391,53 @@ class V6ExecutionEngine:
         self.update_position_layer_summary(position)
         return position
 
+    def residual_position_after_full_close(
+        self,
+        position: dict[str, Any],
+        intent: V6OrderIntent,
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Keep the local position when the exchange reports a residual after a full close.
+
+        Authority order: position_reconcile.after snapshot beats response.executedQty.
+        Flat or dust residual -> mark lots closed and drop the position (return None).
+        Non-dust residual -> scale lots to the exchange quantity and keep the position.
+        """
+        reconcile = result.get("position_reconcile") if isinstance(result.get("position_reconcile"), dict) else {}
+        after = reconcile.get("after") if isinstance(reconcile.get("after"), dict) else {}
+        if not after or reconcile.get("after_error"):
+            return None
+        try:
+            after_qty = abs(float(after.get("position_amt") or 0.0))
+        except (TypeError, ValueError):
+            after_qty = 0.0
+        close_event = {
+            "closed_at": result.get("submitted_at") or utc_now_iso(),
+            "order_id": self.order_id_from_result(result),
+            "executed_quantity": ((result.get("response") or {}).get("executedQty") if isinstance(result.get("response"), dict) else None),
+            "avg_price": ((result.get("response") or {}).get("avgPrice") if isinstance(result.get("response"), dict) else None),
+            "close_mode": ((intent.risk_plan or {}).get("close_decision") or {}).get("mode"),
+            "position_reconcile": reconcile,
+        }
+        if after_qty <= 0 or self.client.is_dust_exchange_snapshot(after):
+            self.reconcile_lots_to_exchange_quantity(
+                position,
+                0.0,
+                reason="close_result_exchange_flat_or_dust",
+            )
+            return None
+        self.reconcile_lots_to_exchange_quantity(
+            position,
+            after_qty,
+            reason="close_result_residual_exchange_quantity",
+        )
+        position["quantity"] = round(after_qty, 12)
+        history = list(position.get("close_events") or [])
+        history.append({**close_event, "residual_quantity": round(after_qty, 12)})
+        position["close_events"] = history[-20:]
+        position["close_residual_reconciled_at"] = utc_now_iso()
+        return position
+
     def apply_intent_to_state(self, state: dict[str, Any], intent: V6OrderIntent, result: dict[str, Any]) -> None:
         positions = [item for item in state.get("positions", []) if isinstance(item, dict)]
         if intent.action in {"open_long", "open_short"} and self.submitted_order_has_no_confirmed_position_delta(result):
@@ -11442,6 +11560,10 @@ class V6ExecutionEngine:
                             side=local_side_for_action(intent.action),
                         )
                     self.enqueue_closed_take_profit_review(position, intent, result)
+                    if getattr(self.config, "close_resolver_enabled", False):
+                        residual = self.residual_position_after_full_close(position, intent, result)
+                        if residual is not None:
+                            updated_positions.append(residual)
                 positions = updated_positions
         elif intent.action in {"open_long", "open_short"}:
             expected_side = "short" if intent.action == "open_short" else "long"

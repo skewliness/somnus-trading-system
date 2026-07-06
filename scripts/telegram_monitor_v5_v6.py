@@ -4778,6 +4778,28 @@ def format_execution_intent(intent: dict[str, Any], index: int) -> str:
     )
 
 
+def zh_close_mode(decision: dict[str, Any]) -> str:
+    mode = str(decision.get("mode") or "")
+    reason = str(decision.get("reason") or "")
+    if mode == "full_flatten":
+        return "粉尘全平" if "dust" in reason else "全平"
+    if mode == "partial":
+        return "部分平仓"
+    if mode == "skip_zero":
+        return "跳过(数量为零)"
+    if mode == "skip_missing_exchange_position":
+        return "跳过(交易所无持仓)"
+    return ""
+
+
+def close_decision_from_intent(intent: dict[str, Any]) -> dict[str, Any]:
+    risk_plan = intent.get("risk_plan")
+    if not isinstance(risk_plan, dict):
+        return {}
+    decision = risk_plan.get("close_decision")
+    return decision if isinstance(decision, dict) else {}
+
+
 def format_compact_execution_intent(intent: dict[str, Any]) -> str:
     symbol = str(intent.get("symbol") or "--").upper()
     action_key = str(intent.get("action") or "").lower()
@@ -4793,6 +4815,10 @@ def format_compact_execution_intent(intent: dict[str, Any]) -> str:
             f"止盈={format_price(intent.get('take_profit_price'))} "
             f"理由={rationale}"
         )
+    if action_key in {"close_long", "close_short"}:
+        mode_text = zh_close_mode(close_decision_from_intent(intent))
+        mode_part = f" 模式={mode_text}" if mode_text else ""
+        return f"{icon} {symbol} {action}{mode_part} 数量={quantity}U 理由={rationale}"
     return f"{icon} {symbol} {action} 数量={quantity}U 理由={rationale}"
 
 
@@ -5298,6 +5324,52 @@ def summary_dedupe_digest(message: str, scope: str) -> str:
     })
 
 
+def extract_error_code(error_text: Any) -> str:
+    match = re.search(r"-\d{3,5}", str(error_text or ""))
+    return match.group(0) if match else ""
+
+
+def close_failure_dedupe_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Stable dedup fields for an unresolved close failure.
+
+    Key = symbol + side + action + reason + target_name + error_code, so the
+    same failing close does not rebroadcast every loop just because
+    timestamps in the raw result changed.
+    """
+    intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+    decision = close_decision_from_intent(intent)
+    return {
+        "kind": "close_failure",
+        "symbol": str(intent.get("symbol") or result.get("symbol") or "").upper(),
+        "side": str(intent.get("side") or ""),
+        "action": str(intent.get("action") or result.get("action") or ""),
+        "reason": str(decision.get("reason") or ""),
+        "target_name": str(intent.get("target_name") or ""),
+        "error_code": extract_error_code(result.get("error") or result.get("original_error")),
+    }
+
+
+def is_close_failure_result(result: dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+    action = str(intent.get("action") or result.get("action") or "").lower()
+    if action not in {"close_long", "close_short"}:
+        return False
+    status = str(result.get("status") or "")
+    return status == "failed" or bool(result.get("error"))
+
+
+def stable_v6_activity_fingerprint(v6: dict[str, Any]) -> dict[str, Any]:
+    results_fp: list[Any] = []
+    for result in v6.get("results") or []:
+        if is_close_failure_result(result):
+            results_fp.append(close_failure_dedupe_fields(result))
+        else:
+            results_fp.append(result)
+    return {"intents": v6.get("intents"), "results": results_fp}
+
+
 def build_alerts(status: dict[str, Any], scope: str = "all") -> list[tuple[str, str]]:
     alerts: list[tuple[str, str]] = []
     v5 = status["v5"]
@@ -5346,7 +5418,7 @@ def build_alerts(status: dict[str, Any], scope: str = "all") -> list[tuple[str, 
             alerts.append(("v6_distill_stale", f"[Somnus告警] V6蒸馏报告/心跳已过期：报告延迟={format_age(v6.get('distill_age'))} 活动延迟={format_age(v6_distill_activity_age)}"))
 
         if v6.get("intent_count", 0) > 0 or v6.get("result_count", 0) > 0:
-            key = "v6_activity_" + short_hash({"intents": v6.get("intents"), "results": v6.get("results")})
+            key = "v6_activity_" + short_hash(stable_v6_activity_fingerprint(v6))
             alerts.append((key, format_v6_activity_details(v6)))
 
     return alerts

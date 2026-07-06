@@ -1,0 +1,5 @@
+arm,window,total_return_pct,max_drawdown_pct,profit_factor,win_rate_pct,avg_trade_return_pct,worst_trade_pct,trade_count,skipped_full,skipped_same_symbol,skipped_gann_filter,avg_exposure_pct,max_simultaneous_positions,funding_omitted
+v6_baseline,validation,-17.629594,-25.333629,0.905209,33.969466,-0.155209,-3.1624,262,0,44,0,26.829672,5,True
+gann_low_weight_scoring,validation,-17.629594,-25.333629,0.905209,33.969466,-0.155209,-3.1624,262,0,44,0,26.829672,5,True
+gann_position_sizing,validation,-16.723633,-24.737685,0.911764,33.969466,-0.155209,-3.1624,262,0,44,0,27.07896,5,True
+gann_hard_filter,validation,-16.698396,-22.623215,0.8942,33.663366,-0.198376,-3.1624,202,0,39,65,23.542729,5,True
