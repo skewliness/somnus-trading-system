@@ -31,9 +31,11 @@ from trading_system.binance_public_guard import (
 )
 from trading_system.coin_scout_model import CoinFeatures
 from trading_system.gate_registry import GateEventRecorder
+from trading_system.gann_feature import gann_position_multiplier
 from trading_system.h4_structure import compute_h4_structure
 from trading_system.persistence import append_text_line, atomic_write_json, load_json, timed_file_lock
 from trading_system.redaction import redact_sensitive_text
+from trading_system.transition_gate_policy import TransitionGatePolicy, append_gate_decision, transition_notional_multiplier
 from trading_system.v6_common.reason_utils import join_reasons
 
 
@@ -466,6 +468,9 @@ class V6ExecutionConfig:
     fib_structure_confirmation_enabled: bool = True
     fib_structure_confirmation_near_pct: float = 1.0
     fib_structure_confirmation_lookback_4h: int = 2190
+    transition_gate_policy_enabled: bool = False
+    transition_gate_min_notional_usdt: float = 5.0
+    gann_position_sizing_enabled: bool = False
     entry_confluence_hold_enabled: bool = True
     entry_confluence_hold_near_pct: float = 1.0
     entry_confluence_hold_break_tolerance_pct: float = 0.15
@@ -675,6 +680,9 @@ class V6ExecutionConfig:
             fib_structure_confirmation_enabled=_env_bool("TS_V6_FIB_STRUCTURE_CONFIRMATION_ENABLED", True),
             fib_structure_confirmation_near_pct=_env_float("TS_V6_FIB_STRUCTURE_CONFIRMATION_NEAR_PCT", 1.0),
             fib_structure_confirmation_lookback_4h=_env_int("TS_V6_FIB_STRUCTURE_CONFIRMATION_LOOKBACK_4H", 2190),
+            transition_gate_policy_enabled=_env_bool("TS_V6_TRANSITION_GATE_POLICY_ENABLED", False),
+            transition_gate_min_notional_usdt=_env_float("TS_V6_TRANSITION_GATE_MIN_NOTIONAL_USDT", 5.0),
+            gann_position_sizing_enabled=_env_bool("TS_V6_GANN_POSITION_SIZING_ENABLED", False),
             entry_confluence_hold_enabled=_env_bool("TS_V6_ENTRY_CONFLUENCE_HOLD_ENABLED", True),
             entry_confluence_hold_near_pct=_env_float("TS_V6_ENTRY_CONFLUENCE_HOLD_NEAR_PCT", 1.0),
             entry_confluence_hold_break_tolerance_pct=_env_float("TS_V6_ENTRY_CONFLUENCE_HOLD_BREAK_TOLERANCE_PCT", 0.15),
@@ -2413,6 +2421,9 @@ class V6ExecutionEngine:
         self._v5_momentum_panel_cache: dict[str, dict[str, dict[str, Any]]] | None = None
         self._smart_signal_cache: dict[str, dict[str, Any]] | None = None
         self.gate_recorder = GateEventRecorder.from_env()
+        self.transition_gate_policy = TransitionGatePolicy.from_env()
+        if self.config.transition_gate_policy_enabled and not self.transition_gate_policy.enabled:
+            self.transition_gate_policy = TransitionGatePolicy(enabled=True)
 
     def close(self) -> None:
         self.client.close()
@@ -5612,6 +5623,7 @@ class V6ExecutionEngine:
         for action in ("open_short", "open_long"):
             context = self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
             macro_block = self.macro_direction_entry_block(signal, action, context)
+            macro_block = self.maybe_downgrade_entry_block(signal, macro_block)
             if macro_block:
                 last_block = macro_block
                 continue
@@ -5912,7 +5924,10 @@ class V6ExecutionEngine:
             }, context
         v5_block = self.v5_overlay_entry_block(signal, action, context)
         if v5_block:
-            return False, v5_block, context
+            downgraded = self.maybe_downgrade_entry_block(signal, v5_block)
+            if downgraded is None and self.transition_gate_policy.should_downgrade(v5_block):
+                return True, None, context
+            return False, downgraded, context
         block = self.entry_structure_block(signal, action, context)
         if block:
             return False, block, context
@@ -5935,14 +5950,18 @@ class V6ExecutionEngine:
             min_lines=max(1, int(self.config.entry_structure_min_rejection_lines)),
         ):
             return True, None, context
-        return False, {
+        unconfirmed_block = {
             "enabled": True,
             "blocked": True,
             "action": action,
             "reason": "technical_entry_only_unconfirmed_15m_trigger",
             "message": "entry blocked: technical-only 15M setup requires touched BB level or 3-line confirmation",
             "entry_context": context,
-        }, context
+        }
+        downgraded = self.maybe_downgrade_entry_block(signal, unconfirmed_block)
+        if downgraded is None and self.transition_gate_policy.should_downgrade(unconfirmed_block):
+            return True, None, context
+        return False, downgraded, context
 
     def technical_entry_rank(self, signal: V6Signal, action: str, context: dict[str, Any]) -> tuple[float, float, float]:
         horizon_score = {
@@ -6523,49 +6542,49 @@ class V6ExecutionEngine:
         entry_context = entry_context if isinstance(entry_context, dict) else self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
         freshness_block = self.market_data_freshness_entry_block(signal, action)
         if freshness_block:
-            return freshness_block
+            return self.maybe_downgrade_entry_block(signal, freshness_block)
         smart_signal_block = self.smart_signal_entry_block(signal, action, entry_context)
         if smart_signal_block:
-            return smart_signal_block
+            return self.maybe_downgrade_entry_block(signal, smart_signal_block)
         ma20_block = None if ignore_15m_entry_blocks else self.ma20_trend_entry_block(signal, action)
         if ma20_block:
-            return ma20_block
+            return self.maybe_downgrade_entry_block(signal, ma20_block)
         daily_ma7_short_reversal_block = self.daily_ma7_short_reversal_entry_block(signal, action, entry_context)
         if daily_ma7_short_reversal_block:
-            return daily_ma7_short_reversal_block
+            return self.maybe_downgrade_entry_block(signal, daily_ma7_short_reversal_block)
         daily_ma20_long_reversal_block = self.daily_ma20_long_reversal_entry_block(signal, action, entry_context)
         if daily_ma20_long_reversal_block:
-            return daily_ma20_long_reversal_block
+            return self.maybe_downgrade_entry_block(signal, daily_ma20_long_reversal_block)
         profile_block = self.symbol_bb_entry_profile_block(signal, action, entry_context)
         if profile_block:
-            return profile_block
+            return self.maybe_downgrade_entry_block(signal, profile_block)
         trend_block = self.trend_big_entry_block(signal, action, entry_context)
         if trend_block:
-            return trend_block
+            return self.maybe_downgrade_entry_block(signal, trend_block)
         h4_lower_block = self.h4_lower_chase_short_block(signal, action, entry_context)
         if h4_lower_block:
-            return h4_lower_block
+            return self.maybe_downgrade_entry_block(signal, h4_lower_block)
         second_test_opposite_block = None if ignore_15m_entry_blocks else self.bb96_210_second_test_opposite_block(signal, action)
         if second_test_opposite_block:
-            return second_test_opposite_block
+            return self.maybe_downgrade_entry_block(signal, second_test_opposite_block)
         generic_indicator_block = self.generic_indicator_entry_block(signal, action, entry_context)
         if generic_indicator_block:
-            return generic_indicator_block
+            return self.maybe_downgrade_entry_block(signal, generic_indicator_block)
         four_h_selector_block = self.four_h_entry_15m_selector_block(signal, action, entry_context)
         if four_h_selector_block:
-            return four_h_selector_block
+            return self.maybe_downgrade_entry_block(signal, four_h_selector_block)
         short_15m_quality_block = self.short_15m_entry_quality_block(signal, action, entry_context)
         if short_15m_quality_block:
-            return short_15m_quality_block
+            return self.maybe_downgrade_entry_block(signal, short_15m_quality_block)
         fib_structure_block = self.fib_structure_confirmation_block(signal, action, entry_context)
         if fib_structure_block:
-            return fib_structure_block
+            return self.maybe_downgrade_entry_block(signal, fib_structure_block)
         if entry_context.get("horizon") in {"4h_trend", "1d_trend"}:
             confluence_hold = self.indicator_confluence_hold(signal, side)
-            return confluence_hold
+            return self.maybe_downgrade_entry_block(signal, confluence_hold)
         confluence_hold = self.indicator_confluence_hold(signal, side)
         if confluence_hold:
-            return confluence_hold
+            return self.maybe_downgrade_entry_block(signal, confluence_hold)
         if self.directional_entry_level_touched(signal, action):
             return None
         boundary = self.entry_boundary_chase_candidate(signal, side)
@@ -6585,7 +6604,7 @@ class V6ExecutionEngine:
         else:
             reason = "long_high_chase_without_15m_reclaim"
             message = "entry blocked: 15M mid/upper resistance is near, but no 3-line 15M mid/lower reclaim; avoid high-side chase long"
-        return {
+        return self.maybe_downgrade_entry_block(signal, {
             "enabled": True,
             "blocked": True,
             "action": action,
@@ -6596,7 +6615,7 @@ class V6ExecutionEngine:
             "required_rejection_lines": max(1, int(self.config.entry_structure_min_rejection_lines)),
             "rejection_near_pct": float(self.config.entry_structure_rejection_near_pct),
             "boundary_near_pct": float(self.config.entry_structure_boundary_near_pct),
-        }
+        })
 
     def directional_entry_level_touched(self, signal: V6Signal, action: str) -> dict[str, Any] | None:
         context = self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
@@ -6784,6 +6803,34 @@ class V6ExecutionEngine:
         candidates.sort(key=lambda item: (float(item.get("abs_distance_pct") or 0.0), int(item.get("period") or 0)))
         return candidates[0]
 
+    def maybe_downgrade_entry_block(self, signal: V6Signal, block: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not block:
+            return None
+        policy = getattr(self, "transition_gate_policy", TransitionGatePolicy(enabled=False))
+        decision = policy.decision_for(block)
+        if not policy.enabled or decision is None:
+            return block
+        levels = signal.levels if isinstance(signal.levels, dict) else {}
+        append_gate_decision(levels, block, decision)
+        signal.levels = levels
+        message = (
+            f"transition gate downgraded {decision.reason}: "
+            f"{decision.classification}, notional x{decision.notional_multiplier:.2f}"
+        )
+        if message not in signal.reasons:
+            signal.reasons.append(message)
+        recorder = getattr(self, "gate_recorder", None)
+        if recorder is not None:
+            recorder.record_entry_block(
+                signal,
+                {
+                    **dict(block),
+                    "downgraded_by_transition_gate_policy": True,
+                    "transition_gate_decision": decision.to_dict(),
+                },
+            )
+        return None
+
     def apply_entry_structure_block(self, signal: V6Signal, block: dict[str, Any]) -> None:
         levels = signal.levels if isinstance(signal.levels, dict) else {}
         levels["entry_structure_filter"] = dict(block)
@@ -6811,6 +6858,23 @@ class V6ExecutionEngine:
         self.apply_candidate_metadata_to_risk_plan(signal.symbol, risk_plan)
         base_notional = max(float(self.config.base_notional_usdt), float(self.config.min_notional_usdt))
         notional = base_notional
+        transition_multiplier = transition_notional_multiplier(signal.levels if isinstance(signal.levels, dict) else {})
+        gann_multiplier = 1.0
+        if self.config.gann_position_sizing_enabled:
+            gann_state = (signal.levels or {}).get("gann_feature") if isinstance(signal.levels, dict) else None
+            gann_multiplier = gann_position_multiplier(gann_state, local_side)
+        combined_multiplier = max(0.05, min(1.25, transition_multiplier * gann_multiplier))
+        if abs(combined_multiplier - 1.0) > 1e-9:
+            risk_plan["position_sizing_overlays"] = {
+                "transition_gate_multiplier": round(transition_multiplier, 6),
+                "gann_multiplier": round(gann_multiplier, 6),
+                "combined_multiplier": round(combined_multiplier, 6),
+            }
+            if combined_multiplier < 1.0:
+                notional_floor = max(5.0, float(self.config.transition_gate_min_notional_usdt))
+            else:
+                notional_floor = float(self.config.min_notional_usdt)
+            notional = max(notional_floor, base_notional * combined_multiplier)
         if (
             self.config.v5_staged_entry_enabled
             and self.config.v5_overlay_rules_active_for(signal.symbol)
