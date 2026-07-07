@@ -165,6 +165,75 @@ class ResidualPositionAfterFullCloseTest(unittest.TestCase):
         self.assertEqual(position["lots"][0]["status"], "open")
 
 
+class PartialTakeProfitFullFlattenStateTest(unittest.TestCase):
+    def make_engine(self) -> V6ExecutionEngine:
+        config = V6ExecutionConfig(symbols=["BTCUSDT"], order_mode="dry_run", close_resolver_enabled=True)
+        return V6ExecutionEngine(config)
+
+    def make_partial_intent(self) -> V6OrderIntent:
+        return V6OrderIntent(
+            action="close_long",
+            symbol="BTCUSDT",
+            side="SELL",
+            quantity_hint_usdt=100.0,
+            leverage=5,
+            reduce_only=True,
+            entry_price=110.0,
+            stop_loss_price=95.0,
+            take_profit_price=120.0,
+            long_probability=0.0,
+            short_probability=0.0,
+            wait_probability=1.0,
+            rationale="tp stage escalated to full flatten",
+            generated_at="2026-07-06T00:00:00+00:00",
+            close_fraction=0.5,
+            target_name="tp1",
+            risk_plan={
+                "partial_take_profit": {"type": "bb_take_profit", "fraction_of_initial": 0.5},
+                "close_decision": {
+                    "mode": "full_flatten",
+                    "reason": "partial_remainder_below_dust_notional_escalated_to_full_flatten",
+                },
+            },
+        )
+
+    def make_position(self) -> dict[str, Any]:
+        return {
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": 100.0,
+            "current_price": 110.0,
+            "position_qty": 1.0,
+            "remaining_quantity": 1.0,
+            "notional_usdt": 100.0,
+            "original_notional_usdt": 100.0,
+            "remaining_fraction": 1.0,
+            "take_profit_stages": [{"name": "tp1", "status": "pending", "fraction_of_initial": 0.5}],
+            "lots": [{"quantity": 1.0, "remaining_quantity": 1.0, "status": "open", "entry_price": 100.0}],
+        }
+
+    def test_partial_tp_resolver_full_flatten_drops_local_position_when_exchange_flat(self) -> None:
+        engine = self.make_engine()
+        position = self.make_position()
+        result = {
+            "status": "submitted",
+            "submitted_at": "2026-07-06T00:00:01+00:00",
+            "response": {"orderId": 123456, "executedQty": "1.0", "avgPrice": "110.0"},
+            "position_reconcile": {
+                "after": {"position_amt": 0.0, "notional": 0.0, "mark_price": 110.0},
+                "delta_qty_abs": 1.0,
+            },
+        }
+
+        updated = engine.apply_partial_take_profit_to_position(position, self.make_partial_intent(), result)
+
+        self.assertIsNone(updated)
+        self.assertEqual(position["remaining_fraction"], 0.0)
+        self.assertEqual(position["position_qty"], 0.0)
+        self.assertEqual(position["remaining_quantity"], 0.0)
+        self.assertTrue(all(lot["status"] == "closed" for lot in position["lots"]))
+
+
 class TelegramCloseEventTest(unittest.TestCase):
     def test_zh_close_mode_mappings(self) -> None:
         self.assertEqual(tg.zh_close_mode({"mode": "partial"}), "部分平仓")

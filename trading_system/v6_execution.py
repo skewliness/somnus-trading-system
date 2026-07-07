@@ -10181,7 +10181,7 @@ class V6ExecutionEngine:
         entry = float(snapshot.get("entry_price") or 0.0)
         mark = float(snapshot.get("mark_price") or 0.0)
         notional = abs(float(snapshot.get("notional") or 0.0))
-        if qty > 0:
+        if "position_amt" in snapshot or "abs_position_qty" in snapshot:
             position["position_qty"] = round(qty, 12)
             position["remaining_quantity"] = round(qty, 12)
         if entry > 0:
@@ -11145,6 +11145,8 @@ class V6ExecutionEngine:
 
     def apply_partial_take_profit_to_position(self, position: dict[str, Any], intent: V6OrderIntent, result: dict[str, Any]) -> dict[str, Any] | None:
         partial = (intent.risk_plan or {}).get("partial_take_profit") or {}
+        close_decision = (intent.risk_plan or {}).get("close_decision") if isinstance(intent.risk_plan, dict) else {}
+        close_decision_mode = str((close_decision or {}).get("mode") or "") if isinstance(close_decision, dict) else ""
         partial_type = str(partial.get("type") or "bb_take_profit")
         if partial_type == "roi_take_profit":
             stage_key = "roi_take_profit_stages"
@@ -11256,13 +11258,36 @@ class V6ExecutionEngine:
         )
         after = self.exchange_after_from_result(result)
         if after:
+            try:
+                after_qty = abs(float(after.get("position_amt") or after.get("abs_position_qty") or 0.0))
+            except (TypeError, ValueError):
+                after_qty = 0.0
             self.apply_exchange_snapshot_to_position(position, after)
             self.reconcile_lots_to_exchange_quantity(
                 position,
-                abs(float(after.get("position_amt") or after.get("abs_position_qty") or 0.0)),
+                after_qty,
                 reason="partial_take_profit_after_order_reconcile",
             )
+            if after_qty <= 0 or self.client.is_dust_exchange_snapshot(after):
+                position["remaining_fraction"] = 0.0
+                position["notional_usdt"] = 0.0
+                position["position_qty"] = 0.0
+                position["remaining_quantity"] = 0.0
+                self.update_position_layer_summary(position)
+                return None
         else:
+            if close_decision_mode == "full_flatten":
+                self.reconcile_lots_to_exchange_quantity(
+                    position,
+                    0.0,
+                    reason="partial_take_profit_resolver_full_flatten",
+                )
+                position["remaining_fraction"] = 0.0
+                position["notional_usdt"] = 0.0
+                position["position_qty"] = 0.0
+                position["remaining_quantity"] = 0.0
+                self.update_position_layer_summary(position)
+                return None
             total_remaining_qty = sum(self.lot_remaining_quantity(lot) for lot in self.normalize_lots(position))
             if total_remaining_qty > 0:
                 position["position_qty"] = round(total_remaining_qty, 12)
