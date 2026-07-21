@@ -30,6 +30,8 @@ CHART_JS = ASSET_DIR / "lightweight-charts-4.2.3.standalone.production.js"
 CHART_JS_URL = "https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"
 V6_SUMMARY_FILE = ROOT / "data/trading_system/v6_execution/latest_run_summary.json"
 V6_ORDERS_FILE = ROOT / "data/trading_system/v6_execution/orders.jsonl"
+V6_LIVE_SUMMARY_FILE = ROOT / "data/trading_system/v6_execution_live/latest_run_summary.json"
+V6_LIVE_ORDERS_FILE = ROOT / "data/trading_system/v6_execution_live/orders.jsonl"
 V5_V6_ORDERS_FILE = ROOT / "data/trading_system/v5_v6_execution/orders.jsonl"
 V5_PAPER_STATE_FILE = ROOT / "data/trading_system/paper_state.json"
 CHART_WIDTH = 1080
@@ -254,11 +256,16 @@ def load_v6_trade_markers(
     last_time: int,
     markers: list[dict[str, Any]],
     seen: set[tuple[int, str, str, int]],
+    *,
+    orders_file: Path | None = None,
+    source: str = "v6",
+    include_all_closes: bool = False,
 ) -> None:
-    if not V6_ORDERS_FILE.exists():
+    source_file = orders_file or V6_ORDERS_FILE
+    if not source_file.exists():
         return
     try:
-        lines = V6_ORDERS_FILE.read_text(encoding="utf-8").splitlines()
+        lines = source_file.read_text(encoding="utf-8").splitlines()
     except Exception:
         return
     for line in lines:
@@ -282,7 +289,8 @@ def load_v6_trade_markers(
             or "take profit" in str(intent.get("rationale") or "").lower()
             or bool(((intent.get("risk_plan") or {}).get("partial_take_profit") if isinstance(intent.get("risk_plan"), dict) else None))
         )
-        if not is_entry and not is_take_profit:
+        is_close = action in {"close_long", "close_short"}
+        if not is_entry and not is_take_profit and not (include_all_closes and is_close):
             continue
         timestamp = parse_iso_timestamp(order.get("submitted_at") or intent.get("generated_at"))
         if timestamp is None:
@@ -291,7 +299,15 @@ def load_v6_trade_markers(
         if chart_time is None:
             continue
         price = marker_price_from_order(order, intent)
-        append_side_marker(markers, seen, chart_time=chart_time, side=str(intent.get("side") or "").upper(), price=price, source="v6", action=action)
+        append_side_marker(
+            markers,
+            seen,
+            chart_time=chart_time,
+            side=str(intent.get("side") or "").upper(),
+            price=price,
+            source=source,
+            action=action,
+        )
 
 
 def load_v5_v6_execution_markers(
@@ -390,7 +406,13 @@ def load_v5_trade_markers(
         append_side_marker(markers, seen, chart_time=chart_time, side=side, price=price, source="v5", action=action)
 
 
-def load_trade_markers(symbol: str, interval: str, candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def load_trade_markers(
+    symbol: str,
+    interval: str,
+    candles: list[dict[str, Any]],
+    *,
+    execution_scope: str = "default",
+) -> list[dict[str, Any]]:
     if not candles:
         return []
     interval_ms = INTERVAL_MS[interval]
@@ -399,9 +421,25 @@ def load_trade_markers(symbol: str, interval: str, candles: list[dict[str, Any]]
     last_time = max(candle_times)
     markers: list[dict[str, Any]] = []
     seen: set[tuple[int, str, str, int]] = set()
-    load_v6_trade_markers(symbol, interval_ms, candle_times, first_time, last_time, markers, seen)
-    load_v5_v6_execution_markers(symbol, interval_ms, candle_times, first_time, last_time, markers, seen)
-    load_v5_trade_markers(symbol, interval_ms, candle_times, first_time, last_time, markers, seen)
+    if execution_scope == "live":
+        load_v6_trade_markers(
+            symbol,
+            interval_ms,
+            candle_times,
+            first_time,
+            last_time,
+            markers,
+            seen,
+            orders_file=V6_LIVE_ORDERS_FILE,
+            source="v6-live",
+            include_all_closes=True,
+        )
+    elif execution_scope == "default":
+        load_v6_trade_markers(symbol, interval_ms, candle_times, first_time, last_time, markers, seen)
+        load_v5_v6_execution_markers(symbol, interval_ms, candle_times, first_time, last_time, markers, seen)
+        load_v5_trade_markers(symbol, interval_ms, candle_times, first_time, last_time, markers, seen)
+    else:
+        raise ValueError(f"unsupported execution scope: {execution_scope}")
     markers.sort(key=lambda item: (int(item["time"]), item["text"]))
     return markers
 
@@ -444,8 +482,8 @@ def fetch_klines(symbol: str, interval: str, max_period: int) -> list[dict[str, 
     return rows
 
 
-def find_v6_signal(symbol: str) -> dict[str, Any]:
-    summary = load_json(V6_SUMMARY_FILE)
+def find_v6_signal(symbol: str, *, summary_file: Path | None = None) -> dict[str, Any]:
+    summary = load_json(summary_file or V6_SUMMARY_FILE)
     for signal in summary.get("signals") or []:
         if str(signal.get("symbol") or "").upper() == symbol:
             return signal
@@ -743,8 +781,11 @@ def render_chart(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"{symbol} {interval} K线不足：{len(klines)}/{max_period}")
 
     candles, volume, lines, bands, meta = build_series(klines, periods, focus_period)
-    markers = load_trade_markers(symbol, interval, candles)
-    signal = find_v6_signal(symbol)
+    execution_scope = str(args.execution_scope or "default").strip().lower()
+    account_label = str(args.account_label or "").strip()
+    markers = load_trade_markers(symbol, interval, candles, execution_scope=execution_scope)
+    signal_file = V6_LIVE_SUMMARY_FILE if execution_scope == "live" else V6_SUMMARY_FILE
+    signal = find_v6_signal(symbol, summary_file=signal_file)
     v6_text = "V6暂无该币最新分析"
     if signal:
         v6_text = (
@@ -754,7 +795,10 @@ def render_chart(args: argparse.Namespace) -> dict[str, Any]:
             f"等={float(signal.get('wait_probability') or 0) * 100:.2f}%"
         )
 
-    title = f"{symbol} {interval.upper()}"
+    scope_title = ""
+    if execution_scope == "live":
+        scope_title = f" · LIVE {account_label}" if account_label else " · LIVE"
+    title = f"{symbol} {interval.upper()}{scope_title}"
     subtitle = f"价格={format_price(meta['price'])}  {v6_text}"
     legend = ["K线来源=Binance实时刷新"]
     if markers:
@@ -762,7 +806,7 @@ def render_chart(args: argparse.Namespace) -> dict[str, Any]:
         source_text = f" 来源={','.join(sources).upper()}" if sources else ""
         legend.append(f"标记=开多/平多/开空/平空 绿色=买入 红色=卖出{source_text}")
     if focus_period:
-        title = f"{symbol} {interval.upper()} BB{focus_period}"
+        title = f"{symbol} {interval.upper()} BB{focus_period}{scope_title}"
         subtitle = (
             f"价格={format_price(meta['price'])}  "
             f"BB{focus_period} 上={format_price(meta.get('focus_upper'))} "
@@ -811,6 +855,8 @@ def render_chart(args: argparse.Namespace) -> dict[str, Any]:
         "kline_from": meta.get("from"),
         "kline_to": meta.get("to"),
         "v6": signal,
+        "execution_scope": execution_scope,
+        "account_label": account_label,
     }
 
 
@@ -820,6 +866,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--interval", choices=sorted(PERIODS_BY_INTERVAL), required=True)
     parser.add_argument("--focus-period", type=int, default=0)
     parser.add_argument("--visible-bars", type=int, default=360)
+    parser.add_argument("--execution-scope", choices=("default", "live"), default="default")
+    parser.add_argument("--account-label", default="")
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 

@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -6,15 +7,40 @@ from unittest.mock import patch
 from trading_system.bridges import BridgeLoadResult
 from trading_system.config import StrategyConfig
 from trading_system.engine import TradingSystem
-from trading_system.models import MarketSnapshot
+from trading_system.models import MarketSnapshot, SentimentSignal
 from trading_system.pipeline import TradingPipeline
 from trading_system.reports import write_markdown_report
+
+
+def _empty_bridge_result(name: str) -> BridgeLoadResult:
+    return BridgeLoadResult(name, [], {"status": "test_stub", "count": 0})
+
+
+def _fresh_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hot_bridge_result(name: str) -> BridgeLoadResult:
+    return BridgeLoadResult(
+        name,
+        [
+            SentimentSignal(
+                symbol="AIXBTUSDT",
+                hotness_score=75.0,
+                mention_count=3,
+                source=name,
+                updated_at=datetime.now(timezone.utc),
+                notes="deterministic pipeline test signal",
+            )
+        ],
+        {"status": "test_stub", "count": 1},
+    )
 
 
 def test_pipeline_writes_outputs(tmp_path: Path) -> None:
     sentiment = tmp_path / "sentiment.csv"
     sentiment.write_text(
-        "symbol,hotness_score,mention_count,source,updated_at,notes\nAIXBTUSDT,91,12,manual_distill,2026-04-12T00:00:00+00:00,test\n",
+        f"symbol,hotness_score,mention_count,source,updated_at,notes\nAIXBTUSDT,91,12,manual_distill,{_fresh_timestamp()},test\n",
         encoding="utf-8",
     )
     replay = tmp_path / "replay.json"
@@ -60,6 +86,7 @@ def test_pipeline_writes_outputs(tmp_path: Path) -> None:
         issues_md_file=tmp_path / "issues.md",
         skill_bridge_dir=tmp_path / "skill_bridges",
         macro_trend_enabled=False,
+        whale_overview_enabled=False,
     )
     pipeline = TradingPipeline(config)
     ranked_snapshot = MarketSnapshot(
@@ -110,7 +137,11 @@ def test_pipeline_writes_outputs(tmp_path: Path) -> None:
     with (
         patch.object(TradingSystem, "scan", fake_scan),
         patch.object(TradingSystem, "rebalance", fake_rebalance),
-        patch("trading_system.pipeline.OptionsDeliveryBridge.load", return_value=BridgeLoadResult("options_delivery", [], {"status": "ok", "count": 0})),
+        patch("trading_system.pipeline.CoinGeckoTrendingBridge.load", return_value=_hot_bridge_result("coingecko_trending")),
+        patch("trading_system.pipeline.BinanceTopMoversBridge.load", return_value=_empty_bridge_result("binance_top_movers")),
+        patch("trading_system.pipeline.OptionsDeliveryBridge.load", return_value=_empty_bridge_result("options_delivery")),
+        patch("trading_system.pipeline.OpenNewsBridge.fetch_for_symbols", return_value=_empty_bridge_result("opennews")),
+        patch("trading_system.pipeline.OpenTwitterBridge.fetch_for_symbols", return_value=_empty_bridge_result("opentwitter")),
     ):
         report = pipeline.run(mode="replay", collect_square_feed=False)
 
@@ -424,9 +455,10 @@ def test_pipeline_keeps_candidate_confirmation_binance_only(tmp_path: Path) -> N
         issues_md_file=tmp_path / "issues.md",
         skill_bridge_dir=tmp_path / "skill_bridges",
         macro_trend_enabled=False,
+        whale_overview_enabled=False,
     )
     config.sentiment_file.write_text(
-        "symbol,hotness_score,mention_count,source,updated_at,notes\nAIXBTUSDT,91,12,manual_distill,2026-04-12T00:00:00+00:00,test\n",
+        f"symbol,hotness_score,mention_count,source,updated_at,notes\nAIXBTUSDT,91,12,manual_distill,{_fresh_timestamp()},test\n",
         encoding="utf-8",
     )
     config.replay_file.write_text("[]", encoding="utf-8")
@@ -455,7 +487,15 @@ def test_pipeline_keeps_candidate_confirmation_binance_only(tmp_path: Path) -> N
     def fake_rebalance(self, regime=None, predictive_model=None):
         return {"entries": [], "exits": []}
 
-    with patch.object(TradingSystem, "scan", fake_scan), patch.object(TradingSystem, "rebalance", fake_rebalance):
+    with (
+        patch.object(TradingSystem, "scan", fake_scan),
+        patch.object(TradingSystem, "rebalance", fake_rebalance),
+        patch("trading_system.pipeline.CoinGeckoTrendingBridge.load", return_value=_empty_bridge_result("coingecko_trending")),
+        patch("trading_system.pipeline.BinanceTopMoversBridge.load", return_value=_empty_bridge_result("binance_top_movers")),
+        patch("trading_system.pipeline.OptionsDeliveryBridge.load", return_value=_empty_bridge_result("options_delivery")),
+        patch("trading_system.pipeline.OpenNewsBridge.fetch_for_symbols", return_value=_empty_bridge_result("opennews")),
+        patch("trading_system.pipeline.OpenTwitterBridge.fetch_for_symbols", return_value=_empty_bridge_result("opentwitter")),
+    ):
         report = pipeline.run(mode="replay", collect_square_feed=False)
 
     assert report["candidate_confirmation"]["symbols"] == ["AIXBTUSDT"]

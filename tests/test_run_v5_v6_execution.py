@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,7 +21,8 @@ for _key in _CREDENTIAL_ENV_KEYS:
 os.environ["TS_EXECUTION_ORDER_MODE"] = "auto"
 os.environ["SOMNUS_SKIP_LOCAL_ENV"] = "1"
 
-from scripts.run_v5_v6_execution import filter_exchange_supported_symbols, run_locked
+from scripts.run_v5_v6_execution import configure_v6_with_v5_keys, filter_exchange_supported_symbols, run_locked
+from trading_system.config import StrategyConfig
 from trading_system.v6_execution import V6ExecutionConfig
 
 
@@ -54,6 +56,33 @@ def test_filter_exchange_supported_symbols_requires_trading_status() -> None:
     assert kept == ["BTCUSDT"]
     assert skipped == ["PUMPUSDT"]
     assert error == ""
+
+
+def test_v5_config_keeps_staged_entry_floor_separate_from_v6_minimum() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "TS_V6_BASE_NOTIONAL_USDT": "510",
+            "TS_V6_MIN_NOTIONAL_USDT": "510",
+        },
+        clear=False,
+    ):
+        config = configure_v6_with_v5_keys(StrategyConfig(), Path("state"), ["ALTUSDT"])
+
+    assert config.base_notional_usdt == 510.0
+    assert config.min_notional_usdt == 510.0
+    assert config.v5_staged_entry_min_notional_usdt == 5.0
+    assert config.v5_initial_entry_notional_fraction == 0.30
+    assert config.manager_reentry_lock_enabled is False
+    assert config.manager_reentry_lock_active_for("ALTUSDT") is False
+
+
+def test_v5_manager_reentry_lock_requires_explicit_v5_opt_in() -> None:
+    with patch.dict(os.environ, {"TS_V5_MANAGER_REENTRY_LOCK_ENABLED": "1"}, clear=False):
+        config = configure_v6_with_v5_keys(StrategyConfig(), Path("state"), ["ALTUSDT"])
+
+    assert config.manager_reentry_lock_enabled is True
+    assert config.manager_reentry_lock_active_for("ALTUSDT") is True
 
 
 def test_positions_only_does_not_read_entry_watchlist(tmp_path) -> None:

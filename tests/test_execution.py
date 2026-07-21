@@ -45,7 +45,7 @@ def test_paper_engine_opens_and_exits_positions(tmp_path: Path) -> None:
 
     second = MarketSnapshot(
         symbol="AIXBTUSDT",
-        mark_price=1.1,
+        mark_price=1.01,
         price_change_pct_24h=-5.0,
         quote_volume_usdt_24h=20_000_000,
         funding_rate=-0.0002,
@@ -56,6 +56,7 @@ def test_paper_engine_opens_and_exits_positions(tmp_path: Path) -> None:
         sentiment_score=20,
         sentiment_mentions=20,
         sentiment_source="manual_distill",
+        h4_structure_state="broken",
         score=20.0,
         reasons=["score_faded"],
     )
@@ -312,7 +313,7 @@ def test_paper_engine_allows_short_cycle_trend_followthrough_hold_extension(tmp_
     )
     current = MarketSnapshot(
         symbol="RUNUSDT",
-        mark_price=1.18,
+        mark_price=1.04,
         price_change_pct_24h=22.0,
         quote_volume_usdt_24h=120_000_000,
         funding_rate=0.0002,
@@ -3226,6 +3227,39 @@ def test_retest_add_support_uses_larger_but_still_reduced_size(tmp_path: Path) -
     assert result["entries"][0]["notional_usdt"] == 80
 
 
+def test_retest_add_support_requires_real_pullback_not_extended_chase(tmp_path: Path) -> None:
+    config = StrategyConfig(
+        state_file=tmp_path / "paper_state.json",
+        repeated_signal_4h_max_breakout_distance=0.45,
+        retest_add_max_breakout_distance=0.20,
+    )
+    engine = PaperExecutionEngine(config, smart_money_panel_provider=lambda _symbol: {"views": {}})
+    still_extended = MarketSnapshot(
+        symbol="FHEUSDT",
+        mark_price=0.0215,
+        price_change_pct_4h=2.0,
+        price_change_pct_24h=18.0,
+        quote_volume_usdt_24h=80_000_000,
+        funding_rate=0.0002,
+        open_interest_usdt=60_000_000,
+        oi_change_pct_4h=4.0,
+        taker_buy_sell_ratio=1.05,
+        sentiment_score=76,
+        sentiment_mentions=24,
+        sentiment_source="binance_top_movers,opentwitter_search",
+        price_position_7d=0.91,
+        price_position_20d=0.90,
+        breakout_distance_7d=0.30,
+        setup_type="trend",
+        score=66.0,
+        hotness_priority_score=8.0,
+        reasons=["retest_hold"],
+    )
+
+    assert engine._has_repeated_signal_4h_support(still_extended) is True
+    assert engine._has_retest_add_support(still_extended) is False
+
+
 def test_shadow_paper_opens_virtual_position_from_high_model_score(tmp_path: Path) -> None:
     config = StrategyConfig(
         state_file=tmp_path / "paper_state.json",
@@ -3697,6 +3731,7 @@ def test_trend_up_long_exits_at_extended_tp(tmp_path: Path) -> None:
         state_file=tmp_path / "paper_state.json",
         take_profit_pct=0.08,
         trend_up_tp_extension_multiplier=1.5,
+        staged_tp_enabled=False,
     )
     config.state_file.write_text(
         json.dumps({

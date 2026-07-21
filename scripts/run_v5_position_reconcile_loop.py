@@ -121,6 +121,87 @@ def exchange_snapshot_summary(engine: V6ExecutionEngine, rows: list[dict[str, An
     }
 
 
+def synthetic_exchange_row(position: dict[str, Any]) -> dict[str, Any]:
+    side = str(position.get("side") or "").lower()
+    quantity = abs(float(position.get("position_qty") or position.get("remaining_quantity") or 0.0))
+    signed_quantity = -quantity if side == "short" else quantity
+    entry = float(position.get("entry_price") or 0.0)
+    mark = float(position.get("current_price") or entry or 0.0)
+    return {
+        "symbol": str(position.get("symbol") or "").upper(),
+        "positionAmt": str(signed_quantity),
+        "positionSide": "SHORT" if side == "short" else "LONG",
+        "entryPrice": str(entry),
+        "markPrice": str(mark),
+        "notional": str(signed_quantity * mark),
+        "unRealizedProfit": str(position.get("unrealized_profit") or 0.0),
+        "leverage": str(position.get("leverage") or 0),
+        "marginType": str(position.get("margin_type") or "isolated"),
+        "_somnus_transient_absence_guard": True,
+    }
+
+
+def guard_transient_absences(
+    engine: V6ExecutionEngine,
+    state: dict[str, Any],
+    actual_rows: list[dict[str, Any]],
+    confirmation_state: dict[str, Any],
+    *,
+    now_ts: float,
+    required_confirmations: int,
+    minimum_elapsed_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Keep a local position until repeated exchange-flat snapshots confirm it."""
+    rows = [dict(row) for row in actual_rows if isinstance(row, dict)]
+    actual_keys = {engine.position_key_from_risk_row(row) for row in rows}
+    local_positions = [item for item in state.get("positions") or [] if isinstance(item, dict)]
+    local_keys = {engine.position_key_from_state(item) for item in local_positions}
+    records = confirmation_state.get("missing") if isinstance(confirmation_state.get("missing"), dict) else {}
+    next_records: dict[str, dict[str, Any]] = {}
+    protected: list[str] = []
+    confirmed_absent: list[str] = []
+
+    for position in local_positions:
+        key = engine.position_key_from_state(position)
+        key_text = f"{key[0]}:{key[1]}"
+        if key in actual_keys:
+            continue
+        if engine.is_strategy_dust_position(position):
+            confirmed_absent.append(key_text)
+            continue
+        previous = records.get(key_text) if isinstance(records.get(key_text), dict) else {}
+        first_seen = float(previous.get("first_seen_ts") or now_ts)
+        count = int(previous.get("count") or 0) + 1
+        record = {
+            "first_seen_ts": first_seen,
+            "last_seen_ts": now_ts,
+            "count": count,
+        }
+        elapsed = max(0.0, now_ts - first_seen)
+        confirmed = count >= max(1, int(required_confirmations)) and elapsed >= max(0.0, float(minimum_elapsed_seconds))
+        record["confirmed"] = confirmed
+        next_records[key_text] = record
+        if confirmed:
+            confirmed_absent.append(key_text)
+            continue
+        synthetic = synthetic_exchange_row(position)
+        if abs(float(synthetic.get("positionAmt") or 0.0)) > 0:
+            rows.append(synthetic)
+            protected.append(key_text)
+
+    next_records = {key: value for key, value in next_records.items() if key in {f"{item[0]}:{item[1]}" for item in local_keys}}
+    next_state = {
+        "updated_at": utc_now(),
+        "missing": next_records,
+    }
+    return rows, next_state, {
+        "protected": sorted(protected),
+        "confirmed_absent": sorted(confirmed_absent),
+        "required_confirmations": max(1, int(required_confirmations)),
+        "minimum_elapsed_seconds": max(0.0, float(minimum_elapsed_seconds)),
+    }
+
+
 def reconcile_once(
     engine: V6ExecutionEngine,
     state_file: Path,
@@ -128,25 +209,45 @@ def reconcile_once(
     events_file: Path,
     *,
     state_dir: Path | None = None,
+    confirmation_state_file: Path | None = None,
+    absence_required_confirmations: int = 2,
+    absence_minimum_elapsed_seconds: float = 5.0,
     lock_timeout_seconds: float = 240.0,
 ) -> dict[str, Any]:
     started = time.time()
-    actual_rows = engine.client.actual_position_rows()
-    exchange_positions = exchange_snapshot_summary(engine, actual_rows)
     lock_ctx = (
         v5_execution_lock(state_dir, lock_timeout_seconds)
         if state_dir is not None
         else nullcontext()
     )
     with lock_ctx:
+        # Read the exchange snapshot only after the execution lock is held. A
+        # pre-lock snapshot can resurrect a position that was closed while this
+        # watcher waited for the lock.
+        actual_rows = engine.client.actual_position_rows()
+        exchange_positions = exchange_snapshot_summary(engine, actual_rows)
         with file_lock(state_file):
             state = load_json(state_file, default={}, lock=False)
             if not isinstance(state, dict):
                 state = {}
+            confirmation_state_path = confirmation_state_file or state_file.with_name("position_reconcile_confirmation_state.json")
+            confirmation_state = load_json(confirmation_state_path, default={}, lock=False)
+            if not isinstance(confirmation_state, dict):
+                confirmation_state = {}
+            previous_confirmation_state = confirmation_state
+            guarded_rows, confirmation_state, absence_guard = guard_transient_absences(
+                engine,
+                state,
+                actual_rows,
+                confirmation_state,
+                now_ts=time.time(),
+                required_confirmations=absence_required_confirmations,
+                minimum_elapsed_seconds=absence_minimum_elapsed_seconds,
+            )
             before = position_signature(state)
             result = engine.reconcile_state_with_exchange(
                 state,
-                actual_rows=actual_rows,
+                actual_rows=guarded_rows,
                 sync_exchange_side_effects=False,
             )
             after = position_signature(state)
@@ -159,6 +260,10 @@ def reconcile_once(
             )
             if changed:
                 atomic_write_json(state_file, state, lock=False)
+            previous_missing = previous_confirmation_state.get("missing") if isinstance(previous_confirmation_state.get("missing"), dict) else {}
+            current_missing = confirmation_state.get("missing") if isinstance(confirmation_state.get("missing"), dict) else {}
+            if current_missing != previous_missing:
+                atomic_write_json(confirmation_state_path, confirmation_state, lock=False)
     latency_ms = round((time.time() - started) * 1000, 3)
     payload = {
         "generated_at": utc_now(),
@@ -170,6 +275,7 @@ def reconcile_once(
         "before": before,
         "after": after,
         "reconcile": result or {"event": "exchange_position_reconcile", "status": "skipped"},
+        "absence_guard": absence_guard,
         "exchange_positions": exchange_positions,
     }
     atomic_write_json(summary_file, payload)
@@ -179,6 +285,10 @@ def reconcile_once(
 
 
 def build_lightweight_reconcile_engine(config: Any) -> V6ExecutionEngine:
+    config.binance_request_timeout_seconds = min(
+        float(config.binance_request_timeout_seconds),
+        max(1.0, float(os.getenv("TS_V5_POSITION_RECONCILE_REQUEST_TIMEOUT_SECONDS", "3"))),
+    )
     config.ensure_dirs()
     engine = V6ExecutionEngine.__new__(V6ExecutionEngine)
     engine.config = config
@@ -226,6 +336,7 @@ def run_loop(args: argparse.Namespace) -> int:
     state_file = state_dir / "state.json"
     summary_file = state_dir / "latest_position_reconcile_watch.json"
     events_file = state_dir / "position_reconcile_events.jsonl"
+    confirmation_state_file = state_dir / "position_reconcile_confirmation_state.json"
     config = configure_v6_with_v5_keys(StrategyConfig(), state_dir, [])
     engine = build_lightweight_reconcile_engine(config)
     interval = max(0.25, float(args.interval_seconds))
@@ -233,6 +344,7 @@ def run_loop(args: argparse.Namespace) -> int:
     try:
         while True:
             started = time.time()
+            cycle_failed = False
             try:
                 payload = reconcile_once(
                     engine,
@@ -240,13 +352,29 @@ def run_loop(args: argparse.Namespace) -> int:
                     summary_file,
                     events_file,
                     state_dir=state_dir,
+                    confirmation_state_file=confirmation_state_file,
+                    absence_required_confirmations=int(args.absence_required_confirmations),
+                    absence_minimum_elapsed_seconds=float(args.absence_minimum_elapsed_seconds),
                     lock_timeout_seconds=float(args.lock_timeout_seconds),
                 )
                 errors = 0
                 if args.verbose or payload.get("changed"):
                     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+            except TimeoutError:
+                errors = 0
+                payload = {
+                    "generated_at": utc_now(),
+                    "mode": "v5_position_reconcile_watcher",
+                    "status": "skipped_lock_busy",
+                    "changed": False,
+                    "reason": "v5_execution_in_progress",
+                }
+                atomic_write_json(summary_file, payload)
+                if args.verbose:
+                    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
             except Exception as exc:
                 errors += 1
+                cycle_failed = True
                 payload = {
                     "generated_at": utc_now(),
                     "mode": "v5_position_reconcile_watcher",
@@ -262,7 +390,10 @@ def run_loop(args: argparse.Namespace) -> int:
             if args.once:
                 return 0
             elapsed = time.time() - started
-            time.sleep(max(0.0, interval - elapsed))
+            if cycle_failed:
+                time.sleep(max(interval, min(5.0, float(errors))))
+            else:
+                time.sleep(max(0.0, interval - elapsed))
     finally:
         engine.close()
 
@@ -271,7 +402,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Poll V5 Binance positions and reconcile V5 local ledger.")
     parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
     parser.add_argument("--interval-seconds", type=float, default=float(os.getenv("TS_V5_POSITION_RECONCILE_INTERVAL_SECONDS", "1")))
-    parser.add_argument("--lock-timeout-seconds", type=float, default=float(os.getenv("TS_V5_EXECUTION_LOCK_TIMEOUT_SECONDS", "240")))
+    parser.add_argument(
+        "--lock-timeout-seconds",
+        type=float,
+        default=float(os.getenv("TS_V5_POSITION_RECONCILE_LOCK_TIMEOUT_SECONDS", "0.20")),
+    )
+    parser.add_argument(
+        "--absence-required-confirmations",
+        type=int,
+        default=int(os.getenv("TS_V5_POSITION_RECONCILE_ABSENCE_CONFIRMATIONS", "2")),
+    )
+    parser.add_argument(
+        "--absence-minimum-elapsed-seconds",
+        type=float,
+        default=float(os.getenv("TS_V5_POSITION_RECONCILE_ABSENCE_MIN_SECONDS", "5")),
+    )
     parser.add_argument("--max-consecutive-errors", type=int, default=int(os.getenv("TS_V5_POSITION_RECONCILE_MAX_ERRORS", "30")))
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--verbose", action="store_true")

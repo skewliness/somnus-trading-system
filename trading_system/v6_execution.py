@@ -30,9 +30,22 @@ from trading_system.binance_public_guard import (
     throttle_binance_public_request,
 )
 from trading_system.coin_scout_model import CoinFeatures
+from trading_system.close_resolver import (
+    coalesce_close_intents,
+    resolve_close_quantity as resolve_close_quantity_decision,
+)
+from trading_system.entry_gate_policy import EntryGateFinding, evaluate_entry_gate_findings, finding_from_block
+from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
+from trading_system.gate_registry import default_entry_gate_registry
 from trading_system.h4_structure import compute_h4_structure
 from trading_system.persistence import append_text_line, atomic_write_json, load_json, timed_file_lock
 from trading_system.redaction import redact_sensitive_text
+from trading_system.telegram_whale_features import (
+    DEFAULT_BRIDGE_FILE as DEFAULT_TELEGRAM_WHALE_BRIDGE_FILE,
+    TelegramWhaleBridgeReader,
+    apply_snapshot_to_features as apply_telegram_whale_snapshot,
+    compact_snapshot as compact_telegram_whale_snapshot,
+)
 from trading_system.v6_common.reason_utils import join_reasons
 
 
@@ -412,20 +425,29 @@ class V6ExecutionConfig:
     binance_request_retries: int = 3
     position_mode: str = "auto"
     margin_type: str = "ISOLATED"
+    account_asset_mode: str = "SINGLE_ASSET"
+    virtual_risk_isolation_enabled: bool = False
+    instance_name: str = "default"
+    exit_control_mode: str = "automatic"
+    manual_exchange_action_audit_enabled: bool = False
     model_path: Path = DEFAULT_MODEL_PATH
     state_dir: Path = DEFAULT_STATE_DIR
     state_file: Path = DEFAULT_STATE_DIR / "state.json"
     signals_file: Path = DEFAULT_STATE_DIR / "signals.jsonl"
+    entry_gate_events_file: Path = DEFAULT_STATE_DIR / "entry_gate_events.jsonl"
+    entry_gate_events_max_bytes: int = 20 * 1024 * 1024
     orders_file: Path = DEFAULT_STATE_DIR / "orders.jsonl"
     wal_file: Path = DEFAULT_STATE_DIR / "execution_wal.jsonl"
     latest_summary_file: Path = DEFAULT_STATE_DIR / "latest_run_summary.json"
     closed_trade_review_queue_file: Path = DEFAULT_STATE_DIR / "closed_trade_review_queue.jsonl"
     post_trade_training_samples_file: Path = DEFAULT_STATE_DIR / "post_trade_training_samples.jsonl"
+    manual_exchange_action_audit_file: Path | None = None
     kline_cache_dir: Path = DEFAULT_EXECUTION_KLINE_CACHE_DIR
     kline_cache_enabled: bool = True
     public_cache_ttl_seconds: int = 90
     public_mark_price_ttl_seconds: int = 120
     public_ticker_24h_ttl_seconds: int = 300
+    exchange_info_cache_ttl_seconds: int = 180
     kline_refresh_interval_1m_seconds: int = 20
     kline_refresh_interval_15m_seconds: int = 120
     kline_refresh_interval_4h_seconds: int = 600
@@ -444,6 +466,7 @@ class V6ExecutionConfig:
     short_entry_threshold: float = 0.72
     symbol_long_entry_thresholds: dict[str, float] = field(default_factory=dict)
     symbol_short_entry_thresholds: dict[str, float] = field(default_factory=dict)
+    symbol_notional_multipliers: dict[str, float] = field(default_factory=dict)
     technical_entry_only_symbols: tuple[str, ...] = field(default_factory=tuple)
     four_h_entry_15m_selector_symbols: tuple[str, ...] = field(default_factory=tuple)
     v5_overlay_rules_enabled: bool = False
@@ -458,6 +481,32 @@ class V6ExecutionConfig:
     v5_reentry_wait_15m_candles: int = 0
     exit_opposite_threshold: float = 0.62
     max_wait_probability_for_entry: float = 0.42
+    entry_gate_policy_v2_enabled: bool = True
+    mixed_structure_macro_arbitration_enabled: bool = False
+    mixed_structure_probability_fallback_max_losses: int = 3
+    telegram_whale_bridge_file: Path = DEFAULT_TELEGRAM_WHALE_BRIDGE_FILE
+    telegram_whale_fallback_enabled: bool = True
+    telegram_whale_fallback_max_bridge_age_seconds: int = 180
+    telegram_whale_fallback_max_event_age_minutes: int = 360
+    telegram_whale_fallback_min_notional_usdt: float = 250_000.0
+    telegram_whale_fallback_min_abs_score: float = 0.75
+    telegram_whale_fallback_max_model_gap: float = 0.015
+    entry_gate_event_recording_enabled: bool = False
+    entry_gate_min_notional_multiplier: float = 0.30
+    entry_gate_profile_unlisted_multiplier: float = 0.85
+    entry_gate_macro_mismatch_multiplier: float = 0.50
+    entry_gate_macro_neutral_multiplier: float = 1.00
+    entry_gate_fib_missing_multiplier: float = 0.90
+    entry_gate_trend_conflict_multiplier: float = 0.65
+    entry_gate_probe_stop_loss_pct: float = 0.015
+    gann_position_sizing_enabled: bool = False
+    gann_position_sizing_symbols: tuple[str, ...] = ("BTCUSDT",)
+    gann_lookback_days: int = 365
+    gann_min_cycle_days: int = 14
+    gann_min_drawdown_pct: float = 10.0
+    gann_stability_shift_days: int = 3
+    close_resolver_enabled: bool = False
+    close_intent_coalescing_enabled: bool = False
     entry_structure_filter_enabled: bool = True
     entry_structure_boundary_near_pct: float = 2.0
     entry_structure_rejection_near_pct: float = 0.8
@@ -470,6 +519,9 @@ class V6ExecutionConfig:
     entry_confluence_hold_break_tolerance_pct: float = 0.15
     entry_confluence_hold_min_lines: int = 3
     entry_confluence_hold_lookback_1m: int = 15
+    entry_scan_rebound_rejection_near_pct: float = 0.5
+    entry_scan_mid_ma_retest_near_pct: float = 0.8
+    entry_scan_breakout_breakdown_near_pct: float = 1.0
     generic_indicator_symbols: tuple[str, ...] = field(default_factory=tuple)
     generic_indicator_label: str = "\u901a\u7528\u6307\u6807"
     generic_indicator_1m_cross_lookback: int = 3
@@ -541,7 +593,13 @@ class V6ExecutionConfig:
     v5_momentum_guard_hyper_whale_file: Path = Path("data/trading_system/skill_bridges/hyperdash-hype-whale-distill.json")
     smart_signal_risk_guard_enabled: bool = True
     smart_signal_file: Path = Path("data/trading_system/skill_bridges/binance-smart-signal.json")
-    smart_signal_snapshot_max_age_hours: float = 2.0
+    smart_signal_snapshot_max_age_hours: float = 0.5
+    smart_signal_exit_snapshot_max_age_hours: float = 0.25
+    smart_signal_ma20_confirm_pct: float = 0.05
+    smart_signal_volume_confirm_ratio: float = 1.5
+    smart_signal_oi_expand_confirm_pct: float = 1.0
+    smart_signal_position_retreat_confirm_pct: float = 10.0
+    smart_signal_risk_confirmation_snapshots: int = 2
     smart_signal_risk_reduce_fraction: float = 0.30
     dust_position_notional_usdt: float = 1.0
     strategy_dust_position_notional_usdt: float = 5.0
@@ -551,6 +609,7 @@ class V6ExecutionConfig:
     v5_profit_reentry_ma20_near_pct: float = 0.5
     v5_staged_entry_enabled: bool = False
     v5_initial_entry_notional_fraction: float = 0.30
+    v5_staged_entry_min_notional_usdt: float = 5.0
     v5_scale_in_min_hold_minutes: float = 0.0
     v5_scale_in_require_15m_ma20_retest: bool = False
     v5_scale_in_15m_ma20_retest_near_pct: float = 0.6
@@ -593,6 +652,15 @@ class V6ExecutionConfig:
     protective_stop_cancel_settle_seconds: float = 2.0
     close_retry_cooldown_minutes: int = 5
     logic_weakening_reentry_cooldown_minutes: int = 30
+    manager_reentry_lock_enabled: bool = True
+    manager_reentry_lock_v5_overlay_enabled: bool = False
+    manager_reentry_lock_4h_min_hours: float = 4.0
+    manager_reentry_lock_daily_min_hours: float = 24.0
+    manager_reentry_lock_max_hours: float = 72.0
+
+    def __post_init__(self) -> None:
+        if self.manual_exchange_action_audit_file is None:
+            self.manual_exchange_action_audit_file = self.state_dir / "manual_exchange_actions.jsonl"
 
     @classmethod
     def from_env(cls) -> "V6ExecutionConfig":
@@ -614,15 +682,25 @@ class V6ExecutionConfig:
             binance_request_retries=_env_int("TS_BINANCE_REQUEST_RETRIES", 3),
             position_mode=os.getenv("TS_V6_BINANCE_POSITION_MODE", "auto"),
             margin_type=os.getenv("TS_V6_MARGIN_TYPE", "ISOLATED"),
+            account_asset_mode=os.getenv("TS_V6_ACCOUNT_ASSET_MODE", "SINGLE_ASSET"),
+            virtual_risk_isolation_enabled=_env_bool("TS_V6_VIRTUAL_RISK_ISOLATION_ENABLED", False),
+            instance_name=os.getenv("TS_V6_INSTANCE_NAME", "default").strip() or "default",
+            exit_control_mode=os.getenv("TS_V6_EXIT_CONTROL_MODE", "automatic").strip().lower(),
+            manual_exchange_action_audit_enabled=_env_bool("TS_V6_MANUAL_EXCHANGE_ACTION_AUDIT_ENABLED", False),
             model_path=Path(os.getenv("TS_V6_MODEL_PATH", str(DEFAULT_MODEL_PATH))),
             state_dir=state_dir,
             state_file=Path(os.getenv("TS_V6_STATE_FILE", str(state_dir / "state.json"))),
             signals_file=Path(os.getenv("TS_V6_SIGNALS_FILE", str(state_dir / "signals.jsonl"))),
+            entry_gate_events_file=Path(os.getenv("TS_V6_ENTRY_GATE_EVENTS_FILE", str(state_dir / "entry_gate_events.jsonl"))),
+            entry_gate_events_max_bytes=_env_int("TS_V6_ENTRY_GATE_EVENTS_MAX_BYTES", 20 * 1024 * 1024),
             orders_file=Path(os.getenv("TS_V6_ORDERS_FILE", str(state_dir / "orders.jsonl"))),
             wal_file=Path(os.getenv("TS_V6_EXECUTION_WAL_FILE", str(state_dir / "execution_wal.jsonl"))),
             latest_summary_file=Path(os.getenv("TS_V6_LATEST_SUMMARY_FILE", str(state_dir / "latest_run_summary.json"))),
             closed_trade_review_queue_file=Path(os.getenv("TS_V6_CLOSED_TRADE_REVIEW_QUEUE_FILE", str(state_dir / "closed_trade_review_queue.jsonl"))),
             post_trade_training_samples_file=Path(os.getenv("TS_V6_POST_TRADE_TRAINING_SAMPLES_FILE", str(state_dir / "post_trade_training_samples.jsonl"))),
+            manual_exchange_action_audit_file=Path(
+                os.getenv("TS_V6_MANUAL_EXCHANGE_ACTION_AUDIT_FILE", str(state_dir / "manual_exchange_actions.jsonl"))
+            ),
             kline_cache_dir=Path(
                 os.getenv(
                     "TS_V6_KLINE_CACHE_DIR",
@@ -639,6 +717,7 @@ class V6ExecutionConfig:
                 "TS_V6_PUBLIC_TICKER_24H_TTL_SECONDS",
                 _env_int("TS_V6_PUBLIC_CACHE_TTL_SECONDS", 300),
             ),
+            exchange_info_cache_ttl_seconds=_env_int("TS_V6_EXCHANGE_INFO_CACHE_TTL_SECONDS", 180),
             kline_refresh_interval_1m_seconds=_env_int("TS_V6_KLINE_REFRESH_1M_SECONDS", 20),
             kline_refresh_interval_15m_seconds=_env_int("TS_V6_KLINE_REFRESH_15M_SECONDS", 120),
             kline_refresh_interval_4h_seconds=_env_int("TS_V6_KLINE_REFRESH_4H_SECONDS", 600),
@@ -661,12 +740,64 @@ class V6ExecutionConfig:
             symbol_short_entry_thresholds=parse_symbol_float_map(
                 os.getenv("TS_V6_SYMBOL_SHORT_ENTRY_THRESHOLDS", os.getenv("TS_V6_SYMBOL_ENTRY_THRESHOLDS", ""))
             ),
+            symbol_notional_multipliers=parse_symbol_float_map(
+                os.getenv("TS_V6_SYMBOL_NOTIONAL_MULTIPLIERS", "")
+            ),
             technical_entry_only_symbols=tuple(parse_symbols(os.getenv("TS_V6_TECHNICAL_ENTRY_ONLY_SYMBOLS", ""))),
             four_h_entry_15m_selector_symbols=tuple(
                 parse_symbols(os.getenv("TS_V6_4H_ENTRY_15M_SELECTOR_SYMBOLS", "BTCUSDT,ETHUSDT"))
             ),
             exit_opposite_threshold=_env_float("TS_V6_EXIT_OPPOSITE_THRESHOLD", 0.62),
             max_wait_probability_for_entry=_env_float("TS_V6_MAX_WAIT_PROBABILITY_FOR_ENTRY", 0.42),
+            entry_gate_policy_v2_enabled=_env_bool("TS_V6_ENTRY_GATE_POLICY_V2_ENABLED", True),
+            mixed_structure_macro_arbitration_enabled=_env_bool(
+                "TS_V6_MIXED_STRUCTURE_MACRO_ARBITRATION_ENABLED",
+                False,
+            ),
+            mixed_structure_probability_fallback_max_losses=max(
+                1,
+                _env_int("TS_V6_MIXED_STRUCTURE_PROBABILITY_FALLBACK_MAX_LOSSES", 3),
+            ),
+            telegram_whale_bridge_file=Path(
+                os.getenv("TS_V6_TELEGRAM_WHALE_BRIDGE_FILE", str(DEFAULT_TELEGRAM_WHALE_BRIDGE_FILE))
+            ),
+            telegram_whale_fallback_enabled=_env_bool("TS_V6_TELEGRAM_WHALE_FALLBACK_ENABLED", True),
+            telegram_whale_fallback_max_bridge_age_seconds=max(
+                30,
+                _env_int("TS_V6_TELEGRAM_WHALE_FALLBACK_MAX_BRIDGE_AGE_SECONDS", 180),
+            ),
+            telegram_whale_fallback_max_event_age_minutes=max(
+                15,
+                _env_int("TS_V6_TELEGRAM_WHALE_FALLBACK_MAX_EVENT_AGE_MINUTES", 360),
+            ),
+            telegram_whale_fallback_min_notional_usdt=max(
+                0.0,
+                _env_float("TS_V6_TELEGRAM_WHALE_FALLBACK_MIN_NOTIONAL_USDT", 250_000.0),
+            ),
+            telegram_whale_fallback_min_abs_score=max(
+                0.0,
+                min(1.0, _env_float("TS_V6_TELEGRAM_WHALE_FALLBACK_MIN_ABS_SCORE", 0.75)),
+            ),
+            telegram_whale_fallback_max_model_gap=max(
+                0.0,
+                min(1.0, _env_float("TS_V6_TELEGRAM_WHALE_FALLBACK_MAX_MODEL_GAP", 0.015)),
+            ),
+            entry_gate_event_recording_enabled=_env_bool("TS_V6_ENTRY_GATE_EVENT_RECORDING_ENABLED", True),
+            entry_gate_min_notional_multiplier=_env_float("TS_V6_ENTRY_GATE_MIN_NOTIONAL_MULTIPLIER", 0.30),
+            entry_gate_profile_unlisted_multiplier=_env_float("TS_V6_ENTRY_GATE_PROFILE_UNLISTED_MULTIPLIER", 0.85),
+            entry_gate_macro_mismatch_multiplier=_env_float("TS_V6_ENTRY_GATE_MACRO_MISMATCH_MULTIPLIER", 0.50),
+            entry_gate_macro_neutral_multiplier=_env_float("TS_V6_ENTRY_GATE_MACRO_NEUTRAL_MULTIPLIER", 1.00),
+            entry_gate_fib_missing_multiplier=_env_float("TS_V6_ENTRY_GATE_FIB_MISSING_MULTIPLIER", 0.90),
+            entry_gate_trend_conflict_multiplier=_env_float("TS_V6_ENTRY_GATE_TREND_CONFLICT_MULTIPLIER", 0.65),
+            entry_gate_probe_stop_loss_pct=_env_float("TS_V6_ENTRY_GATE_PROBE_STOP_LOSS_PCT", 0.015),
+            gann_position_sizing_enabled=_env_bool("TS_V6_GANN_POSITION_SIZING_ENABLED", False),
+            gann_position_sizing_symbols=tuple(parse_symbols(os.getenv("TS_V6_GANN_POSITION_SIZING_SYMBOLS", "BTCUSDT"))),
+            gann_lookback_days=_env_int("TS_V6_GANN_LOOKBACK_DAYS", 365),
+            gann_min_cycle_days=_env_int("TS_V6_GANN_MIN_CYCLE_DAYS", 14),
+            gann_min_drawdown_pct=_env_float("TS_V6_GANN_MIN_DRAWDOWN_PCT", 10.0),
+            gann_stability_shift_days=_env_int("TS_V6_GANN_STABILITY_SHIFT_DAYS", 3),
+            close_resolver_enabled=_env_bool("TS_V6_CLOSE_RESOLVER_ENABLED", True),
+            close_intent_coalescing_enabled=_env_bool("TS_V6_CLOSE_COALESCE_ENABLED", True),
             entry_structure_filter_enabled=_env_bool("TS_V6_ENTRY_STRUCTURE_FILTER_ENABLED", True),
             entry_structure_boundary_near_pct=_env_float("TS_V6_ENTRY_STRUCTURE_BOUNDARY_NEAR_PCT", 2.0),
             entry_structure_rejection_near_pct=_env_float("TS_V6_ENTRY_STRUCTURE_REJECTION_NEAR_PCT", 0.8),
@@ -679,6 +810,18 @@ class V6ExecutionConfig:
             entry_confluence_hold_break_tolerance_pct=_env_float("TS_V6_ENTRY_CONFLUENCE_HOLD_BREAK_TOLERANCE_PCT", 0.15),
             entry_confluence_hold_min_lines=_env_int("TS_V6_ENTRY_CONFLUENCE_HOLD_MIN_LINES", 3),
             entry_confluence_hold_lookback_1m=_env_int("TS_V6_ENTRY_CONFLUENCE_HOLD_LOOKBACK_1M", 15),
+            entry_scan_rebound_rejection_near_pct=max(
+                0.0,
+                _env_float("TS_V6_ENTRY_SCAN_REBOUND_REJECTION_NEAR_PCT", 0.5),
+            ),
+            entry_scan_mid_ma_retest_near_pct=max(
+                0.0,
+                _env_float("TS_V6_ENTRY_SCAN_MID_MA_RETEST_NEAR_PCT", 0.8),
+            ),
+            entry_scan_breakout_breakdown_near_pct=max(
+                0.0,
+                _env_float("TS_V6_ENTRY_SCAN_BREAKOUT_BREAKDOWN_NEAR_PCT", 1.0),
+            ),
             generic_indicator_symbols=tuple(parse_symbols(os.getenv("TS_V6_GENERIC_INDICATOR_SYMBOLS", ""))),
             generic_indicator_label=os.getenv("TS_V6_GENERIC_INDICATOR_LABEL", "\u901a\u7528\u6307\u6807"),
             generic_indicator_1m_cross_lookback=_env_int("TS_V6_GENERIC_INDICATOR_1M_CROSS_LOOKBACK", 3),
@@ -759,7 +902,16 @@ class V6ExecutionConfig:
             ),
             smart_signal_risk_guard_enabled=_env_bool("TS_V6_SMART_SIGNAL_RISK_GUARD_ENABLED", True),
             smart_signal_file=Path(os.getenv("TS_V6_SMART_SIGNAL_FILE", "data/trading_system/skill_bridges/binance-smart-signal.json")),
-            smart_signal_snapshot_max_age_hours=_env_float("TS_V6_SMART_SIGNAL_SNAPSHOT_MAX_AGE_HOURS", 2.0),
+            smart_signal_snapshot_max_age_hours=_env_float("TS_V6_SMART_SIGNAL_SNAPSHOT_MAX_AGE_HOURS", 0.5),
+            smart_signal_exit_snapshot_max_age_hours=_env_float("TS_V6_SMART_SIGNAL_EXIT_SNAPSHOT_MAX_AGE_HOURS", 0.25),
+            smart_signal_ma20_confirm_pct=_env_float("TS_V6_SMART_SIGNAL_MA20_CONFIRM_PCT", 0.05),
+            smart_signal_volume_confirm_ratio=_env_float("TS_V6_SMART_SIGNAL_VOLUME_CONFIRM_RATIO", 1.5),
+            smart_signal_oi_expand_confirm_pct=_env_float("TS_V6_SMART_SIGNAL_OI_EXPAND_CONFIRM_PCT", 1.0),
+            smart_signal_position_retreat_confirm_pct=_env_float("TS_V6_SMART_SIGNAL_POSITION_RETREAT_CONFIRM_PCT", 10.0),
+            smart_signal_risk_confirmation_snapshots=max(
+                1,
+                _env_int("TS_V6_SMART_SIGNAL_RISK_CONFIRMATION_SNAPSHOTS", 2),
+            ),
             smart_signal_risk_reduce_fraction=_env_float("TS_V6_SMART_SIGNAL_RISK_REDUCE_FRACTION", 0.30),
             dust_position_notional_usdt=_env_float("TS_V6_DUST_POSITION_NOTIONAL_USDT", 1.0),
             strategy_dust_position_notional_usdt=_env_float("TS_V6_STRATEGY_DUST_POSITION_NOTIONAL_USDT", 5.0),
@@ -769,6 +921,7 @@ class V6ExecutionConfig:
             v5_profit_reentry_ma20_near_pct=_env_float("TS_V5_PROFIT_REENTRY_MA20_NEAR_PCT", 0.5),
             v5_staged_entry_enabled=_env_bool("TS_V5_STAGED_ENTRY_ENABLED", False),
             v5_initial_entry_notional_fraction=_env_float("TS_V5_INITIAL_ENTRY_NOTIONAL_FRACTION", 0.30),
+            v5_staged_entry_min_notional_usdt=_env_float("TS_V5_STAGED_ENTRY_MIN_NOTIONAL_USDT", 5.0),
             v5_scale_in_min_hold_minutes=_env_float("TS_V5_SCALE_IN_MIN_HOLD_MINUTES", 0.0),
             v5_scale_in_require_15m_ma20_retest=_env_bool("TS_V5_SCALE_IN_REQUIRE_15M_MA20_RETEST", False),
             v5_scale_in_15m_ma20_retest_near_pct=_env_float("TS_V5_SCALE_IN_15M_MA20_RETEST_NEAR_PCT", 0.6),
@@ -813,18 +966,76 @@ class V6ExecutionConfig:
             protective_stop_cancel_settle_seconds=_env_float("TS_V6_PROTECTIVE_STOP_CANCEL_SETTLE_SECONDS", 2.0),
             close_retry_cooldown_minutes=_env_int("TS_V6_CLOSE_RETRY_COOLDOWN_MINUTES", 5),
             logic_weakening_reentry_cooldown_minutes=_env_int("TS_V6_LOGIC_WEAKENING_REENTRY_COOLDOWN_MINUTES", 30),
+            manager_reentry_lock_enabled=_env_bool("TS_V6_MANAGER_REENTRY_LOCK_ENABLED", True),
+            manager_reentry_lock_v5_overlay_enabled=_env_bool("TS_V6_MANAGER_REENTRY_LOCK_V5_OVERLAY_ENABLED", False),
+            manager_reentry_lock_4h_min_hours=_env_float("TS_V6_MANAGER_REENTRY_LOCK_4H_MIN_HOURS", 4.0),
+            manager_reentry_lock_daily_min_hours=_env_float("TS_V6_MANAGER_REENTRY_LOCK_DAILY_MIN_HOURS", 24.0),
+            manager_reentry_lock_max_hours=_env_float("TS_V6_MANAGER_REENTRY_LOCK_MAX_HOURS", 72.0),
         )
 
     def ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.signals_file.parent.mkdir(parents=True, exist_ok=True)
+        self.entry_gate_events_file.parent.mkdir(parents=True, exist_ok=True)
         self.orders_file.parent.mkdir(parents=True, exist_ok=True)
         self.wal_file.parent.mkdir(parents=True, exist_ok=True)
         self.latest_summary_file.parent.mkdir(parents=True, exist_ok=True)
         self.closed_trade_review_queue_file.parent.mkdir(parents=True, exist_ok=True)
         self.post_trade_training_samples_file.parent.mkdir(parents=True, exist_ok=True)
+        assert self.manual_exchange_action_audit_file is not None
+        self.manual_exchange_action_audit_file.parent.mkdir(parents=True, exist_ok=True)
         self.kline_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def mutable_runtime_paths(self) -> tuple[Path, ...]:
+        return (
+            self.state_file,
+            self.signals_file,
+            self.entry_gate_events_file,
+            self.orders_file,
+            self.wal_file,
+            self.latest_summary_file,
+            self.closed_trade_review_queue_file,
+            self.post_trade_training_samples_file,
+            self.manual_exchange_action_audit_file or (self.state_dir / "manual_exchange_actions.jsonl"),
+        )
+
+    def validate_runtime_isolation(self) -> None:
+        if self.exit_control_mode not in {"automatic", "stop_only_manual_profit"}:
+            raise V6ExecutionError(f"Unsupported V6 exit control mode: {self.exit_control_mode}")
+        if canonical_order_mode(self.order_mode) != "live_order":
+            return
+
+        live_root = self.state_dir.resolve(strict=False)
+        demo_root = Path(os.getenv("TS_V6_DEMO_EXECUTION_DIR", str(DEFAULT_STATE_DIR))).resolve(strict=False)
+        if live_root == demo_root or demo_root in live_root.parents:
+            raise V6ExecutionError(
+                f"V6 live execution state must not use the Demo state directory: {self.state_dir}"
+            )
+
+        for path in self.mutable_runtime_paths():
+            resolved = path.resolve(strict=False)
+            if resolved != live_root and live_root not in resolved.parents:
+                raise V6ExecutionError(
+                    f"V6 live mutable path must stay under {self.state_dir}: {path}"
+                )
+            if resolved == demo_root or demo_root in resolved.parents:
+                raise V6ExecutionError(
+                    f"V6 live mutable path points into the Demo state directory: {path}"
+                )
+
+        if (
+            self.live_api_key
+            and self.demo_api_key
+            and self.live_api_secret
+            and self.demo_api_secret
+            and self.live_api_key == self.demo_api_key
+            and self.live_api_secret == self.demo_api_secret
+        ):
+            raise V6ExecutionError("V6 Live and Demo credentials must be different")
+
+    def stop_only_manual_profit(self) -> bool:
+        return str(self.exit_control_mode or "automatic").strip().lower() == "stop_only_manual_profit"
 
     def kline_limit_for_interval(self, interval: str) -> int:
         limits = {
@@ -851,8 +1062,26 @@ class V6ExecutionConfig:
     def short_entry_threshold_for(self, symbol: str) -> float:
         return float(self.symbol_short_entry_thresholds.get(str(symbol or "").upper(), self.short_entry_threshold))
 
+    def notional_multiplier_for(self, symbol: str) -> float:
+        normalized = str(symbol or "").strip().upper()
+        if normalized and not normalized.endswith("USDT"):
+            normalized = f"{normalized}USDT"
+        multiplier = float(self.symbol_notional_multipliers.get(normalized, 1.0))
+        return clamp(multiplier, 0.05, 1.0)
+
+    def base_notional_for(self, symbol: str) -> float:
+        configured_base = max(float(self.base_notional_usdt), float(self.min_notional_usdt))
+        return configured_base * self.notional_multiplier_for(symbol)
+
     def technical_entry_only_for(self, symbol: str) -> bool:
         return str(symbol or "").upper() in {item.upper() for item in self.technical_entry_only_symbols}
+
+    def entry_gate_policy_v2_for(self, symbol: str) -> bool:
+        return bool(self.entry_gate_policy_v2_enabled and self.technical_entry_only_for(symbol))
+
+    def gann_position_sizing_for(self, symbol: str) -> bool:
+        enabled_symbols = {item.upper() for item in self.gann_position_sizing_symbols}
+        return bool(self.gann_position_sizing_enabled and str(symbol or "").upper() in enabled_symbols)
 
     def four_h_entry_requires_15m_selector_for(self, symbol: str) -> bool:
         return str(symbol or "").upper() in {item.upper() for item in self.four_h_entry_15m_selector_symbols}
@@ -867,6 +1096,13 @@ class V6ExecutionConfig:
         if not technical_symbols:
             return True
         return str(symbol or "").upper() in technical_symbols
+
+    def manager_reentry_lock_active_for(self, symbol: str) -> bool:
+        if not self.manager_reentry_lock_enabled:
+            return False
+        if self.v5_overlay_rules_active_for(symbol) and not self.manager_reentry_lock_v5_overlay_enabled:
+            return False
+        return True
 
 
 def canonical_order_mode(raw: str) -> str:
@@ -1672,10 +1908,20 @@ class V6BinanceClient:
 
     def exchange_info(self) -> dict[str, Any]:
         if self._exchange_info_cache is None:
+            cache_key = canonical_order_mode(self.config.order_mode)
+            cached = self.load_public_cache(
+                "exchangeInfo",
+                cache_key,
+                max_age_seconds=max(0, int(self.config.exchange_info_cache_ttl_seconds)),
+            )
+            if cached:
+                self._exchange_info_cache = cached
+                return self._exchange_info_cache
             payload = self.public_get("/fapi/v1/exchangeInfo", order_endpoint=self.config.order_mode != "dry_run")
             if not isinstance(payload, dict):
                 raise V6ExecutionError("exchangeInfo returned non-dict payload")
             self._exchange_info_cache = payload
+            self.save_public_cache("exchangeInfo", cache_key, payload)
         return self._exchange_info_cache
 
     def quantity_rules(self, symbol: str) -> tuple[float, float]:
@@ -1689,6 +1935,20 @@ class V6BinanceClient:
             if lot_filter:
                 return float(lot_filter.get("stepSize") or 0.0), float(lot_filter.get("minQty") or 0.0)
         raise V6ExecutionError(f"quantity rules not found for {symbol}")
+
+    def minimum_notional_rule(self, symbol: str) -> float:
+        for item in self.exchange_info().get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+            for flt in item.get("filters", []):
+                if flt.get("filterType") not in {"MIN_NOTIONAL", "NOTIONAL"}:
+                    continue
+                try:
+                    return max(0.0, float(flt.get("notional") or flt.get("minNotional") or 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+            return 0.0
+        raise V6ExecutionError(f"minimum notional rule not found for {symbol}")
 
     def price_tick_size(self, symbol: str) -> float:
         for item in self.exchange_info().get("symbols", []):
@@ -1724,6 +1984,8 @@ class V6BinanceClient:
         return self.format_decimal(qty)
 
     def resolve_close_quantity(self, intent: V6OrderIntent) -> str:
+        if self.config.close_resolver_enabled:
+            return self.resolve_close_quantity_via_resolver(intent)
         actual = self.actual_position_for_intent(intent)
         if actual is None:
             raise V6ExecutionError(f"no exchange position found for {intent.symbol} {intent.action}")
@@ -1746,6 +2008,55 @@ class V6BinanceClient:
         else:
             quantity = self.round_down_to_step(quantity, step)
         return self.format_decimal(quantity)
+
+    def resolve_close_quantity_via_resolver(self, intent: V6OrderIntent) -> str:
+        actual = self.actual_position_for_intent(intent)
+        if actual is not None:
+            amount = float(actual.get("positionAmt") or 0.0)
+            expected_side = "short" if intent.action == "close_short" else "long"
+            actual_side = self.position_side_from_risk_row(actual)
+            if actual_side != expected_side:
+                raise V6ExecutionError(
+                    f"exchange position side mismatch for {intent.symbol}: "
+                    f"expected={expected_side} actual={actual_side} amount={amount}"
+                )
+        step, _min_quantity = self.quantity_rules(intent.symbol)
+        min_notional = self.minimum_notional_rule(intent.symbol)
+        mark_price = 0.0
+        if actual is not None:
+            try:
+                mark_price = float(actual.get("markPrice") or 0.0)
+            except (TypeError, ValueError):
+                mark_price = 0.0
+        if mark_price <= 0:
+            mark_price = float(intent.entry_price or 0.0)
+        dust_threshold = max(
+            0.0,
+            float(self.config.dust_position_notional_usdt or 0.0),
+            float(self.config.strategy_dust_position_notional_usdt or 0.0),
+        )
+        decision = resolve_close_quantity_decision(
+            requested_fraction=clamp(float(intent.close_fraction or 1.0), 0.0, 1.0),
+            exchange_position=actual,
+            mark_price=mark_price,
+            step_size=step,
+            min_notional_usdt=min_notional,
+            dust_notional_usdt=dust_threshold,
+        )
+        risk_plan = dict(intent.risk_plan or {})
+        risk_plan["close_decision"] = asdict(decision)
+        intent.risk_plan = risk_plan
+        if decision.mode == "skip_missing_exchange_position":
+            raise V6ExecutionError(
+                f"no exchange position found for {intent.symbol} {intent.action} "
+                f"(close_resolver: {decision.reason})"
+            )
+        if decision.mode == "skip_zero":
+            raise V6ExecutionError(
+                f"resolved zero partial close quantity for {intent.symbol} {intent.action} "
+                f"(close_resolver: {decision.reason})"
+            )
+        return decision.quantity
 
     def actual_position_for_intent(self, intent: V6OrderIntent) -> dict[str, Any] | None:
         expected_side = "short" if intent.action in {"open_short", "close_short"} else "long"
@@ -1833,7 +2144,11 @@ class V6BinanceClient:
         after = self.exchange_position_snapshot(after_row)
         before_qty = abs(float(before.get("position_amt") or 0.0))
         after_qty = abs(float(after.get("position_amt") or 0.0))
-        if intent.action in {"open_long", "open_short"}:
+        after_state = "unknown" if after_error else "position" if after_row is not None else "flat"
+        confirmation_state = "unknown" if after_error else "confirmed"
+        if after_error or before_error:
+            delta_qty = 0.0
+        elif intent.action in {"open_long", "open_short"}:
             delta_qty = max(0.0, after_qty - before_qty)
         elif intent.action in {"close_long", "close_short"}:
             delta_qty = max(0.0, before_qty - after_qty)
@@ -1844,6 +2159,8 @@ class V6BinanceClient:
             "symbol": intent.symbol,
             "side": "short" if intent.action in {"open_short", "close_short"} else "long",
             "action": intent.action,
+            "confirmation_state": confirmation_state,
+            "after_state": after_state,
             "before": before,
             "after": after,
             "delta_qty_abs": round(delta_qty, 12),
@@ -1859,6 +2176,11 @@ class V6BinanceClient:
             return False
         reconcile = result.get("position_reconcile")
         if not isinstance(reconcile, dict):
+            return False
+        if str(reconcile.get("confirmation_state") or "confirmed") != "confirmed":
+            return True
+        action = str(reconcile.get("action") or (result.get("intent") or {}).get("action") or "")
+        if action in {"close_long", "close_short"} and str(reconcile.get("after_state") or "") == "flat":
             return False
         try:
             delta_qty = abs(float(reconcile.get("delta_qty_abs") or 0.0))
@@ -2190,6 +2512,7 @@ class V6BinanceClient:
     def submit_protective_stop(self, intent: V6OrderIntent, quantity: str | None = None) -> dict[str, Any]:
         stop_side = "SELL" if intent.action == "open_long" else "BUY"
         position_mode = self.current_position_mode()
+        close_remaining_position = self.config.stop_only_manual_profit()
         params: dict[str, Any] = {
             "symbol": intent.symbol,
             "side": stop_side,
@@ -2197,12 +2520,17 @@ class V6BinanceClient:
             "algoType": "CONDITIONAL",
             "type": "STOP_MARKET",
             "triggerPrice": self.resolve_price(intent.symbol, intent.stop_loss_price),
-            "quantity": quantity or self.resolve_quantity(intent.symbol, intent.quantity_hint_usdt, intent.entry_price),
             "workingType": "MARK_PRICE",
             **self.signed_params(),
         }
-        if position_mode != "hedge":
-            params["reduceOnly"] = "true"
+        if close_remaining_position:
+            # A quantity-bound stop reserves the full position and prevents a
+            # manual partial close. Close-all tracks whatever quantity remains.
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = quantity or self.resolve_quantity(intent.symbol, intent.quantity_hint_usdt, intent.entry_price)
+            if position_mode != "hedge":
+                params["reduceOnly"] = "true"
         payload = self.signed_request("POST", "/fapi/v1/algoOrder", params)
         return {
             "status": "submitted",
@@ -2385,14 +2713,51 @@ class V6ModelScorer:
     def __init__(self, model_path: Path) -> None:
         self.model_path = model_path
         self.model = None
+        self._dimension_warning_emitted = False
         if model_path.exists():
             with model_path.open("rb") as fh:
                 self.model = pickle.load(fh)
 
+    def expected_feature_count(self) -> int | None:
+        if self.model is None:
+            return None
+        raw = getattr(self.model, "n_features_in_", None)
+        try:
+            if raw is not None and int(raw) > 0:
+                return int(raw)
+        except (TypeError, ValueError):
+            pass
+        num_feature = getattr(self.model, "num_feature", None)
+        if callable(num_feature):
+            try:
+                value = int(num_feature())
+                return value if value > 0 else None
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def compatible_vector(self, features: CoinFeatures) -> np.ndarray:
+        values = [float(value) for value in features.to_feature_vector()]
+        expected = self.expected_feature_count()
+        if expected is not None and expected != len(values):
+            if expected < len(values):
+                values = values[:expected]
+            else:
+                values.extend([0.0] * (expected - len(values)))
+            if not self._dimension_warning_emitted:
+                LOGGER.warning(
+                    "adapted CoinFeatures vector for loaded model: runtime=%d expected=%d model=%s",
+                    len(features.to_feature_vector()),
+                    expected,
+                    self.model_path,
+                )
+                self._dimension_warning_emitted = True
+        return np.asarray([values], dtype=float)
+
     def quality_score(self, features: CoinFeatures) -> float:
         if self.model is None:
             return 0.5
-        vector = np.array([features.to_feature_vector()])
+        vector = self.compatible_vector(features)
         if hasattr(self.model, "predict_proba"):
             probs = self.model.predict_proba(vector)[0]
             if len(probs) > 1:
@@ -2404,6 +2769,7 @@ class V6ModelScorer:
 class V6ExecutionEngine:
     def __init__(self, config: V6ExecutionConfig | None = None) -> None:
         self.config = config or V6ExecutionConfig.from_env()
+        self.config.validate_runtime_isolation()
         self.config.ensure_dirs()
         self.client = V6BinanceClient(self.config)
         self.scorer = V6ModelScorer(self.config.model_path)
@@ -2411,6 +2777,8 @@ class V6ExecutionEngine:
         self._v5_sentiment_metadata_cache: dict[str, dict[str, Any]] | None = None
         self._v5_momentum_panel_cache: dict[str, dict[str, dict[str, Any]]] | None = None
         self._smart_signal_cache: dict[str, dict[str, Any]] | None = None
+        self.telegram_whale_bridge = TelegramWhaleBridgeReader(self.config.telegram_whale_bridge_file)
+        self.entry_gate_registry = default_entry_gate_registry()
 
     def close(self) -> None:
         self.client.close()
@@ -2449,9 +2817,7 @@ class V6ExecutionEngine:
             try:
                 signal = self.build_signal(symbol)
                 signals.append(signal)
-                intent = self.intent_for_signal(signal, state)
-                if intent:
-                    intents.append(intent)
+                intents.extend(self.intents_for_signal(signal, state))
             except Exception as exc:
                 LOGGER.exception("V6 signal build failed for %s", symbol)
                 results.append({
@@ -2463,6 +2829,8 @@ class V6ExecutionEngine:
         def compact_signal_for_jsonl(signal_data: dict[str, Any]) -> dict[str, Any]:
             h4 = signal_data.get("h4") if isinstance(signal_data.get("h4"), dict) else {}
             fifteen_m = signal_data.get("fifteen_m") if isinstance(signal_data.get("fifteen_m"), dict) else {}
+            levels = signal_data.get("levels") if isinstance(signal_data.get("levels"), dict) else {}
+            gann = levels.get("gann_feature") if isinstance(levels.get("gann_feature"), dict) else {}
             return {
                 "symbol": signal_data.get("symbol"),
                 "computed_at": signal_data.get("computed_at"),
@@ -2486,6 +2854,18 @@ class V6ExecutionEngine:
                     "above_ma20": fifteen_m.get("above_ma20"),
                     "ma20_slope_pct": fifteen_m.get("ma20_slope_pct"),
                 },
+                "gann_feature": {
+                    key: gann.get(key)
+                    for key in (
+                        "zone",
+                        "bias",
+                        "confidence",
+                        "anchor_stability",
+                        "position_sizing_enabled",
+                        "policy",
+                    )
+                    if gann.get(key) is not None
+                },
             }
 
         signal_dicts = [signal.to_dict() for signal in signals]
@@ -2493,12 +2873,32 @@ class V6ExecutionEngine:
         for signal_data in compact_signal_dicts:
             append_text_line(self.config.signals_file, json.dumps(signal_data, ensure_ascii=False))
         should_commit_dry = self.config.commit_dry_run_state if commit_dry_run_state is None else commit_dry_run_state
+        if self.config.close_intent_coalescing_enabled:
+            original_count = len(intents)
+            intents = coalesce_close_intents(intents)
+            if len(intents) != original_count:
+                append_text_line(
+                    self.config.orders_file,
+                    json.dumps(
+                        {
+                            "event": "close_intents_coalesced",
+                            "before_count": original_count,
+                            "after_count": len(intents),
+                            "coalesced_at": utc_now_iso(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
         for intent in intents:
+            self.annotate_intent_execution_risk(intent)
             result: dict[str, Any]
             existing_position: dict[str, Any] | None = None
             pre_submit_cancellation: dict[str, Any] | None = None
+            close_preflight: dict[str, Any] | None = None
             try:
                 existing_position = self.find_position(state, intent.symbol, side=local_side_for_action(intent.action)) if intent.action in {"close_long", "close_short"} or self.is_scale_in_intent(intent) else None
+                if submit and intent.action in {"close_long", "close_short"}:
+                    close_preflight = self.preflight_close_quantity(intent)
                 if submit and existing_position and intent.action in {"close_long", "close_short"}:
                     pre_submit_cancellation = self.cancel_protective_stop_if_present(existing_position)
                     if pre_submit_cancellation:
@@ -2509,8 +2909,8 @@ class V6ExecutionEngine:
                         pre_submit_cancellation["clear_wait"] = cancel_wait
                         if cancel_wait.get("status") in {"still_open", "failed"}:
                             retry_wait = None
-                            if self.is_staged_take_profit_intent(intent):
-                                retry_wait = self.mark_partial_take_profit_retry_wait(
+                            if self.is_partial_take_profit_intent(intent):
+                                retry_wait = self.mark_partial_close_retry_wait(
                                     existing_position,
                                     intent,
                                     "protective stop cancel is still pending before reduce-only close",
@@ -2540,6 +2940,8 @@ class V6ExecutionEngine:
                             pre_submit_cancellation["settle_wait_seconds"] = settle_seconds
                 if submit:
                     result = self.client.submit_order(intent)
+                    if close_preflight:
+                        result["close_preflight"] = close_preflight
                     if pre_submit_cancellation:
                         result["pre_submit_cancelled_protective_stop"] = pre_submit_cancellation
                 else:
@@ -2608,6 +3010,8 @@ class V6ExecutionEngine:
                 }
                 if pre_submit_cancellation:
                     failed["pre_submit_cancelled_protective_stop"] = pre_submit_cancellation
+                if close_preflight:
+                    failed["close_preflight"] = close_preflight
                 if (
                     submit
                     and intent.action in {"open_long", "open_short"}
@@ -2746,8 +3150,8 @@ class V6ExecutionEngine:
                         if reconcile_result:
                             maintenance.append(reconcile_result)
                         retry_position = self.find_position(state, intent.symbol, side=local_side_for_action(intent.action))
-                        if retry_position and self.is_staged_take_profit_intent(intent):
-                            retry_wait = self.mark_partial_take_profit_retry_wait(
+                        if retry_position and self.is_partial_take_profit_intent(intent):
+                            retry_wait = self.mark_partial_close_retry_wait(
                                 retry_position,
                                 intent,
                                 error_text,
@@ -2814,8 +3218,8 @@ class V6ExecutionEngine:
                                                 maintenance.append(sync)
                                                 append_text_line(self.config.orders_file, json.dumps({"event": "partial_take_profit_protective_stop_sync_after_reduce_only_retry", "intent": intent.to_dict(), "sync": sync}, ensure_ascii=False))
                                 continue
-                        if retry_position and self.is_staged_take_profit_intent(intent):
-                            retry_wait = self.mark_partial_take_profit_retry_wait(
+                        if retry_position and self.is_partial_take_profit_intent(intent):
+                            retry_wait = self.mark_partial_close_retry_wait(
                                 retry_position,
                                 intent,
                                 error_text,
@@ -2917,6 +3321,14 @@ class V6ExecutionEngine:
                 for symbol in self.config.symbols
             },
             "technical_entry_only_symbols": list(self.config.technical_entry_only_symbols),
+            "mixed_structure_macro_arbitration_enabled": self.config.mixed_structure_macro_arbitration_enabled,
+            "mixed_structure_probability_fallback_max_losses": self.config.mixed_structure_probability_fallback_max_losses,
+            "mixed_structure_probability_fallback_guards": dict(
+                state.get("mixed_structure_probability_fallback_guards") or {}
+            ),
+            "cross_timeframe_macro_observations": dict(
+                state.get("cross_timeframe_macro_observations") or {}
+            ),
             "four_h_entry_15m_selector_symbols": list(self.config.four_h_entry_15m_selector_symbols),
             "entry_mode_by_symbol": {
                 symbol: (
@@ -3096,12 +3508,48 @@ class V6ExecutionEngine:
         )
         h4 = compute_h4_structure(symbol, klines_4h, mark_price)
         features = self.features_from_context(symbol, mark_price, ticker, bb, h4, klines_4h, klines_15m)
+        telegram_whale_snapshot = self.telegram_whale_bridge.snapshot(
+            symbol,
+            max_bridge_age_seconds=self.config.telegram_whale_fallback_max_bridge_age_seconds,
+            max_event_age_minutes=self.config.telegram_whale_fallback_max_event_age_minutes,
+        )
+        apply_telegram_whale_snapshot(features, telegram_whale_snapshot)
+        telegram_whale_flow = compact_telegram_whale_snapshot(telegram_whale_snapshot)
         quality = self.scorer.quality_score(features)
         fifteen_m = self.fifteen_m_state(mark_price, bb, klines_15m)
         mid_retest = self.mid_retest_state(mark_price, bb)
         one_m = self.one_m_state(mark_price, bb)
         levels = self.levels(mark_price, bb, h4, klines_15m=klines_15m, klines_4h=klines_4h, klines_1d=klines_1d)
+        levels["telegram_whale_flow"] = telegram_whale_flow
         levels["generic_indicator_1m"] = self.generic_indicator_1m_state(mark_price, klines_1m)
+        gann_feature = compute_gann_feature(
+            symbol,
+            self.closed_kline_rows(klines_1d),
+            lookback_days=max(30, int(self.config.gann_lookback_days)),
+            min_cycle_days=max(2, int(self.config.gann_min_cycle_days)),
+            min_drawdown_pct=max(0.0, float(self.config.gann_min_drawdown_pct)),
+            stability_shift_days=max(0, int(self.config.gann_stability_shift_days)),
+        )
+        if gann_feature is None:
+            levels["gann_feature"] = {
+                "symbol": str(symbol or "").upper(),
+                "zone": "unknown",
+                "bias": "unknown",
+                "confidence": 0.0,
+                "stale": False,
+                "position_sizing_enabled": self.config.gann_position_sizing_for(symbol),
+                "policy": "btc_macro_position_sizing_only",
+                "reason": "insufficient_or_unstable_daily_anchor",
+            }
+        else:
+            gann_payload = gann_feature.to_dict()
+            gann_payload["position_sizing_enabled"] = self.config.gann_position_sizing_for(symbol)
+            gann_payload["policy"] = "btc_macro_position_sizing_only"
+            if str(symbol or "").upper() == "ZECUSDT" and gann_payload.get("zone") == "below_1x2":
+                gann_payload["raw_bias"] = gann_payload.get("bias")
+                gann_payload["bias"] = "neutral"
+                gann_payload["interpretation"] = "zec_below_1x2_is_rebound_prone_not_short_support"
+            levels["gann_feature"] = gann_payload
         indicators = self.indicator_snapshot(mark_price, bb, klines_15m=klines_15m)
         indicators["recent_extremes"] = {
             "1m": self.recent_kline_extremes(klines_1m, lookback=3),
@@ -3111,6 +3559,12 @@ class V6ExecutionEngine:
                 lookback=max(3, int(self.config.entry_confluence_hold_lookback_1m)),
             ),
         }
+        indicators["entry_risk_flags"] = self.entry_risk_flags(
+            fifteen_m=fifteen_m,
+            levels=levels,
+            mid_retest=mid_retest,
+            model_quality_score=quality,
+        )
         long_prob, short_prob, wait_prob, reasons = self.direction_probabilities(
             mark_price=mark_price,
             quality=quality,
@@ -3125,6 +3579,24 @@ class V6ExecutionEngine:
             bb96_210_second_test_15m=levels.get("bb96_210_second_test_15m"),
         )
         reasons = self.apply_symbol_entry_profile_reasons(symbol, reasons, levels)
+        gann_state = levels.get("gann_feature") if isinstance(levels.get("gann_feature"), dict) else {}
+        if gann_state.get("position_sizing_enabled") and float(gann_state.get("confidence") or 0.0) >= 0.40:
+            reasons.append(
+                "BTC Gann macro sizing factor: "
+                f"zone={gann_state.get('zone')} bias={gann_state.get('bias')} "
+                f"confidence={float(gann_state.get('confidence') or 0.0):.2f}"
+            )
+        if (
+            telegram_whale_flow.get("available")
+            and telegram_whale_flow.get("bridge_fresh")
+            and telegram_whale_flow.get("fresh")
+        ):
+            reasons.append(
+                "Telegram whale flow is auxiliary only: "
+                f"direction={telegram_whale_flow.get('direction')} "
+                f"score={float(telegram_whale_flow.get('fallback_score') or 0.0):+.2f} "
+                f"window={int(telegram_whale_flow.get('fallback_window_minutes') or 0)}m"
+            )
         side_bias = "neutral"
         if long_prob >= max(short_prob, wait_prob):
             side_bias = "long"
@@ -4001,6 +4473,8 @@ class V6ExecutionEngine:
         weak_tail = weak_recent[-weak_required:] if len(weak_recent) >= weak_required else []
         long_logic_weakened = bool(len(weak_tail) == weak_required and all(item["long_logic_weakened"] for item in weak_tail))
         short_logic_weakened = bool(len(weak_tail) == weak_required and all(item["short_logic_weakened"] for item in weak_tail))
+        last_closed_open_time = int(rows[-1][0])
+        last_closed_close_time = int(rows[-1][6]) if len(rows[-1]) > 6 else last_closed_open_time + KLINE_INTERVAL_MS["4h"]
         return {
             "ready": True,
             "timeframe": "4h",
@@ -4009,6 +4483,8 @@ class V6ExecutionEngine:
             "ma20": round(ma20, 8),
             "price": round(price, 8),
             "price_distance_pct": round(pct_diff(price, ma20), 6),
+            "last_closed_open_time": last_closed_open_time,
+            "last_closed_close_time": last_closed_close_time,
             "cross_up_seen": cross_up,
             "cross_down_seen": cross_down,
             "retest_hold": retest_hold,
@@ -4663,7 +5139,14 @@ class V6ExecutionEngine:
         near_levels: list[dict[str, Any]] = []
         long_candidates: list[dict[str, Any]] = []
         short_candidates: list[dict[str, Any]] = []
-        near_pct = float(self.config.mid_retest_near_pct)
+        rebound_rejection_near_pct = max(0.0, float(self.config.entry_scan_rebound_rejection_near_pct))
+        mid_ma_retest_near_pct = max(0.0, float(self.config.entry_scan_mid_ma_retest_near_pct))
+        breakout_breakdown_near_pct = max(0.0, float(self.config.entry_scan_breakout_breakdown_near_pct))
+        max_near_pct = max(
+            rebound_rejection_near_pct,
+            mid_ma_retest_near_pct,
+            breakout_breakdown_near_pct,
+        )
 
         def append_candidate(row: dict[str, Any]) -> None:
             signal = str(row.get("structure_signal") or "")
@@ -4679,40 +5162,32 @@ class V6ExecutionEngine:
                 continue
             distance = pct_diff(price, value)
             abs_distance = abs(distance)
-            if abs_distance > near_pct:
-                continue
             band = str(parsed["band"])
+            if band == "lower":
+                structure_signal = "long_lower_support_rebound" if distance >= 0 else "short_lower_breakdown_retest"
+                near_pct_limit = rebound_rejection_near_pct if distance >= 0 else breakout_breakdown_near_pct
+            elif band == "mid":
+                structure_signal = "long_mid_support_retest" if distance >= 0 else "short_mid_resistance_retest"
+                near_pct_limit = mid_ma_retest_near_pct
+            elif band == "upper":
+                structure_signal = "long_upper_breakout" if distance >= 0 else "short_upper_rejection"
+                near_pct_limit = breakout_breakdown_near_pct if distance >= 0 else rebound_rejection_near_pct
+            else:
+                continue
+            if abs_distance > near_pct_limit:
+                continue
             row = {
                 "name": name,
                 "price": round(value, 8),
                 "distance_pct": round(distance, 6),
                 "abs_distance_pct": round(abs_distance, 6),
+                "near_pct_limit": round(near_pct_limit, 6),
                 "period": parsed["period"],
                 "band": band,
                 "timeframe": parsed["timeframe"],
+                "structure_signal": structure_signal,
             }
-            if band == "lower":
-                if distance >= 0:
-                    row["structure_signal"] = "long_lower_support_rebound"
-                    long_candidates.append(row)
-                else:
-                    row["structure_signal"] = "short_lower_breakdown_retest"
-                    short_candidates.append(row)
-            elif band == "mid":
-                if distance >= 0:
-                    row["structure_signal"] = "long_mid_support_retest"
-                    long_candidates.append(row)
-                else:
-                    row["structure_signal"] = "short_mid_resistance_retest"
-                    short_candidates.append(row)
-            elif band == "upper":
-                if distance >= 0:
-                    row["structure_signal"] = "long_upper_breakout"
-                    long_candidates.append(row)
-                else:
-                    row["structure_signal"] = "short_upper_rejection"
-                    short_candidates.append(row)
-            near_levels.append(row)
+            append_candidate(row)
 
         for name, value in ma_levels or []:
             parsed = self.parse_shared_ma_name(name)
@@ -4720,13 +5195,14 @@ class V6ExecutionEngine:
                 continue
             distance = pct_diff(price, value)
             abs_distance = abs(distance)
-            if abs_distance > near_pct:
+            if abs_distance > mid_ma_retest_near_pct:
                 continue
             row = {
                 "name": name,
                 "price": round(value, 8),
                 "distance_pct": round(distance, 6),
                 "abs_distance_pct": round(abs_distance, 6),
+                "near_pct_limit": round(mid_ma_retest_near_pct, 6),
                 "period": parsed["period"],
                 "band": "ma",
                 "timeframe": parsed["timeframe"],
@@ -4764,13 +5240,14 @@ class V6ExecutionEngine:
                 prev_close = float(closed[previous_index][4])
                 close_now = float(closed[current_index][4])
                 distance = pct_diff(price, ma_now)
-                if abs(distance) > near_pct:
+                if abs(distance) > breakout_breakdown_near_pct:
                     continue
                 base = {
                     "name": f"ma{period}_{timeframe}",
                     "price": round(ma_now, 8),
                     "distance_pct": round(distance, 6),
                     "abs_distance_pct": round(abs(distance), 6),
+                    "near_pct_limit": round(breakout_breakdown_near_pct, 6),
                     "period": period,
                     "band": "ma",
                     "timeframe": timeframe,
@@ -4791,7 +5268,12 @@ class V6ExecutionEngine:
         long_candidates.sort(key=lambda item: (item["abs_distance_pct"], item["timeframe"], int(item["period"])))
         short_candidates.sort(key=lambda item: (item["abs_distance_pct"], item["timeframe"], int(item["period"])))
         return {
-            "near_pct": near_pct,
+            "near_pct": max_near_pct,
+            "near_pct_by_structure": {
+                "rebound_rejection": round(rebound_rejection_near_pct, 6),
+                "mid_ma_retest": round(mid_ma_retest_near_pct, 6),
+                "breakout_breakdown": round(breakout_breakdown_near_pct, 6),
+            },
             "near_level_count": len(near_levels),
             "long_candidate_count": len(long_candidates),
             "short_candidate_count": len(short_candidates),
@@ -5082,6 +5564,7 @@ class V6ExecutionEngine:
         metadata = self.v5_candidate_metadata_for_symbol(symbol)
         if not metadata:
             return
+        price_momentum_only = self.candidate_is_price_momentum_only(metadata)
         risk_plan["v5_candidate_metadata"] = {
             "symbol": str(metadata.get("symbol") or symbol).upper(),
             "score": metadata.get("score"),
@@ -5093,20 +5576,49 @@ class V6ExecutionEngine:
             else [],
             "notes": str(metadata.get("notes") or "")[:300],
             "has_news_confirmation": self.candidate_has_news_confirmation(metadata),
-            "price_momentum_only": self.candidate_is_price_momentum_only(metadata),
+            "price_momentum_only": price_momentum_only,
         }
+        if (
+            price_momentum_only
+            and self.config.v5_overlay_rules_active_for(symbol)
+            and not str(risk_plan.get("strategy_id") or "").strip()
+        ):
+            risk_plan["strategy_id"] = "v5_no_news_momentum"
+            risk_plan["strategy_version"] = "v5"
+            risk_plan["strategy_provenance"] = "entry_snapshot"
 
     def v5_no_news_momentum_position_metadata(self, position: dict[str, Any]) -> dict[str, Any]:
-        risk_plan = position.get("risk_plan") if isinstance(position.get("risk_plan"), dict) else {}
-        metadata = risk_plan.get("v5_candidate_metadata") if isinstance(risk_plan.get("v5_candidate_metadata"), dict) else {}
-        if metadata:
-            return dict(metadata)
-        return self.v5_candidate_metadata_for_symbol(str(position.get("symbol") or ""))
+        raw_risk_plan = position.get("risk_plan")
+        risk_plan: dict[str, Any] = raw_risk_plan if isinstance(raw_risk_plan, dict) else {}
+        raw_metadata = risk_plan.get("v5_candidate_metadata")
+        metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        return dict(metadata)
 
     def is_v5_no_news_momentum_position(self, position: dict[str, Any]) -> bool:
         if not self.config.v5_no_news_momentum_tp_enabled:
             return False
+        raw_risk_plan = position.get("risk_plan")
+        risk_plan: dict[str, Any] = raw_risk_plan if isinstance(raw_risk_plan, dict) else {}
+        strategy_id = str(position.get("strategy_id") or risk_plan.get("strategy_id") or "").strip().lower()
+        if strategy_id != "v5_no_news_momentum":
+            return False
         return self.candidate_is_price_momentum_only(self.v5_no_news_momentum_position_metadata(position))
+
+    @staticmethod
+    def inherit_position_strategy_provenance(
+        position: dict[str, Any],
+        risk_plan: dict[str, Any],
+    ) -> None:
+        """Keep explicit parent strategy identity on scale-in lots without inference."""
+        raw_source = position.get("risk_plan")
+        source: dict[str, Any] = raw_source if isinstance(raw_source, dict) else {}
+        for key in ("strategy_id", "strategy_version", "strategy_provenance"):
+            value = position.get(key) or source.get(key)
+            if value is not None and str(value).strip():
+                risk_plan[key] = value
+        metadata = source.get("v5_candidate_metadata")
+        if isinstance(metadata, dict) and metadata:
+            risk_plan["v5_candidate_metadata"] = dict(metadata)
 
     def v5_profit_reentry_guard_block(self, signal: V6Signal, state: dict[str, Any], action: str) -> dict[str, Any] | None:
         if not self.config.v5_profit_reentry_guard_enabled or action not in {"open_long", "open_short"}:
@@ -5249,12 +5761,26 @@ class V6ExecutionEngine:
                     "second_test_zone": lower,
                 }
         profile = symbol_bb_entry_profile(symbol)
+        profile_soft_mode = bool(profile and self.config.entry_gate_policy_v2_for(symbol))
         profile_filter: dict[str, Any] = {}
         if profile:
-            candidates = [item for item in raw_candidates if bb_entry_profile_allows(symbol, item)]
+            allowed = [item for item in raw_candidates if bb_entry_profile_allows(symbol, item)]
             blocked = [item for item in raw_candidates if not bb_entry_profile_allows(symbol, item)]
+            if profile_soft_mode:
+                candidates = []
+                for item in raw_candidates:
+                    candidate = dict(item)
+                    candidate["profile_status"] = "preferred" if bb_entry_profile_allows(symbol, item) else "unlisted"
+                    candidate["profile_prior_multiplier"] = (
+                        1.0 if candidate["profile_status"] == "preferred"
+                        else round(float(self.config.entry_gate_profile_unlisted_multiplier), 6)
+                    )
+                    candidates.append(candidate)
+            else:
+                candidates = allowed
             profile_filter = {
                 "enabled": True,
+                "mode": "soft_prior" if profile_soft_mode else "hard_allowlist",
                 "symbol": str(symbol or "").upper(),
                 "profile": str(profile.get("name") or ""),
                 "source": str(profile.get("source") or ""),
@@ -5268,9 +5794,12 @@ class V6ExecutionEngine:
                     for timeframe, period, band, structure_signal in profile.get("allow") or ()
                 ],
                 "input_candidate_count": len(raw_candidates),
-                "allowed_candidate_count": len(candidates),
-                "blocked_candidate_count": len(blocked),
-                "blocked_candidates": blocked[:8],
+                "allowed_candidate_count": len(allowed),
+                "unlisted_candidate_count": len(blocked),
+                "unlisted_candidates": blocked[:8],
+                "blocked_candidate_count": 0 if profile_soft_mode else len(blocked),
+                "blocked_candidates": [] if profile_soft_mode else blocked[:8],
+                "candidate_count_after_profile": len(candidates),
             }
         allow_synthetic_second_test = not profile or bool(profile.get("allow_synthetic_15m_second_test", True))
         if second_test_candidate and allow_synthetic_second_test:
@@ -5292,7 +5821,7 @@ class V6ExecutionEngine:
         daily_candidate: dict[str, Any] = {}
         ma20_value = float(ma20_pressure.get("value") or 0.0)
         profile_allows_4h_ma20 = bool(profile and profile.get("allow_4h_ma20_pressure"))
-        if (not profile or profile_allows_4h_ma20) and action == "open_short" and ma20_pressure.get("pressure_active") and h4_right_side.get("short_confirmed") and ma20_value > 0:
+        if (not profile or profile_allows_4h_ma20 or profile_soft_mode) and action == "open_short" and ma20_pressure.get("pressure_active") and h4_right_side.get("short_confirmed") and ma20_value > 0:
             ma20_candidate = {
                 "name": "ma20_4h",
                 "price": round(ma20_value, 8),
@@ -5303,7 +5832,7 @@ class V6ExecutionEngine:
                 "timeframe": "4h",
                 "structure_signal": "short_4h_ma20_pressure_retest",
             }
-        elif (not profile or profile_allows_4h_ma20) and action == "open_long" and ma20_pressure.get("support_active") and h4_right_side.get("long_confirmed") and ma20_value > 0:
+        elif (not profile or profile_allows_4h_ma20 or profile_soft_mode) and action == "open_long" and ma20_pressure.get("support_active") and h4_right_side.get("long_confirmed") and ma20_value > 0:
             ma20_candidate = {
                 "name": "ma20_4h",
                 "price": round(ma20_value, 8),
@@ -5314,14 +5843,14 @@ class V6ExecutionEngine:
                 "timeframe": "4h",
                 "structure_signal": "long_4h_ma20_support_retest",
             }
-        if not profile and action == "open_long" and daily_trend.get("long_confirmed"):
+        if (not profile or profile_soft_mode) and action == "open_long" and daily_trend.get("long_confirmed"):
             daily_candidate = dict(daily_trend.get("entry_level") or {})
             daily_candidate.setdefault("name", "ma7_1d")
             daily_candidate.setdefault("timeframe", "1d")
             daily_candidate.setdefault("period", 7)
             daily_candidate.setdefault("band", "ma")
             daily_candidate.setdefault("structure_signal", "long_1d_ma7_rebreak")
-        elif not profile and action == "open_short" and daily_trend.get("short_confirmed"):
+        elif (not profile or profile_soft_mode) and action == "open_short" and daily_trend.get("short_confirmed"):
             daily_candidate = dict(daily_trend.get("entry_level") or {})
             daily_candidate.setdefault("name", "ma7_1d")
             daily_candidate.setdefault("timeframe", "1d")
@@ -5424,6 +5953,11 @@ class V6ExecutionEngine:
             "bb96_210_second_test_candidate": second_test_candidate,
             "generic_indicator": generic_indicator,
             "symbol_bb_entry_profile": profile_filter,
+            "telegram_whale_flow": (
+                dict(levels.get("telegram_whale_flow") or {})
+                if isinstance(levels.get("telegram_whale_flow"), dict)
+                else {}
+            ),
             "countertrend_rebound": countertrend_rebound,
             "macro_trend_context": (
                 "daily_short_rebound_long" if countertrend_rebound and action == "open_long"
@@ -5550,16 +6084,54 @@ class V6ExecutionEngine:
             "structure_entry_scan": levels.get("structure_entry_scan") or {},
         }
 
+    def refresh_cross_timeframe_macro_observation(self, signal: V6Signal, state: dict[str, Any]) -> None:
+        if not self.config.mixed_structure_macro_arbitration_enabled:
+            return
+        levels = signal.levels if isinstance(signal.levels, dict) else {}
+        context = {
+            "daily_ma7_trend": levels.get("daily_ma7_trend") if isinstance(levels.get("daily_ma7_trend"), dict) else {},
+            "h4_right_side": levels.get("h4_right_side") if isinstance(levels.get("h4_right_side"), dict) else {},
+        }
+        if self.cross_timeframe_macro_arbitration_applicable(signal, context, state):
+            self.cross_timeframe_macro_entry_block(signal, "open_long", context, state=state)
+
+    def intents_for_signal(self, signal: V6Signal, state: dict[str, Any]) -> list[V6OrderIntent]:
+        primary_intent = self.intent_for_signal(signal, state)
+        if primary_intent is None:
+            return []
+        if primary_intent.action not in {"close_long", "close_short"}:
+            return [primary_intent]
+
+        # intent_for_signal remains the compatibility entrypoint and refreshes macro
+        # state once. Only inspect the opposite hedge side for an additional exit.
+        exit_intents = [primary_intent]
+        for position in self.find_positions(state, signal.symbol):
+            position_side = str(position.get("side") or "").lower()
+            expected_action = "close_short" if position_side == "short" else "close_long"
+            if expected_action == primary_intent.action:
+                continue
+            exit_intent = self.exit_intent_if_needed(signal, position, state=state)
+            if exit_intent:
+                exit_intents.append(exit_intent)
+        return exit_intents
+
     def intent_for_signal(self, signal: V6Signal, state: dict[str, Any]) -> V6OrderIntent | None:
+        """Return one action for compatibility with external callers and tests."""
+        self.refresh_cross_timeframe_macro_observation(signal, state)
         positions = self.find_positions(state, signal.symbol)
         for position in positions:
-            exit_intent = self.exit_intent_if_needed(signal, position)
+            exit_intent = self.exit_intent_if_needed(signal, position, state=state)
             if exit_intent:
                 return exit_intent
-        if self.entry_cooldown_active(state, signal.symbol):
-            return None
-        if len(self.active_positions(state)) >= self.config.max_positions:
-            return None
+        return self._entry_intent_for_signal(signal, state, positions)
+
+    def _entry_intent_for_signal(
+        self,
+        signal: V6Signal,
+        state: dict[str, Any],
+        positions: list[dict[str, Any]],
+    ) -> V6OrderIntent | None:
+        at_position_capacity = len(self.active_positions(state)) >= self.config.max_positions
 
         if self.config.technical_entry_only_for(signal.symbol):
             return self.intent_for_technical_entry_signal(signal, state, positions)
@@ -5567,36 +6139,59 @@ class V6ExecutionEngine:
         if signal.wait_probability > self.config.max_wait_probability_for_entry:
             return None
 
-        if signal.short_probability >= self.config.short_entry_threshold_for(signal.symbol):
-            same_side = self.find_position(state, signal.symbol, side="short")
-            if same_side:
-                return self.scale_in_intent_if_needed(signal, same_side)
+        short_threshold_met = signal.short_probability >= self.config.short_entry_threshold_for(signal.symbol)
+        short_lock = self.manager_reentry_lock_block(signal, state, "open_short")
+        short_suppressed = self.entry_cooldown_active(state, signal.symbol, "short") or short_lock is not None
+        short_same_side = self.find_position(state, signal.symbol, side="short")
+        if short_threshold_met and not short_suppressed and (short_same_side is not None or not at_position_capacity):
+            entry_context = self.entry_context_for_action("open_short", signal.levels or {}, symbol=signal.symbol)
+            reversal_block = self.manager_reversal_entry_block(signal, state, "open_short", entry_context)
+            if reversal_block:
+                self.apply_entry_structure_block(signal, reversal_block)
+                return None
+            if short_same_side:
+                return self.scale_in_intent_if_needed(signal, short_same_side, state=state)
+            if at_position_capacity:
+                return None
             if positions and not self.can_open_opposite_symbol_position():
                 return None
             chase_block = self.v5_profit_reentry_guard_block(signal, state, "open_short")
             if chase_block:
                 self.apply_entry_structure_block(signal, chase_block)
                 return None
-            block = self.entry_structure_block(signal, "open_short")
+            block = self.entry_structure_block(signal, "open_short", entry_context)
             if block:
                 self.apply_entry_structure_block(signal, block)
                 return None
-            return self.open_intent(signal, "open_short")
-        if signal.long_probability >= self.config.long_entry_threshold_for(signal.symbol):
-            same_side = self.find_position(state, signal.symbol, side="long")
-            if same_side:
-                return self.scale_in_intent_if_needed(signal, same_side)
+            return self.open_intent(signal, "open_short", entry_context=entry_context)
+        long_threshold_met = signal.long_probability >= self.config.long_entry_threshold_for(signal.symbol)
+        long_lock = self.manager_reentry_lock_block(signal, state, "open_long")
+        long_suppressed = self.entry_cooldown_active(state, signal.symbol, "long") or long_lock is not None
+        long_same_side = self.find_position(state, signal.symbol, side="long")
+        if long_threshold_met and not long_suppressed and (long_same_side is not None or not at_position_capacity):
+            entry_context = self.entry_context_for_action("open_long", signal.levels or {}, symbol=signal.symbol)
+            reversal_block = self.manager_reversal_entry_block(signal, state, "open_long", entry_context)
+            if reversal_block:
+                self.apply_entry_structure_block(signal, reversal_block)
+                return None
+            if long_same_side:
+                return self.scale_in_intent_if_needed(signal, long_same_side, state=state)
+            if at_position_capacity:
+                return None
             if positions and not self.can_open_opposite_symbol_position():
                 return None
             chase_block = self.v5_profit_reentry_guard_block(signal, state, "open_long")
             if chase_block:
                 self.apply_entry_structure_block(signal, chase_block)
                 return None
-            block = self.entry_structure_block(signal, "open_long")
+            block = self.entry_structure_block(signal, "open_long", entry_context)
             if block:
                 self.apply_entry_structure_block(signal, block)
                 return None
-            return self.open_intent(signal, "open_long")
+            return self.open_intent(signal, "open_long", entry_context=entry_context)
+        final_lock = long_lock if long_threshold_met and long_lock is not None else short_lock if short_threshold_met else None
+        if final_lock is not None:
+            self.apply_entry_structure_block(signal, final_lock)
         return None
 
     def intent_for_technical_entry_signal(
@@ -5607,16 +6202,46 @@ class V6ExecutionEngine:
     ) -> V6OrderIntent | None:
         candidates: list[dict[str, Any]] = []
         last_block: dict[str, Any] | None = None
+        at_position_capacity = len(self.active_positions(state)) >= self.config.max_positions
         for action in ("open_short", "open_long"):
-            context = self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
-            macro_block = self.macro_direction_entry_block(signal, action, context)
-            if macro_block:
-                last_block = macro_block
-                continue
             side = "short" if action == "open_short" else "long"
+            if self.entry_cooldown_active(state, signal.symbol, side):
+                continue
+            manager_lock = self.manager_reentry_lock_block(signal, state, action)
+            if manager_lock:
+                last_block = manager_lock
+                continue
+            context = self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
+            reversal_block = self.manager_reversal_entry_block(signal, state, action, context)
+            if reversal_block:
+                last_block = reversal_block
+                continue
+            macro_block = self.macro_direction_entry_block(signal, action, context, state=state)
+            if not self.config.entry_gate_policy_v2_for(signal.symbol):
+                if macro_block:
+                    if (
+                        str(macro_block.get("reason") or "") == "mixed_structure_probability_fallback_loss_streak"
+                        or str((last_block or {}).get("reason") or "") != "mixed_structure_probability_fallback_loss_streak"
+                    ):
+                        last_block = macro_block
+                    continue
+            elif macro_block and str(macro_block.get("reason") or "") in {
+                "mixed_structure_macro_direction_mismatch",
+                "mixed_structure_macro_direction_neutral",
+                "mixed_structure_probability_fallback_loss_streak",
+                "mixed_structure_cross_timeframe_4h_direction_active",
+                "mixed_structure_cross_timeframe_4h_logic_weakened",
+                "mixed_structure_cross_timeframe_wait_key_structure_break",
+            }:
+                if (
+                    str(macro_block.get("reason") or "") == "mixed_structure_probability_fallback_loss_streak"
+                    or str((last_block or {}).get("reason") or "") != "mixed_structure_probability_fallback_loss_streak"
+                ):
+                    last_block = macro_block
+                continue
             same_side = self.find_position(state, signal.symbol, side=side)
             if same_side:
-                scale_intent = self.scale_in_intent_if_needed(signal, same_side, require_probability=False)
+                scale_intent = self.scale_in_intent_if_needed(signal, same_side, require_probability=False, state=state)
                 if scale_intent:
                     candidates.append({
                         "action": action,
@@ -5624,6 +6249,8 @@ class V6ExecutionEngine:
                         "context": (scale_intent.risk_plan or {}).get("entry_context") or {},
                         "rank": (250.0, 0.0, 0.0),
                 })
+                continue
+            if at_position_capacity:
                 continue
             if positions and not self.can_open_opposite_symbol_position():
                 continue
@@ -5656,21 +6283,577 @@ class V6ExecutionEngine:
         )
         if reason not in signal.reasons:
             signal.reasons.append(reason)
-        return self.open_intent(signal, str(selected["action"]))
+        return self.open_intent(signal, str(selected["action"]), entry_context=context)
 
-    def macro_direction_entry_block(self, signal: V6Signal, action: str, context: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    @staticmethod
+    def mixed_structure_direction_state(signal: V6Signal) -> dict[str, Any]:
+        levels = signal.levels if isinstance(signal.levels, dict) else {}
+        scan = levels.get("structure_entry_scan") if isinstance(levels.get("structure_entry_scan"), dict) else {}
+
+        def candidate_count(count_key: str, candidates_key: str) -> int:
+            candidates = scan.get(candidates_key) if isinstance(scan.get(candidates_key), list) else []
+            try:
+                explicit_count = int(scan.get(count_key) or 0)
+            except (TypeError, ValueError):
+                explicit_count = 0
+            return max(explicit_count, len(candidates))
+
+        long_count = candidate_count("long_candidate_count", "long_candidates")
+        short_count = candidate_count("short_candidate_count", "short_candidates")
+        return {
+            "active": long_count > 0 and short_count > 0,
+            "long_candidate_count": long_count,
+            "short_candidate_count": short_count,
+        }
+
+    @staticmethod
+    def macro_structure_components(signal: V6Signal, context: dict[str, Any]) -> dict[str, Any]:
+        daily = context.get("daily_ma7_trend") if isinstance(context.get("daily_ma7_trend"), dict) else {}
+        daily_long = bool(daily.get("long_confirmed"))
+        daily_short = bool(daily.get("short_confirmed"))
+        daily_direction = "neutral"
+        daily_source = "daily_unresolved"
+        daily_conflict = False
+        if daily_long and daily_short:
+            daily_conflict = True
+            daily_source = "daily_ma7_trend_conflict"
+        elif daily_long:
+            daily_direction = "long"
+            daily_source = "daily_ma7_trend_confirmed"
+        elif daily_short:
+            daily_direction = "short"
+            daily_source = "daily_ma7_trend_confirmed"
+        elif daily.get("ready"):
+            bearish_stack = bool(daily.get("bearish_stack"))
+            bullish_stack = bool(daily.get("bullish_stack"))
+            if bearish_stack and bullish_stack:
+                daily_conflict = True
+                daily_source = "daily_ma_stack_conflict"
+            elif bearish_stack:
+                daily_direction = "short"
+                daily_source = "daily_ma20_above_ma7"
+            elif bullish_stack:
+                daily_direction = "long"
+                daily_source = "daily_ma7_above_ma20"
+
+        h4_right_side = context.get("h4_right_side") if isinstance(context.get("h4_right_side"), dict) else {}
+        h4_long = bool(h4_right_side.get("long_confirmed"))
+        h4_short = bool(h4_right_side.get("short_confirmed"))
+        h4_direction = "neutral"
+        h4_source = "4h_unresolved"
+        h4_conflict = False
+        if h4_long and h4_short:
+            h4_conflict = True
+            h4_source = "4h_right_side_conflict"
+        elif h4_long != h4_short:
+            h4_direction = "long" if h4_long else "short"
+            h4_source = "4h_right_side"
+        else:
+            h4 = signal.h4 if isinstance(signal.h4, dict) else {}
+            try:
+                ma20_slope = float(h4.get("ma20_slope_pct") or 0.0)
+            except (TypeError, ValueError):
+                ma20_slope = 0.0
+            above_ma20 = h4.get("above_ma20")
+            if above_ma20 is True and ma20_slope > 0:
+                h4_direction = "long"
+                h4_source = "4h_ma20_slope"
+            elif above_ma20 is False and ma20_slope < 0:
+                h4_direction = "short"
+                h4_source = "4h_ma20_slope"
+
+        cross_timeframe_conflict = bool(
+            not daily_conflict
+            and not h4_conflict
+            and daily_direction in {"long", "short"}
+            and h4_direction in {"long", "short"}
+            and daily_direction != h4_direction
+        )
+        return {
+            "daily_direction": daily_direction,
+            "daily_source": daily_source,
+            "daily_conflict": daily_conflict,
+            "h4_direction": h4_direction,
+            "h4_source": h4_source,
+            "h4_conflict": h4_conflict,
+            "cross_timeframe_conflict": cross_timeframe_conflict,
+        }
+
+    @classmethod
+    def macro_structure_direction(cls, signal: V6Signal, context: dict[str, Any]) -> tuple[str, str]:
+        components = cls.macro_structure_components(signal, context)
+        if components["daily_conflict"]:
+            return "neutral", str(components["daily_source"])
+        if components["h4_conflict"]:
+            return "neutral", str(components["h4_source"])
+        if components["cross_timeframe_conflict"]:
+            return "neutral", "daily_4h_direction_conflict"
+        if components["daily_direction"] in {"long", "short"}:
+            return str(components["daily_direction"]), str(components["daily_source"])
+        if components["h4_direction"] in {"long", "short"}:
+            return str(components["h4_direction"]), str(components["h4_source"])
+
+        return "neutral", "unresolved"
+
+    def cross_timeframe_key_structure_break_confirmation(
+        self,
+        signal: V6Signal,
+        action: str,
+    ) -> dict[str, Any]:
+        """Confirm the opposite entry only after a current 15M/4H structure break.
+
+        The daily direction already existed before the 4H thesis weakened, so it
+        is not itself a new reversal trigger. A closed-candle MA cross or a
+        break/retest of a BB middle/outer boundary is required before reversal.
+        """
+        levels = signal.levels if isinstance(signal.levels, dict) else {}
+        scan = levels.get("structure_entry_scan") if isinstance(levels.get("structure_entry_scan"), dict) else {}
+        candidates_key = "short_candidates" if action == "open_short" else "long_candidates"
+        candidates = [dict(item) for item in scan.get(candidates_key) or [] if isinstance(item, dict)]
+        allowed_signals = (
+            {"short_ma_break_cross", "short_mid_resistance_retest", "short_lower_breakdown_retest"}
+            if action == "open_short"
+            else {"long_ma_reclaim_cross", "long_mid_support_retest", "long_upper_breakout"}
+        )
+        recent = (
+            (signal.indicators or {})
+            .get("recent_extremes", {})
+            .get("1m", {})
+        )
+        recent = recent if isinstance(recent, dict) else {}
+        current_price = float(signal.price or 0.0)
+        tolerance = max(0.0, float(self.config.entry_structure_rejection_near_pct)) / 100.0
+        evaluated: list[dict[str, Any]] = []
+        confirmed_candidate: dict[str, Any] = {}
+        for candidate in candidates:
+            structure_signal = str(candidate.get("structure_signal") or "")
+            timeframe = str(candidate.get("timeframe") or "")
+            if timeframe not in {"15m", "4h"} or structure_signal not in allowed_signals:
+                continue
+            level_price = float(candidate.get("price") or 0.0)
+            if level_price <= 0 or current_price <= 0:
+                continue
+            confirmation_source = ""
+            confirmed = False
+            if structure_signal in {"short_ma_break_cross", "long_ma_reclaim_cross"} and candidate.get("source") == "ma_cross":
+                confirmed = True
+                confirmation_source = "closed_kline_ma_cross"
+            elif action == "open_short":
+                recent_high = float(recent.get("high") or 0.0)
+                confirmed = bool(
+                    recent_high >= level_price
+                    and current_price <= level_price * (1.0 + tolerance)
+                )
+                confirmation_source = "breakdown_retest" if confirmed else "waiting_breakdown_retest"
+            else:
+                recent_low = float(recent.get("low") or 0.0)
+                confirmed = bool(
+                    recent_low > 0
+                    and recent_low <= level_price
+                    and current_price >= level_price * (1.0 - tolerance)
+                )
+                confirmation_source = "breakout_retest" if confirmed else "waiting_breakout_retest"
+            row = {
+                **candidate,
+                "confirmed": confirmed,
+                "confirmation_source": confirmation_source,
+            }
+            evaluated.append(row)
+            if confirmed and not confirmed_candidate:
+                confirmed_candidate = row
+        return {
+            "confirmed": bool(confirmed_candidate),
+            "action": action,
+            "required_timeframes": ["15m", "4h"],
+            "required_structure_signals": sorted(allowed_signals),
+            "candidate_count": len(evaluated),
+            "candidates": evaluated[:8],
+            "selected_confirmation": confirmed_candidate,
+        }
+
+    @staticmethod
+    def cross_timeframe_macro_observation_store(state: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(state, dict):
+            return {}
+        observations = state.setdefault("cross_timeframe_macro_observations", {})
+        if not isinstance(observations, dict):
+            observations = {}
+            state["cross_timeframe_macro_observations"] = observations
+        return observations
+
+    def cross_timeframe_macro_arbitration_applicable(
+        self,
+        signal: V6Signal,
+        context: dict[str, Any],
+        state: dict[str, Any] | None,
+    ) -> bool:
+        existing = (
+            context.get("mixed_structure_macro_arbitration")
+            if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+            else {}
+        )
+        if existing.get("active") and existing.get("arbitration_mode") == "daily_4h_weakening":
+            return True
+        components = self.macro_structure_components(signal, context)
+        if components.get("cross_timeframe_conflict"):
+            return True
+        observation = self.cross_timeframe_macro_observation_store(state).get(str(signal.symbol or "").upper())
+        return bool(
+            isinstance(observation, dict)
+            and str(observation.get("status") or "") in {"active_4h", "waiting_key_structure_break", "reversal_ready"}
+        )
+
+    @staticmethod
+    def cross_timeframe_block_from_arbitration(
+        action: str,
+        context: dict[str, Any],
+        arbitration: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        status = str(arbitration.get("status") or "")
+        h4_action = str(arbitration.get("h4_action") or "")
+        reversal_action = str(arbitration.get("reversal_action") or "")
+        allowed_action = str(arbitration.get("allowed_action") or "")
+        daily_direction = str(arbitration.get("daily_direction") or "neutral")
+        h4_direction = str(arbitration.get("h4_direction") or "neutral")
+        required = int(arbitration.get("required_closed_4h_candles") or 0)
+        common = {
+            "enabled": True,
+            "blocked": True,
+            "watchable": True,
+            "action": action,
+            "daily_direction": daily_direction,
+            "h4_direction": h4_direction,
+            "required_closed_4h_candles": required,
+            "checked_closed_4h_candles": int(arbitration.get("checked_closed_4h_candles") or 0),
+            "weakened_count": int(arbitration.get("weakened_count") or 0),
+            "h4_logic_weakened": bool(arbitration.get("h4_logic_weakened")),
+            "reversal_confirmation": dict(arbitration.get("reversal_confirmation") or {}),
+            "reason_context": arbitration,
+            "entry_context": context,
+        }
+        if status == "active_4h":
+            if action == h4_action:
+                return None
+            return {
+                **common,
+                "reason": "mixed_structure_cross_timeframe_4h_direction_active",
+                "message": (
+                    f"entry waiting: daily direction is {daily_direction}, but the active 4H {h4_direction} thesis "
+                    f"has not weakened for {required} closed 4H candles"
+                ),
+            }
+        if action == h4_action:
+            return {
+                **common,
+                "reason": "mixed_structure_cross_timeframe_4h_logic_weakened",
+                "message": (
+                    f"entry waiting: the 4H {h4_direction} thesis weakened for {required} closed 4H candles; "
+                    "do not continue the old 4H direction"
+                ),
+            }
+        if action == reversal_action and action != allowed_action:
+            return {
+                **common,
+                "reason": "mixed_structure_cross_timeframe_wait_key_structure_break",
+                "message": (
+                    f"entry waiting: the 4H {h4_direction} thesis weakened, but {reversal_action} still requires "
+                    "a confirmed 15M/4H key-structure break and retest"
+                ),
+            }
+        return None
+
+    @staticmethod
+    def active_4h_overrides_conflicting_daily_entry_gate(
+        action: str,
+        context: dict[str, Any],
+    ) -> bool:
+        arbitration = (
+            context.get("mixed_structure_macro_arbitration")
+            if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+            else {}
+        )
+        return bool(
+            arbitration.get("active")
+            and arbitration.get("arbitration_mode") == "daily_4h_weakening"
+            and arbitration.get("status") == "active_4h"
+            and arbitration.get("allowed_action") == action
+            and arbitration.get("h4_action") == action
+            and not arbitration.get("h4_logic_weakened")
+        )
+
+    def cross_timeframe_macro_entry_block(
+        self,
+        signal: V6Signal,
+        action: str,
+        context: dict[str, Any],
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        existing = (
+            context.get("mixed_structure_macro_arbitration")
+            if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+            else {}
+        )
+        if existing.get("active") and existing.get("arbitration_mode") == "daily_4h_weakening":
+            return self.cross_timeframe_block_from_arbitration(action, context, existing)
+
+        components = self.macro_structure_components(signal, context)
+        symbol = str(signal.symbol or "").upper()
+        observations = self.cross_timeframe_macro_observation_store(state)
+        observation = observations.get(symbol) if observations else None
+        observation = observation if isinstance(observation, dict) else {}
+        observation_active = str(observation.get("status") or "") in {
+            "active_4h",
+            "waiting_key_structure_break",
+            "reversal_ready",
+        }
+        current_cross = bool(components.get("cross_timeframe_conflict"))
+        current_daily_direction = str(components.get("daily_direction") or "neutral")
+        current_h4_direction = str(components.get("h4_direction") or "neutral")
+
+        if current_cross:
+            same_observation = bool(
+                observation_active
+                and str(observation.get("daily_direction") or "") == current_daily_direction
+                and str(observation.get("original_h4_direction") or "") == current_h4_direction
+            )
+            if not same_observation:
+                now = utc_now_iso()
+                observation = {
+                    "symbol": symbol,
+                    "status": "active_4h",
+                    "daily_direction": current_daily_direction,
+                    "daily_source": str(components.get("daily_source") or ""),
+                    "original_h4_direction": current_h4_direction,
+                    "original_h4_source": str(components.get("h4_source") or ""),
+                    "first_seen_at": now,
+                    "updated_at": now,
+                    "first_seen_price": float(signal.price or 0.0),
+                    "last_price": float(signal.price or 0.0),
+                }
+                if observations is not None:
+                    observations[symbol] = observation
+            daily_direction = current_daily_direction
+            h4_direction = current_h4_direction
+        elif observation_active:
+            daily_direction = str(observation.get("daily_direction") or "neutral")
+            h4_direction = str(observation.get("original_h4_direction") or "neutral")
+            if current_daily_direction != daily_direction:
+                now = utc_now_iso()
+                observation.update({
+                    "status": "resolved",
+                    "resolved_at": now,
+                    "updated_at": now,
+                    "resolution_reason": "daily_direction_changed_or_unresolved",
+                    "resolved_daily_direction": current_daily_direction,
+                    "resolved_daily_source": str(components.get("daily_source") or ""),
+                    "last_price": float(signal.price or 0.0),
+                })
+                return None
+        else:
+            return None
+
+        if daily_direction not in {"long", "short"} or h4_direction not in {"long", "short"}:
+            return None
+        h4_action = "open_long" if h4_direction == "long" else "open_short"
+        reversal_action = "open_short" if h4_direction == "long" else "open_long"
+        h4_right_side = context.get("h4_right_side") if isinstance(context.get("h4_right_side"), dict) else {}
+        weakening = (
+            h4_right_side.get("logic_weakening_exit")
+            if isinstance(h4_right_side.get("logic_weakening_exit"), dict)
+            else {}
+        )
+        required = max(1, int(weakening.get("required_closed_candles") or self.config.logic_weakening_exit_required_4h_candles))
+        checked = int(weakening.get("checked_closed_candles") or 0)
+        weak_key = "long_logic_weakened" if h4_direction == "long" else "short_logic_weakened"
+        weak_count_key = "long_weakened_count" if h4_direction == "long" else "short_weakened_count"
+        weak_count = max(
+            int(weakening.get(weak_count_key) or 0),
+            int(observation.get("weakened_count") or 0),
+        )
+        previously_weakened = str(observation.get("status") or "") in {
+            "waiting_key_structure_break",
+            "reversal_ready",
+        }
+        weakened = bool(previously_weakened or (checked >= required and weakening.get(weak_key)))
+        reversal_confirmation = (
+            self.cross_timeframe_key_structure_break_confirmation(signal, reversal_action)
+            if weakened
+            else {}
+        )
+        reversal_confirmed = bool(reversal_confirmation.get("confirmed"))
+        status = "reversal_ready" if weakened and reversal_confirmed else "waiting_key_structure_break" if weakened else "active_4h"
+        allowed_action = reversal_action if status == "reversal_ready" else h4_action if status == "active_4h" else None
+        if not weakened:
+            arbitration_source = "4h_direction_active"
+        elif reversal_confirmed:
+            arbitration_source = "key_structure_break_after_4h_weakening"
+        else:
+            arbitration_source = "4h_logic_weakened_observe"
+        arbitration = {
+            "active": True,
+            "arbitration_mode": "daily_4h_weakening",
+            "macro_direction": h4_direction if not weakened else daily_direction if reversal_confirmed else "neutral",
+            "macro_source": arbitration_source,
+            "macro_state_direction": "neutral",
+            "macro_state_source": "daily_4h_direction_conflict",
+            "probability_fallback": False,
+            "daily_direction": daily_direction,
+            "daily_source": components.get("daily_source"),
+            "h4_direction": h4_direction,
+            "h4_source": observation.get("original_h4_source") or components.get("h4_source"),
+            "current_h4_direction": current_h4_direction,
+            "current_h4_source": components.get("h4_source"),
+            "status": status,
+            "h4_action": h4_action,
+            "required_closed_4h_candles": required,
+            "checked_closed_4h_candles": checked,
+            "weakened_count": weak_count,
+            "h4_logic_weakened": weakened,
+            "reversal_action": reversal_action,
+            "reversal_confirmation": reversal_confirmation,
+            "allowed_action": allowed_action,
+            "requested_action": action,
+            "aligned": bool(allowed_action and action == allowed_action),
+        }
+        context["mixed_structure_macro_arbitration"] = arbitration
+        if observation:
+            now = utc_now_iso()
+            observation.update({
+                "status": status,
+                "daily_direction": daily_direction,
+                "daily_source": str(observation.get("daily_source") or components.get("daily_source") or ""),
+                "original_h4_direction": h4_direction,
+                "original_h4_source": str(observation.get("original_h4_source") or components.get("h4_source") or ""),
+                "current_h4_direction": current_h4_direction,
+                "current_h4_source": str(components.get("h4_source") or ""),
+                "required_closed_4h_candles": required,
+                "checked_closed_4h_candles": checked,
+                "weakened_count": weak_count,
+                "h4_logic_weakened": weakened,
+                "reversal_action": reversal_action,
+                "reversal_confirmation": reversal_confirmation,
+                "allowed_action": allowed_action,
+                "last_price": float(signal.price or 0.0),
+                "updated_at": now,
+            })
+        if reversal_confirmed and action == reversal_action:
+            selected = dict(reversal_confirmation.get("selected_confirmation") or {})
+            timeframe = str(selected.get("timeframe") or "15m")
+            context["selected_entry_level"] = selected
+            context["entry_timeframe"] = timeframe
+            context["horizon"] = "4h_trend" if timeframe == "4h" else "15m_scalp"
+            context["max_hold_days"] = (
+                float(self.config.max_hold_days_4h)
+                if timeframe == "4h"
+                else float(self.config.max_hold_days_15m)
+            )
+            context["cross_timeframe_reversal_confirmation"] = reversal_confirmation
+        return self.cross_timeframe_block_from_arbitration(action, context, arbitration)
+
+    def probability_fallback_direction(self, signal: V6Signal) -> tuple[str, str, float, float]:
+        long_probability = float(signal.long_probability or 0.0)
+        short_probability = float(signal.short_probability or 0.0)
+        model_gap = abs(long_probability - short_probability)
+        whale_flow = (
+            signal.levels.get("telegram_whale_flow")
+            if isinstance(signal.levels, dict) and isinstance(signal.levels.get("telegram_whale_flow"), dict)
+            else {}
+        )
+        whale_score = float(whale_flow.get("fallback_score") or 0.0)
+        whale_notional = float(whale_flow.get("fallback_notional_usdt") or 0.0)
+        whale_direction = str(whale_flow.get("direction") or "neutral").lower()
+        whale_usable = bool(
+            self.config.telegram_whale_fallback_enabled
+            and model_gap <= float(self.config.telegram_whale_fallback_max_model_gap)
+            and whale_flow.get("available")
+            and whale_flow.get("bridge_fresh")
+            and whale_flow.get("fresh")
+            and whale_notional >= float(self.config.telegram_whale_fallback_min_notional_usdt)
+            and abs(whale_score) >= float(self.config.telegram_whale_fallback_min_abs_score)
+            and whale_direction in {"long", "short"}
+        )
+        if whale_usable:
+            if whale_direction == "long":
+                return "long", "telegram_whale_flow_fallback", long_probability, short_probability
+            return "short", "telegram_whale_flow_fallback", short_probability, long_probability
+        if abs(long_probability - short_probability) <= 1e-12:
+            return "neutral", "model_probability_tie", long_probability, short_probability
+        if long_probability > short_probability:
+            return "long", "model_probability_fallback", long_probability, short_probability
+        return "short", "model_probability_fallback", short_probability, long_probability
+
+    def macro_arbitration_direction(self, signal: V6Signal, context: dict[str, Any]) -> tuple[str, str]:
+        macro_direction, macro_source = self.macro_structure_direction(signal, context)
+        if macro_direction in {"long", "short"}:
+            return macro_direction, macro_source
+        probability_direction, probability_source, _, _ = self.probability_fallback_direction(signal)
+        return probability_direction, probability_source if probability_direction in {"long", "short"} else macro_source
+
+    @staticmethod
+    def mixed_structure_probability_fallback_guard(state: dict[str, Any] | None, symbol: str) -> dict[str, Any]:
+        if not isinstance(state, dict):
+            return {}
+        guards = state.setdefault("mixed_structure_probability_fallback_guards", {})
+        if not isinstance(guards, dict):
+            guards = {}
+            state["mixed_structure_probability_fallback_guards"] = guards
+        symbol_upper = str(symbol or "").upper()
+        guard = guards.get(symbol_upper)
+        if not isinstance(guard, dict):
+            guard = {
+                "symbol": symbol_upper,
+                "status": "active",
+                "consecutive_losses": 0,
+                "total_trades": 0,
+                "total_losses": 0,
+                "history": [],
+                "processed_event_ids": [],
+            }
+            guards[symbol_upper] = guard
+        return guard
+
+    def reset_mixed_structure_probability_fallback_guard(
+        self,
+        state: dict[str, Any] | None,
+        symbol: str,
+        *,
+        macro_direction: str,
+        macro_source: str,
+    ) -> None:
+        if not isinstance(state, dict):
+            return
+        guard = self.mixed_structure_probability_fallback_guard(state, symbol)
+        if int(guard.get("consecutive_losses") or 0) <= 0 and str(guard.get("status") or "active") == "active":
+            return
+        reset_at = utc_now_iso()
+        history = [dict(item) for item in guard.get("history") or [] if isinstance(item, dict)]
+        history.append({
+            "event": "reset_on_explicit_macro_direction",
+            "at": reset_at,
+            "macro_direction": macro_direction,
+            "macro_source": macro_source,
+            "previous_consecutive_losses": int(guard.get("consecutive_losses") or 0),
+        })
+        guard.update({
+            "status": "active",
+            "consecutive_losses": 0,
+            "last_reset_at": reset_at,
+            "last_reset_reason": "explicit_macro_direction",
+            "last_macro_direction": macro_direction,
+            "last_macro_source": macro_source,
+            "history": history[-30:],
+            "updated_at": reset_at,
+        })
+
+    def macro_direction_entry_block(
+        self,
+        signal: V6Signal,
+        action: str,
+        context: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         side_bias = str(signal.side_bias or "neutral").lower()
         context = context if isinstance(context, dict) else self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
-        profile = symbol_bb_entry_profile(signal.symbol)
-        if profile.get("allow_4h_profile_direction_override") and str(context.get("horizon") or "") == "4h_trend":
-            selected = context.get("selected_entry_level") if isinstance(context.get("selected_entry_level"), dict) else {}
-            h4_right_side = context.get("h4_right_side") if isinstance(context.get("h4_right_side"), dict) else {}
-            selected_timeframe = str(selected.get("timeframe") or "")
-            if selected_timeframe == "4h" or context.get("h4_confirmed_15m_selector"):
-                if action == "open_short" and h4_right_side.get("short_confirmed"):
-                    return None
-                if action == "open_long" and h4_right_side.get("long_confirmed"):
-                    return None
         daily_trend = context.get("daily_ma7_trend") if isinstance(context.get("daily_ma7_trend"), dict) else {}
         macro_source = "probability"
         effective_bias = side_bias
@@ -5682,6 +6865,142 @@ class V6ExecutionEngine:
                 effective_bias = "long"
                 macro_source = "daily_ma7_trend_fallback"
         expected_action = "open_short" if effective_bias == "short" else "open_long" if effective_bias == "long" else ""
+        structure_conflict = self.mixed_structure_direction_state(signal)
+        if self.config.mixed_structure_macro_arbitration_enabled and self.cross_timeframe_macro_arbitration_applicable(
+            signal,
+            context,
+            state,
+        ):
+            cross_timeframe_block = self.cross_timeframe_macro_entry_block(signal, action, context, state=state)
+            arbitration = (
+                context.get("mixed_structure_macro_arbitration")
+                if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+                else {}
+            )
+            if arbitration.get("active") and arbitration.get("arbitration_mode") == "daily_4h_weakening":
+                return cross_timeframe_block
+        if self.config.mixed_structure_macro_arbitration_enabled and structure_conflict["active"]:
+            macro_state_direction, macro_state_source = self.macro_structure_direction(signal, context)
+            probability_fallback = macro_state_direction not in {"long", "short"}
+            selected_probability = None
+            opposite_probability = None
+            if probability_fallback:
+                conflict_bias, conflict_source, selected_probability, opposite_probability = self.probability_fallback_direction(signal)
+            else:
+                conflict_bias, conflict_source = macro_state_direction, macro_state_source
+                self.reset_mixed_structure_probability_fallback_guard(
+                    state,
+                    signal.symbol,
+                    macro_direction=macro_state_direction,
+                    macro_source=macro_state_source,
+                )
+            conflict_expected_action = (
+                "open_short" if conflict_bias == "short" else "open_long" if conflict_bias == "long" else ""
+            )
+            existing_arbitration = (
+                context.get("mixed_structure_macro_arbitration")
+                if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+                else {}
+            )
+            guard = (
+                self.mixed_structure_probability_fallback_guard(state, signal.symbol)
+                if probability_fallback and conflict_expected_action
+                else {}
+            )
+            consecutive_losses = int(
+                guard.get("consecutive_losses")
+                if guard
+                else existing_arbitration.get("consecutive_losses") or 0
+            )
+            max_losses = max(1, int(self.config.mixed_structure_probability_fallback_max_losses or 3))
+            fallback_paused = probability_fallback and consecutive_losses >= max_losses
+            telegram_whale_flow = (
+                signal.levels.get("telegram_whale_flow")
+                if isinstance(signal.levels, dict) and isinstance(signal.levels.get("telegram_whale_flow"), dict)
+                else {}
+            )
+            context["mixed_structure_macro_arbitration"] = {
+                "active": True,
+                "macro_direction": conflict_bias,
+                "macro_source": conflict_source,
+                "macro_state_direction": macro_state_direction,
+                "macro_state_source": macro_state_source,
+                "probability_fallback": probability_fallback,
+                "selected_probability": selected_probability,
+                "opposite_probability": opposite_probability,
+                "consecutive_losses": consecutive_losses,
+                "max_consecutive_losses": max_losses,
+                "fallback_paused": fallback_paused,
+                "telegram_whale_flow": {
+                    "used": conflict_source == "telegram_whale_flow_fallback",
+                    "available": bool(telegram_whale_flow.get("available")),
+                    "direction": telegram_whale_flow.get("direction") or "neutral",
+                    "score": float(telegram_whale_flow.get("fallback_score") or 0.0),
+                    "notional_usdt": float(telegram_whale_flow.get("fallback_notional_usdt") or 0.0),
+                    "window_minutes": int(telegram_whale_flow.get("fallback_window_minutes") or 0),
+                    "latest_event_at": telegram_whale_flow.get("latest_event_at") or "",
+                },
+                "allowed_action": conflict_expected_action or None,
+                "requested_action": action,
+                "aligned": bool(conflict_expected_action and action == conflict_expected_action and not fallback_paused),
+                "long_candidate_count": structure_conflict["long_candidate_count"],
+                "short_candidate_count": structure_conflict["short_candidate_count"],
+            }
+            common = {
+                "enabled": True,
+                "blocked": True,
+                "action": action,
+                "side_bias": side_bias,
+                "effective_bias": conflict_bias,
+                "macro_source": conflict_source,
+                "macro_state_direction": macro_state_direction,
+                "macro_state_source": macro_state_source,
+                "probability_fallback": probability_fallback,
+                "selected_probability": selected_probability,
+                "opposite_probability": opposite_probability,
+                "consecutive_losses": consecutive_losses,
+                "max_consecutive_losses": max_losses,
+                "long_probability": signal.long_probability,
+                "short_probability": signal.short_probability,
+                "structure_conflict": structure_conflict,
+                "entry_context": context,
+            }
+            if not conflict_expected_action:
+                return {
+                    **common,
+                    "reason": "mixed_structure_macro_direction_neutral",
+                    "message": "entry blocked: long and short structures conflict while macro direction is neutral",
+                }
+            if fallback_paused and action == conflict_expected_action:
+                return {
+                    **common,
+                    "reason": "mixed_structure_probability_fallback_loss_streak",
+                    "message": (
+                        "entry blocked: macro direction is neutral or conflicting and the probability-selected side "
+                        f"has lost {consecutive_losses} consecutive completed trades"
+                    ),
+                }
+            if action != conflict_expected_action:
+                return {
+                    **common,
+                    "reason": "mixed_structure_macro_direction_mismatch",
+                    "message": (
+                        "entry blocked: long and short structures conflict; "
+                        f"macro direction only allows {conflict_expected_action}"
+                    ),
+                }
+            return None
+
+        profile = symbol_bb_entry_profile(signal.symbol)
+        if profile.get("allow_4h_profile_direction_override") and str(context.get("horizon") or "") == "4h_trend":
+            selected = context.get("selected_entry_level") if isinstance(context.get("selected_entry_level"), dict) else {}
+            h4_right_side = context.get("h4_right_side") if isinstance(context.get("h4_right_side"), dict) else {}
+            selected_timeframe = str(selected.get("timeframe") or "")
+            if selected_timeframe == "4h" or context.get("h4_confirmed_15m_selector"):
+                if action == "open_short" and h4_right_side.get("short_confirmed"):
+                    return None
+                if action == "open_long" and h4_right_side.get("long_confirmed"):
+                    return None
         if not expected_action:
             return {
                 "enabled": True,
@@ -5714,6 +7033,64 @@ class V6ExecutionEngine:
             "entry_context": context,
         }
 
+    @staticmethod
+    def entry_risk_flags(
+        *,
+        fifteen_m: dict[str, Any] | None,
+        levels: dict[str, Any] | None,
+        mid_retest: dict[str, Any] | None,
+        model_quality_score: float,
+    ) -> dict[str, Any]:
+        fifteen_m = fifteen_m if isinstance(fifteen_m, dict) else {}
+        levels = levels if isinstance(levels, dict) else {}
+        mid_retest = mid_retest if isinstance(mid_retest, dict) else {}
+        ma20_trend = fifteen_m.get("ma20_trend") if isinstance(fifteen_m.get("ma20_trend"), dict) else {}
+        scan = levels.get("structure_entry_scan") if isinstance(levels.get("structure_entry_scan"), dict) else {}
+
+        def candidate_count(count_key: str, candidates_key: str) -> int:
+            candidates = scan.get(candidates_key) if isinstance(scan.get(candidates_key), list) else []
+            try:
+                explicit_count = int(scan.get(count_key) or 0)
+            except (TypeError, ValueError):
+                explicit_count = 0
+            return max(explicit_count, len(candidates))
+
+        long_count = candidate_count("long_candidate_count", "long_candidates")
+        short_count = candidate_count("short_candidate_count", "short_candidates")
+        try:
+            far_below_count = int(mid_retest.get("far_below_count") or 0)
+        except (TypeError, ValueError):
+            far_below_count = 0
+        try:
+            quality = float(model_quality_score)
+        except (TypeError, ValueError):
+            quality = 0.5
+        return {
+            "schema_version": 1,
+            "ma20_trend_broken_or_mixed": bool(
+                ma20_trend.get("bullish_trend_broken") or ma20_trend.get("bearish_trend_broken")
+            ),
+            "mixed_bb_structure": long_count > 0 and short_count > 0,
+            "avoid_chasing_4h_mids": far_below_count >= 2,
+            "low_model_quality": quality < 0.35,
+            "long_candidate_count": long_count,
+            "short_candidate_count": short_count,
+            "far_below_4h_mid_count": far_below_count,
+            "model_quality_score": round(quality, 6),
+        }
+
+    def signal_entry_risk_flags(self, signal: V6Signal) -> dict[str, Any]:
+        indicators = signal.indicators if isinstance(getattr(signal, "indicators", None), dict) else {}
+        existing = indicators.get("entry_risk_flags") if isinstance(indicators.get("entry_risk_flags"), dict) else None
+        if existing is not None:
+            return dict(existing)
+        return self.entry_risk_flags(
+            fifteen_m=getattr(signal, "fifteen_m", {}),
+            levels=getattr(signal, "levels", {}),
+            mid_retest=getattr(signal, "mid_retest", {}),
+            model_quality_score=float(getattr(signal, "model_quality_score", 0.5) or 0.5),
+        )
+
     def v5_overlay_entry_block(
         self,
         signal: V6Signal,
@@ -5730,8 +7107,8 @@ class V6ExecutionEngine:
         selected_period = str(selected.get("period") or "")
         selected_band = str(selected.get("band") or "").lower()
         structure_signal = str(selected.get("structure_signal") or "")
-        reason_text = " | ".join(str(item or "") for item in signal.reasons).lower()
-        if self.config.v5_block_unclean_15m_ma20_initial_entry and "15m ma20 trend guard is broken or mixed" in reason_text:
+        risk_flags = self.signal_entry_risk_flags(signal)
+        if self.config.v5_block_unclean_15m_ma20_initial_entry and risk_flags.get("ma20_trend_broken_or_mixed"):
             return {
                 "enabled": True,
                 "blocked": True,
@@ -5743,7 +7120,7 @@ class V6ExecutionEngine:
                 "entry_context": context,
                 "selected_entry_level": selected,
             }
-        if self.config.v5_block_mixed_structure_initial_entry and "bb structure entry scan is mixed" in reason_text:
+        if self.config.v5_block_mixed_structure_initial_entry and risk_flags.get("mixed_bb_structure"):
             return {
                 "enabled": True,
                 "blocked": True,
@@ -5872,9 +7249,9 @@ class V6ExecutionEngine:
                     "selected_entry_level": selected,
                 }
         if self.config.v5_block_mixed_avoid_low_quality_entry:
-            mixed_scan = "bb structure entry scan is mixed" in reason_text
-            avoid_chasing = "avoid chasing" in reason_text
-            low_quality = "model quality score is low" in reason_text
+            mixed_scan = bool(risk_flags.get("mixed_bb_structure"))
+            avoid_chasing = bool(risk_flags.get("avoid_chasing_4h_mids"))
+            low_quality = bool(risk_flags.get("low_model_quality"))
             if mixed_scan and (avoid_chasing or low_quality):
                 return {
                     "enabled": True,
@@ -5891,6 +7268,321 @@ class V6ExecutionEngine:
                 }
         return None
 
+    def record_entry_gate_event(
+        self,
+        signal: V6Signal,
+        action: str,
+        entry_context: dict[str, Any],
+        decision: dict[str, Any],
+    ) -> None:
+        if not self.config.entry_gate_event_recording_enabled:
+            return
+        selected = entry_context.get("selected_entry_level") if isinstance(entry_context.get("selected_entry_level"), dict) else {}
+        event_key = "|".join(
+            [
+                str(signal.computed_at or ""),
+                str(signal.symbol or "").upper(),
+                action,
+                str(selected.get("name") or ""),
+                f"{float(signal.price or 0.0):.8f}",
+            ]
+        )
+        payload = {
+            "event": "entry_gate_decision",
+            "event_id": hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:24],
+            "computed_at": signal.computed_at,
+            "recorded_at": utc_now_iso(),
+            "symbol": str(signal.symbol or "").upper(),
+            "action": action,
+            "price": round(float(signal.price or 0.0), 8),
+            "side_bias": signal.side_bias,
+            "model_probabilities": {
+                "long": round(float(signal.long_probability or 0.0), 6),
+                "short": round(float(signal.short_probability or 0.0), 6),
+                "wait": round(float(signal.wait_probability or 0.0), 6),
+            },
+            "selected_entry_level": {
+                key: selected.get(key)
+                for key in ("name", "timeframe", "period", "band", "structure_signal", "price", "distance_pct")
+                if selected.get(key) is not None
+            },
+            "horizon": str(entry_context.get("horizon") or ""),
+            "decision": {
+                "state": decision.get("state"),
+                "allowed": bool(decision.get("allowed")),
+                "notional_multiplier": decision.get("notional_multiplier"),
+                "blocking_reason": decision.get("blocking_reason"),
+                "hard_reasons": list(decision.get("hard_reasons") or []),
+                "watch_reasons": list(decision.get("watch_reasons") or []),
+                "soft_reasons": list(decision.get("soft_reasons") or []),
+                "support_reasons": list(decision.get("support_reasons") or []),
+                "transition_probe": bool(decision.get("transition_probe")),
+                "probe_reasons": list(decision.get("probe_reasons") or []),
+                "structural_confirmation": dict(decision.get("structural_confirmation") or {}),
+            },
+            "outcomes": {
+                "status": "pending",
+                "execution": "next_15m_bar_open",
+                "horizons": ["1h", "4h", "24h", "48h", "168h"],
+            },
+        }
+        try:
+            max_bytes = max(0, int(self.config.entry_gate_events_max_bytes))
+            events_file = self.config.entry_gate_events_file
+            if max_bytes and events_file.exists() and events_file.stat().st_size >= max_bytes:
+                archive_file = events_file.with_suffix(events_file.suffix + ".1")
+                archive_file.unlink(missing_ok=True)
+                events_file.replace(archive_file)
+            append_text_line(self.config.entry_gate_events_file, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        except Exception as exc:
+            LOGGER.warning("V6 entry gate event recording failed for %s %s: %s", signal.symbol, action, exc)
+
+    def entry_gate_policy_v2_decision(
+        self,
+        signal: V6Signal,
+        action: str,
+        entry_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate every V6 technical-entry gate before choosing the outcome.
+
+        Soft priors may reduce size, but never short-circuit later hard or watch gates.
+        """
+        findings: list[EntryGateFinding | None] = []
+        probe_reasons: list[str] = []
+        registry = getattr(self, "entry_gate_registry", None) or default_entry_gate_registry()
+        profile = symbol_bb_entry_profile(signal.symbol)
+        ignore_15m_entry_blocks = bool(profile.get("ignore_15m_entry_blocks"))
+        side = "short" if action == "open_short" else "long"
+        directional_touch = bool(self.directional_entry_level_touched(signal, action, entry_context))
+        directional_confirmation = self.scale_in_trigger_candidate(
+            signal,
+            side,
+            near_pct=float(self.config.entry_structure_rejection_near_pct),
+            min_lines=max(1, int(self.config.entry_structure_min_rejection_lines)),
+        )
+        qualified_structure = bool(directional_touch or directional_confirmation)
+        strong_structure = bool(directional_confirmation)
+
+        def add_finding(
+            block: dict[str, Any] | None,
+            *,
+            severity: str | None = None,
+            multiplier: float | None = None,
+            probe: bool = False,
+        ) -> None:
+            finding = finding_from_block(
+                block,
+                severity=severity,
+                notional_multiplier=multiplier,
+                registry=registry,
+            )
+            findings.append(finding)
+            if probe and finding is not None:
+                probe_reasons.append(finding.reason)
+
+        if directional_touch:
+            add_finding(
+                {
+                    "reason": "directional_level_touched",
+                    "message": "selected directional structure level has been touched",
+                    "selected_entry_level": dict(entry_context.get("selected_entry_level") or {}),
+                },
+            )
+        if directional_confirmation:
+            add_finding(
+                {
+                    "reason": "three_line_structure_confirmation",
+                    "message": "three-line directional structure confirmation is active",
+                    "confluence": directional_confirmation,
+                },
+            )
+
+        macro_block = self.macro_direction_entry_block(signal, action, entry_context)
+        if macro_block:
+            macro_multiplier = (
+                self.config.entry_gate_macro_neutral_multiplier
+                if str(macro_block.get("reason") or "") == "macro_direction_neutral"
+                else self.config.entry_gate_macro_mismatch_multiplier
+            )
+            add_finding(macro_block, multiplier=macro_multiplier)
+
+        add_finding(
+            self.symbol_bb_entry_profile_block(signal, action, entry_context),
+            multiplier=self.config.entry_gate_profile_unlisted_multiplier,
+        )
+
+        add_finding(self.market_data_freshness_entry_block(signal, action))
+        add_finding(self.smart_signal_entry_block(signal, action, entry_context))
+
+        ma20_block = None if ignore_15m_entry_blocks else self.ma20_trend_entry_block(signal, action)
+        if ma20_block:
+            add_finding(
+                ma20_block,
+                severity="soft",
+                multiplier=self.config.entry_gate_trend_conflict_multiplier,
+                probe=qualified_structure,
+            )
+
+        active_4h_daily_override = self.active_4h_overrides_conflicting_daily_entry_gate(action, entry_context)
+
+        def add_daily_gate_finding(block: dict[str, Any] | None) -> None:
+            if block is None:
+                return
+            if not active_4h_daily_override:
+                add_finding(block)
+                return
+            downgraded = dict(block)
+            downgraded.update({
+                "precedence": "active_4h_over_conflicting_daily_gate",
+                "original_classification": "hard",
+                "arbitration_status": "active_4h",
+                "arbitration_allowed_action": action,
+            })
+            add_finding(
+                downgraded,
+                severity="soft",
+                multiplier=self.config.entry_gate_macro_mismatch_multiplier,
+                probe=qualified_structure,
+            )
+
+        add_daily_gate_finding(self.daily_ma7_short_reversal_entry_block(signal, action, entry_context))
+        add_daily_gate_finding(self.daily_ma20_long_reversal_entry_block(signal, action, entry_context))
+
+        trend_block = self.trend_big_entry_block(signal, action, entry_context)
+        add_finding(
+            trend_block,
+            severity="soft",
+            multiplier=0.50,
+            probe=bool(trend_block and qualified_structure),
+        )
+        lower_chase_block = self.h4_lower_chase_short_block(signal, action, entry_context)
+        add_finding(
+            lower_chase_block,
+            severity="soft",
+            multiplier=0.50,
+            probe=bool(lower_chase_block and strong_structure),
+        )
+        second_test_opposite_block = (
+            None
+            if ignore_15m_entry_blocks
+            else self.bb96_210_second_test_opposite_block(signal, action)
+        )
+        add_finding(second_test_opposite_block)
+
+        generic_block = self.generic_indicator_entry_block(signal, action, entry_context)
+        add_finding(
+            generic_block,
+            severity="soft" if strong_structure else "watch",
+            multiplier=0.75 if strong_structure else None,
+            probe=bool(generic_block and strong_structure),
+        )
+        selector_block = self.four_h_entry_15m_selector_block(signal, action, entry_context)
+        add_finding(
+            selector_block,
+            severity="soft" if qualified_structure else "watch",
+            multiplier=0.50 if qualified_structure else None,
+            probe=bool(selector_block and qualified_structure),
+        )
+
+        short_quality_block = self.short_15m_entry_quality_block(signal, action, entry_context)
+        if short_quality_block:
+            short_quality_reason = str(short_quality_block.get("reason") or "")
+            countertrend_probe = short_quality_reason == "short_15m_blocked_by_4h_right_side_long" and strong_structure
+            ordinary_probe = short_quality_reason != "short_15m_blocked_by_4h_right_side_long" and qualified_structure
+            add_finding(
+                short_quality_block,
+                severity="soft" if countertrend_probe or ordinary_probe else "watch",
+                multiplier=0.30 if countertrend_probe else 0.60 if ordinary_probe else None,
+                probe=countertrend_probe or ordinary_probe,
+            )
+
+        add_finding(
+            self.fib_structure_confirmation_block(signal, action, entry_context),
+            multiplier=self.config.entry_gate_fib_missing_multiplier,
+        )
+
+        confluence_hold = self.indicator_confluence_hold(signal, side)
+        add_finding(
+            confluence_hold,
+            severity="soft",
+            multiplier=0.50,
+            probe=bool(confluence_hold and qualified_structure),
+        )
+
+        if not confluence_hold and not directional_touch:
+            boundary = self.entry_boundary_chase_candidate(signal, side)
+            if boundary and not directional_confirmation:
+                if side == "short":
+                    reason = "short_low_chase_without_15m_rejection"
+                    message = "entry waiting: nearby 15M support has not produced a valid rejection; do not chase short"
+                else:
+                    reason = "long_high_chase_without_15m_reclaim"
+                    message = "entry waiting: nearby 15M resistance has not produced a valid reclaim; do not chase long"
+                add_finding(
+                    {
+                        "enabled": True,
+                        "blocked": True,
+                        "watchable": True,
+                        "action": action,
+                        "side": side,
+                        "reason": reason,
+                        "message": message,
+                        "boundary": boundary,
+                    },
+                )
+
+        decision = evaluate_entry_gate_findings(
+            findings,
+            minimum_notional_multiplier=float(self.config.entry_gate_min_notional_multiplier),
+        )
+        payload = decision.to_dict()
+        payload["action"] = action
+        payload["symbol"] = signal.symbol
+        payload["selected_entry_level"] = dict(entry_context.get("selected_entry_level") or {})
+        payload["structural_confirmation"] = {
+            "directional_level_touched": directional_touch,
+            "three_line_confirmation": bool(directional_confirmation),
+            "confirmation": directional_confirmation or {},
+        }
+        payload["transition_probe"] = bool(decision.allowed and probe_reasons)
+        payload["probe_reasons"] = sorted(set(probe_reasons))
+        payload["gate_registry_version"] = "fable5_v1"
+        entry_context["entry_gate_policy_v2"] = payload
+        levels = signal.levels if isinstance(signal.levels, dict) else {}
+        gate_history = levels.get("entry_gate_policy_v2") if isinstance(levels.get("entry_gate_policy_v2"), dict) else {}
+        gate_history[action] = payload
+        levels["entry_gate_policy_v2"] = gate_history
+        signal.levels = levels
+        self.record_entry_gate_event(signal, action, entry_context, payload)
+        return payload
+
+    @staticmethod
+    def entry_gate_policy_v2_block(decision: dict[str, Any], entry_context: dict[str, Any]) -> dict[str, Any] | None:
+        if decision.get("allowed"):
+            return None
+        blocking_reason = str(decision.get("blocking_reason") or "entry_gate_policy_v2_wait")
+        findings = decision.get("findings") if isinstance(decision.get("findings"), list) else []
+        blocking_finding = next(
+            (
+                item for item in findings
+                if isinstance(item, dict)
+                and str(item.get("reason") or "") == blocking_reason
+            ),
+            {},
+        )
+        source = blocking_finding.get("payload") if isinstance(blocking_finding.get("payload"), dict) else {}
+        block = dict(source)
+        block.update({
+            "enabled": True,
+            "blocked": True,
+            "watchable": str(decision.get("state") or "") == "watch",
+            "reason": blocking_reason,
+            "message": str(blocking_finding.get("message") or source.get("message") or blocking_reason),
+            "entry_gate_policy_v2": decision,
+            "entry_context": entry_context,
+        })
+        return block
+
     def technical_entry_ready(
         self,
         signal: V6Signal,
@@ -5900,18 +7592,49 @@ class V6ExecutionEngine:
         context = context if isinstance(context, dict) else self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
         selected = context.get("selected_entry_level") if isinstance(context.get("selected_entry_level"), dict) else {}
         if not selected:
-            return False, {
+            block = {
                 "enabled": True,
                 "blocked": True,
                 "action": action,
                 "reason": "technical_entry_only_no_indicator_level",
                 "message": "entry blocked: technical-only symbol requires BB/MA/right-side indicator entry level",
                 "entry_context": context,
-            }, context
+            }
+            decision = evaluate_entry_gate_findings(
+                [
+                    finding_from_block(
+                        block,
+                        severity="hard",
+                        registry=getattr(self, "entry_gate_registry", None) or default_entry_gate_registry(),
+                    )
+                ],
+                minimum_notional_multiplier=float(self.config.entry_gate_min_notional_multiplier),
+            ).to_dict()
+            decision.update({
+                "action": action,
+                "symbol": signal.symbol,
+                "selected_entry_level": {},
+                "structural_confirmation": {
+                    "directional_level_touched": False,
+                    "three_line_confirmation": False,
+                    "confirmation": {},
+                },
+                "transition_probe": False,
+                "probe_reasons": [],
+                "gate_registry_version": "fable5_v1",
+            })
+            context["entry_gate_policy_v2"] = decision
+            self.record_entry_gate_event(signal, action, context, decision)
+            return False, block, context
         v5_block = self.v5_overlay_entry_block(signal, action, context)
         if v5_block:
             return False, v5_block, context
-        block = self.entry_structure_block(signal, action, context)
+        gate_decision: dict[str, Any] | None = None
+        if self.config.entry_gate_policy_v2_for(signal.symbol) and self.config.entry_structure_filter_enabled:
+            gate_decision = self.entry_gate_policy_v2_decision(signal, action, context)
+            block = self.entry_gate_policy_v2_block(gate_decision, context)
+        else:
+            block = self.entry_structure_block(signal, action, context)
         if block:
             return False, block, context
         if context.get("countertrend_rebound"):
@@ -5923,24 +7646,62 @@ class V6ExecutionEngine:
                 signal.reasons.append(message)
         if context.get("horizon") in {"4h_trend", "1d_trend"}:
             return True, None, context
-        if self.directional_entry_level_touched(signal, action):
-            return True, None, context
-        side = "short" if action == "open_short" else "long"
-        if self.scale_in_trigger_candidate(
-            signal,
-            side,
-            near_pct=float(self.config.entry_structure_rejection_near_pct),
-            min_lines=max(1, int(self.config.entry_structure_min_rejection_lines)),
-        ):
-            return True, None, context
-        return False, {
+        if gate_decision is not None:
+            structural_confirmation = (
+                gate_decision.get("structural_confirmation")
+                if isinstance(gate_decision.get("structural_confirmation"), dict)
+                else {}
+            )
+            if (
+                structural_confirmation.get("directional_level_touched")
+                or structural_confirmation.get("three_line_confirmation")
+            ):
+                return True, None, context
+        else:
+            if self.directional_entry_level_touched(signal, action, context):
+                return True, None, context
+            side = "short" if action == "open_short" else "long"
+            if self.scale_in_trigger_candidate(
+                signal,
+                side,
+                near_pct=float(self.config.entry_structure_rejection_near_pct),
+                min_lines=max(1, int(self.config.entry_structure_min_rejection_lines)),
+            ):
+                return True, None, context
+        unconfirmed_block = {
             "enabled": True,
             "blocked": True,
             "action": action,
             "reason": "technical_entry_only_unconfirmed_15m_trigger",
             "message": "entry blocked: technical-only 15M setup requires touched BB level or 3-line confirmation",
             "entry_context": context,
-        }, context
+        }
+        if self.config.entry_gate_policy_v2_for(signal.symbol):
+            final_decision = dict(context.get("entry_gate_policy_v2") or {})
+            watch_reasons = list(final_decision.get("watch_reasons") or [])
+            if unconfirmed_block["reason"] not in watch_reasons:
+                watch_reasons.append(unconfirmed_block["reason"])
+            findings = list(final_decision.get("findings") or [])
+            findings.append(
+                finding_from_block(
+                    unconfirmed_block,
+                    registry=getattr(self, "entry_gate_registry", None) or default_entry_gate_registry(),
+                ).to_dict()
+            )
+            final_decision.update({
+                "state": "watch",
+                "allowed": False,
+                "blocking_reason": unconfirmed_block["reason"],
+                "watch_reasons": watch_reasons,
+                "findings": findings,
+                "transition_probe": False,
+            })
+            context["entry_gate_policy_v2"] = final_decision
+            gate_history = signal.levels.get("entry_gate_policy_v2") if isinstance(signal.levels.get("entry_gate_policy_v2"), dict) else {}
+            gate_history[action] = final_decision
+            signal.levels["entry_gate_policy_v2"] = gate_history
+            self.record_entry_gate_event(signal, action, context, final_decision)
+        return False, unconfirmed_block, context
 
     def technical_entry_rank(self, signal: V6Signal, action: str, context: dict[str, Any]) -> tuple[float, float, float]:
         horizon_score = {
@@ -6596,8 +8357,13 @@ class V6ExecutionEngine:
             "boundary_near_pct": float(self.config.entry_structure_boundary_near_pct),
         }
 
-    def directional_entry_level_touched(self, signal: V6Signal, action: str) -> dict[str, Any] | None:
-        context = self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
+    def directional_entry_level_touched(
+        self,
+        signal: V6Signal,
+        action: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        context = context if isinstance(context, dict) else self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
         selected = context.get("selected_entry_level") if isinstance(context.get("selected_entry_level"), dict) else {}
         if not selected:
             return None
@@ -6791,9 +8557,22 @@ class V6ExecutionEngine:
         if message and message not in signal.reasons:
             signal.reasons.append(message)
 
-    def open_intent(self, signal: V6Signal, action: str) -> V6OrderIntent:
+    def open_intent(
+        self,
+        signal: V6Signal,
+        action: str,
+        *,
+        entry_context: dict[str, Any] | None = None,
+    ) -> V6OrderIntent:
         side = "SELL" if action == "open_short" else "BUY"
         stop, take_profit, risk_plan = self.stop_take_profit(signal, action)
+        if isinstance(entry_context, dict):
+            risk_plan["entry_context"] = entry_context
+            for key in ("horizon", "entry_timeframe", "max_hold_days"):
+                if entry_context.get(key) is not None:
+                    risk_plan[key] = entry_context.get(key)
+            if isinstance(entry_context.get("manager_reversal_confirmation"), dict):
+                risk_plan["manager_reversal_confirmation"] = dict(entry_context["manager_reversal_confirmation"])
         risk_plan["entry_indicators"] = dict(getattr(signal, "indicators", {}) or {})
         local_side = "short" if action == "open_short" else "long"
         smart_signal_context = self.v6_smart_signal_context(signal, local_side)
@@ -6807,26 +8586,110 @@ class V6ExecutionEngine:
             if message not in signal.reasons:
                 signal.reasons.append(message)
         self.apply_candidate_metadata_to_risk_plan(signal.symbol, risk_plan)
-        base_notional = max(float(self.config.base_notional_usdt), float(self.config.min_notional_usdt))
+        symbol_notional_multiplier = self.config.notional_multiplier_for(signal.symbol)
+        base_notional = self.config.base_notional_for(signal.symbol)
         notional = base_notional
-        if (
+        risk_plan["configured_base_notional_usdt"] = round(
+            max(float(self.config.base_notional_usdt), float(self.config.min_notional_usdt)),
+            6,
+        )
+        risk_plan["symbol_notional_multiplier"] = round(symbol_notional_multiplier, 6)
+        risk_plan["symbol_base_notional_usdt"] = round(base_notional, 6)
+        staged_entry_active = bool(
             self.config.v5_staged_entry_enabled
             and self.config.v5_overlay_rules_active_for(signal.symbol)
             and action in {"open_long", "open_short"}
-        ):
+        )
+        first_fraction = 1.0
+        staged_entry_floor = max(1.0, float(self.config.v5_staged_entry_min_notional_usdt))
+        if staged_entry_active:
             first_fraction = clamp(float(self.config.v5_initial_entry_notional_fraction), 0.05, 1.0)
-            notional = max(float(self.config.min_notional_usdt), base_notional * first_fraction)
+            notional = max(staged_entry_floor, base_notional * first_fraction)
             risk_plan["v5_staged_entry"] = {
                 "enabled": True,
                 "mode": "light_first_entry_then_15m_pullback_scale_in",
                 "base_notional_usdt": round(base_notional, 6),
                 "initial_fraction": round(first_fraction, 6),
+                "order_min_notional_usdt": round(staged_entry_floor, 6),
                 "initial_notional_usdt": round(notional, 6),
                 "scale_in_fraction": round(float(self.config.scale_in_notional_fraction), 6),
                 "max_scale_ins": int(self.config.max_scale_ins_per_position),
                 "scale_in_min_hold_minutes": float(self.config.v5_scale_in_min_hold_minutes),
                 "scale_in_min_adverse_move_pct": float(self.config.scale_in_min_adverse_move_pct),
             }
+        gate_decision = (
+            entry_context.get("entry_gate_policy_v2")
+            if isinstance(entry_context, dict) and isinstance(entry_context.get("entry_gate_policy_v2"), dict)
+            else {}
+        )
+        entry_gate_multiplier = 1.0
+        if self.config.entry_gate_policy_v2_for(signal.symbol) and gate_decision.get("allowed"):
+            entry_gate_multiplier = clamp(float(gate_decision.get("notional_multiplier") or 1.0), 0.0, 1.0)
+            risk_plan["entry_gate_policy_v2"] = dict(gate_decision)
+            risk_plan["entry_gate_base_notional_usdt"] = round(base_notional, 6)
+            risk_plan["entry_gate_notional_multiplier"] = round(entry_gate_multiplier, 6)
+            if entry_gate_multiplier < 1.0:
+                message = f"V6 entry soft-risk sizing applied: multiplier={entry_gate_multiplier:.2f}"
+                if message not in signal.reasons:
+                    signal.reasons.append(message)
+
+        gann_state = (signal.levels or {}).get("gann_feature") if isinstance(signal.levels, dict) else {}
+        gann_multiplier = (
+            gann_position_multiplier(gann_state, local_side)
+            if self.config.gann_position_sizing_for(signal.symbol)
+            else 1.0
+        )
+        manager_reversal = (
+            entry_context.get("manager_reversal_confirmation")
+            if isinstance(entry_context, dict) and isinstance(entry_context.get("manager_reversal_confirmation"), dict)
+            else {}
+        )
+        manager_reversal_multiplier = clamp(float(manager_reversal.get("notional_multiplier") or 1.0), 0.05, 1.0)
+        combined_multiplier = clamp(entry_gate_multiplier * gann_multiplier * manager_reversal_multiplier, 0.05, 1.25)
+        symbol_min_notional = float(self.config.min_notional_usdt) * symbol_notional_multiplier
+        sizing_floor = staged_entry_floor if staged_entry_active else symbol_min_notional
+        if combined_multiplier < 1.0:
+            multiplier_floor = base_notional * clamp(float(self.config.entry_gate_min_notional_multiplier), 0.0, 1.0)
+            if staged_entry_active:
+                multiplier_floor *= first_fraction
+                sizing_floor = max(staged_entry_floor, multiplier_floor)
+            # Legacy configs commonly set min_notional equal to base_notional. In
+            # that case the gate multiplier is the intentional soft-entry floor;
+            # a separately configured lower minimum remains authoritative.
+            elif sizing_floor >= base_notional:
+                sizing_floor = multiplier_floor
+        notional = max(sizing_floor, notional * combined_multiplier)
+        risk_plan["position_sizing_overlays"] = {
+            "entry_gate_multiplier": round(entry_gate_multiplier, 6),
+            "gann_multiplier": round(gann_multiplier, 6),
+            "manager_reversal_multiplier": round(manager_reversal_multiplier, 6),
+            "combined_multiplier": round(combined_multiplier, 6),
+            "sizing_floor_usdt": round(sizing_floor, 6),
+            "gann_scope": "BTCUSDT_only" if self.config.gann_position_sizing_enabled else "disabled",
+        }
+        risk_plan["entry_gate_adjusted_notional_usdt"] = round(notional, 6)
+        if self.config.gann_position_sizing_for(signal.symbol):
+            risk_plan["gann_feature"] = dict(gann_state or {})
+            if abs(gann_multiplier - 1.0) > 1e-9:
+                message = f"BTC Gann macro sizing applied: multiplier={gann_multiplier:.2f}"
+                if message not in signal.reasons:
+                    signal.reasons.append(message)
+
+        if gate_decision.get("transition_probe"):
+            probe_stop_pct = max(0.0025, float(self.config.entry_gate_probe_stop_loss_pct))
+            original_stop = float(stop)
+            if action == "open_long":
+                stop = max(original_stop, float(signal.price) * (1.0 - probe_stop_pct))
+            else:
+                stop = min(original_stop, float(signal.price) * (1.0 + probe_stop_pct))
+            risk_plan["transition_probe_risk"] = {
+                "enabled": True,
+                "probe_reasons": list(gate_decision.get("probe_reasons") or []),
+                "max_stop_distance_pct": round(probe_stop_pct * 100.0, 6),
+                "original_stop_loss_price": round(original_stop, 8),
+                "adjusted_stop_loss_price": round(float(stop), 8),
+            }
+            risk_plan["stop_loss_price"] = round(float(stop), 8)
         return V6OrderIntent(
             action=action,
             symbol=signal.symbol,
@@ -6851,7 +8714,27 @@ class V6ExecutionEngine:
 
     @staticmethod
     def is_partial_take_profit_intent(intent: V6OrderIntent) -> bool:
-        return V6ExecutionEngine.is_staged_take_profit_intent(intent) and float(intent.close_fraction or 1.0) < 0.999
+        close_fraction = clamp(float(intent.close_fraction or 1.0), 0.0, 1.0)
+        return intent.action in {"close_long", "close_short"} and 0.0 < close_fraction < 0.999
+
+    def preflight_close_quantity(self, intent: V6OrderIntent) -> dict[str, Any]:
+        """Resolve a close before cancelling its protective stop.
+
+        The client resolves again immediately before submission so a manual exchange
+        change cannot make the preflight quantity authoritative. This first pass only
+        prevents a known-zero or missing close from briefly removing protection.
+        """
+
+        resolver = getattr(self.client, "resolve_close_quantity", None)
+        if not callable(resolver):
+            return {}
+        quantity = str(resolver(intent))
+        decision = (intent.risk_plan or {}).get("close_decision") or {}
+        return {
+            "quantity": quantity,
+            "decision": dict(decision) if isinstance(decision, dict) else {},
+            "checked_at": utc_now_iso(),
+        }
 
     @staticmethod
     def is_reduce_only_rejected_error(error_text: str) -> bool:
@@ -7006,6 +8889,8 @@ class V6ExecutionEngine:
             "h4_lower_reversal_guard",
             "v5_no_news_momentum_tp",
             "v5_no_news_momentum_final_giveback_exit",
+            "v5_momentum_guard",
+            "v6_smart_signal_risk_guard",
         }:
             stage_key = "profit_guard_stages"
             stages = [stage for stage in position.get(stage_key) or [] if isinstance(stage, dict)]
@@ -7054,6 +8939,51 @@ class V6ExecutionEngine:
             "stage_key": stage_key,
         }
 
+    def mark_partial_close_retry_wait(
+        self,
+        position: dict[str, Any],
+        intent: V6OrderIntent,
+        error_text: str,
+        *,
+        reason: str,
+        minutes: int = 30,
+    ) -> dict[str, Any]:
+        """Cool down any partial close, including non-BB risk reductions."""
+
+        minutes = max(1, int(minutes))
+        retry_after = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+        now = utc_now_iso()
+        stage_retry = self.mark_partial_take_profit_retry_wait(
+            position,
+            intent,
+            error_text,
+            reason=reason,
+            minutes=minutes,
+        )
+        if stage_retry is None:
+            position["close_retry_block_until"] = retry_after
+            position["close_retry_block_reason"] = reason
+            position["close_retry_last_error"] = error_text
+            position["close_retry_last_at"] = now
+        history = list(position.get("partial_close_retry_history") or [])
+        history.append({
+            "target_name": str(intent.target_name or ""),
+            "submitted_at": now,
+            "reason": reason,
+            "retry_after": retry_after,
+            "error": error_text,
+        })
+        position["partial_close_retry_history"] = history[-20:]
+        return {
+            "event": "partial_close_retry_wait",
+            "symbol": intent.symbol,
+            "side": local_side_for_action(intent.action),
+            "target_name": str(intent.target_name or ""),
+            "reason": reason,
+            "retry_after": retry_after,
+            "stage_retry": stage_retry or {},
+        }
+
     def ensure_position_take_profit_stages(self, position: dict[str, Any], signal: V6Signal | None = None) -> list[dict[str, Any]]:
         if not self.config.staged_take_profit_enabled:
             return []
@@ -7085,7 +9015,10 @@ class V6ExecutionEngine:
             ], action=str(risk_plan.get("action") or ""), horizon=str(risk_plan.get("horizon") or ""))
         if stages:
             position["take_profit_stages"] = stages
-            position.setdefault("original_notional_usdt", float(position.get("notional_usdt") or self.config.base_notional_usdt))
+            position.setdefault(
+                "original_notional_usdt",
+                float(position.get("notional_usdt") or self.config.base_notional_for(position.get("symbol") or "")),
+            )
             position.setdefault("remaining_fraction", 1.0)
         return stages
 
@@ -7459,7 +9392,20 @@ class V6ExecutionEngine:
                 dt = dt.replace(tzinfo=timezone.utc)
         except Exception:
             return False
-        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() <= max(0.1, float(max_age_hours)) * 3600.0
+        age_seconds = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+        return 0.0 <= age_seconds <= max(0.1, float(max_age_hours)) * 3600.0
+
+    @staticmethod
+    def _v5_momentum_snapshot_id(value: Any) -> str:
+        if not value:
+            return ""
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return ""
+        return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
     @staticmethod
     def _v5_momentum_iso_is_fresh_seconds(value: Any, max_age_seconds: float) -> bool:
@@ -7471,7 +9417,8 @@ class V6ExecutionEngine:
                 dt = dt.replace(tzinfo=timezone.utc)
         except Exception:
             return False
-        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() <= max(1.0, float(max_age_seconds))
+        age_seconds = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+        return 0.0 <= age_seconds <= max(1.0, float(max_age_seconds))
 
     def v5_momentum_smart_signal_metrics(self, row: dict[str, Any]) -> dict[str, Any]:
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -7570,7 +9517,9 @@ class V6ExecutionEngine:
             updated_at = row.get("updated_at") or generated_at
             if updated_at and not self._v5_momentum_iso_is_fresh(updated_at, max_age):
                 continue
-            cache.setdefault(symbol, dict(row))
+            cached_row = dict(row)
+            cached_row["snapshot_updated_at"] = str(updated_at or "")
+            cache.setdefault(symbol, cached_row)
         self._smart_signal_cache = cache
         return cache
 
@@ -7607,39 +9556,73 @@ class V6ExecutionEngine:
         if not row:
             return {"enabled": True, "active": False, "has_signal": False, "reason": "no_smart_signal"}
         metrics = self.v5_momentum_smart_signal_metrics(row)
+        raw_metadata = row.get("metadata")
+        metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
         price = float(signal.price or 0.0)
         raw_fifteen_m = getattr(signal, "fifteen_m", {})
-        fifteen_m = raw_fifteen_m if isinstance(raw_fifteen_m, dict) else {}
-        ma20_trend = fifteen_m.get("ma20_trend") if isinstance(fifteen_m.get("ma20_trend"), dict) else {}
+        fifteen_m: dict[str, Any] = raw_fifteen_m if isinstance(raw_fifteen_m, dict) else {}
+        raw_ma20_trend = fifteen_m.get("ma20_trend")
+        ma20_trend: dict[str, Any] = raw_ma20_trend if isinstance(raw_ma20_trend, dict) else {}
         price_distance = self._v5_momentum_optional_float(ma20_trend.get("price_distance_pct"))
         volume_ratio = self.signal_tick_volume_15m_ratio(signal)
-        volume_confirmed = volume_ratio >= 1.5
+        volume_confirmed = volume_ratio >= max(0.0, float(self.config.smart_signal_volume_confirm_ratio))
         short_avg_entry = self._v5_momentum_safe_float(metrics.get("short_avg_entry_price"))
         long_avg_entry = self._v5_momentum_safe_float(metrics.get("long_avg_entry_price"))
-        price_reclaimed_ma20 = bool(ma20_trend.get("bullish_trend_alive")) or (
-            price_distance is not None and price_distance >= 0
-        )
-        price_lost_ma20 = bool(ma20_trend.get("bearish_trend_alive")) or (
-            price_distance is not None and price_distance <= 0
-        )
+        ma20_confirm_pct = max(0.0, float(self.config.smart_signal_ma20_confirm_pct))
+        if price_distance is not None:
+            # Exact MA20 is neutral even when the configured threshold is zero.
+            price_reclaimed_ma20 = bool(price_distance > 0.0 and price_distance >= ma20_confirm_pct)
+            price_lost_ma20 = bool(price_distance < 0.0 and price_distance <= -ma20_confirm_pct)
+        else:
+            bullish_trend_alive = bool(ma20_trend.get("bullish_trend_alive"))
+            bearish_trend_alive = bool(ma20_trend.get("bearish_trend_alive"))
+            price_reclaimed_ma20 = bool(bullish_trend_alive and not bearish_trend_alive)
+            price_lost_ma20 = bool(bearish_trend_alive and not bullish_trend_alive)
         near_or_above_short_avg = bool(short_avg_entry > 0 and price >= short_avg_entry * 0.995)
         near_or_below_long_avg = bool(long_avg_entry > 0 and price <= long_avg_entry * 1.005)
+
+        def metadata_float(key: str) -> float | None:
+            return self._v5_momentum_optional_float(metadata.get(key, row.get(key)))
+
+        oi_change_pct = metadata_float("oi_change_pct")
+        long_notional_change_pct = metadata_float("long_notional_change_pct")
+        short_notional_change_pct = metadata_float("short_notional_change_pct")
+        oi_expanded = bool(
+            oi_change_pct is not None
+            and oi_change_pct >= max(0.0, float(self.config.smart_signal_oi_expand_confirm_pct))
+        )
+        retreat_threshold = max(0.0, float(self.config.smart_signal_position_retreat_confirm_pct))
+        long_position_retreat = bool(
+            long_notional_change_pct is not None and long_notional_change_pct <= -retreat_threshold
+        )
+        short_position_retreat = bool(
+            short_notional_change_pct is not None and short_notional_change_pct <= -retreat_threshold
+        )
+        snapshot_updated_at = str(row.get("snapshot_updated_at") or row.get("updated_at") or "")
+        snapshot_fresh_for_exit = self._v5_momentum_iso_is_fresh(
+            snapshot_updated_at,
+            float(self.config.smart_signal_exit_snapshot_max_age_hours),
+        )
+        short_risk_evidence = bool(volume_confirmed or oi_expanded or short_position_retreat)
+        long_risk_evidence = bool(volume_confirmed or oi_expanded or long_position_retreat)
         short_squeeze_active = bool(
             metrics.get("short_crowded")
             and price_reclaimed_ma20
-            and (volume_confirmed or near_or_above_short_avg)
+            and short_risk_evidence
+            and snapshot_fresh_for_exit
         )
         long_flush_active = bool(
             metrics.get("long_crowded")
             and price_lost_ma20
-            and (volume_confirmed or near_or_below_long_avg)
+            and long_risk_evidence
+            and snapshot_fresh_for_exit
         )
         adverse = bool((side == "short" and short_squeeze_active) or (side == "long" and long_flush_active))
         supportive = bool((side == "long" and short_squeeze_active) or (side == "short" and long_flush_active))
         reason = (
-            "short_crowded_reclaim_ma20"
+            "short_crowded_reclaim_ma20_confirmed"
             if short_squeeze_active
-            else "long_crowded_lost_ma20"
+            else "long_crowded_lost_ma20_confirmed"
             if long_flush_active
             else "smart_signal_wait_confirmation"
         )
@@ -7653,10 +9636,21 @@ class V6ExecutionEngine:
             "supportive_to_side": supportive,
             "short_squeeze_active": short_squeeze_active,
             "long_crowded_flush_active": long_flush_active,
+            "squeeze_risk_confirmed": short_squeeze_active,
+            "flush_risk_confirmed": long_flush_active,
             "price_reclaimed_ma20": price_reclaimed_ma20,
             "price_lost_ma20": price_lost_ma20,
+            "ma20_confirm_pct": round(ma20_confirm_pct, 6),
             "volume_confirmed": volume_confirmed,
             "volume_ratio_15m": round(volume_ratio, 6),
+            "oi_expanded": oi_expanded,
+            "oi_change_pct": round(oi_change_pct, 6) if oi_change_pct is not None else None,
+            "long_position_retreat": long_position_retreat,
+            "short_position_retreat": short_position_retreat,
+            "long_notional_change_pct": round(long_notional_change_pct, 6) if long_notional_change_pct is not None else None,
+            "short_notional_change_pct": round(short_notional_change_pct, 6) if short_notional_change_pct is not None else None,
+            "snapshot_updated_at": snapshot_updated_at,
+            "snapshot_fresh_for_exit": snapshot_fresh_for_exit,
             "price_distance_ma20_15m_pct": round(price_distance, 6) if price_distance is not None else None,
             "direction": metrics.get("direction"),
             "long_score": round(float(metrics.get("long_score") or 0.0), 6),
@@ -7669,6 +9663,8 @@ class V6ExecutionEngine:
             "long_whale_share": metrics.get("long_whale_share"),
             "short_avg_entry_price": short_avg_entry,
             "long_avg_entry_price": long_avg_entry,
+            "near_or_above_short_avg": near_or_above_short_avg,
+            "near_or_below_long_avg": near_or_below_long_avg,
             "short_crowded": bool(metrics.get("short_crowded")),
             "long_crowded": bool(metrics.get("long_crowded")),
             "source": "binance_smart_signal",
@@ -8277,6 +10273,10 @@ class V6ExecutionEngine:
         return None
 
     def next_roi_take_profit(self, signal: V6Signal, position: dict[str, Any]) -> tuple[list[dict[str, Any]], float] | None:
+        # V5 no-news momentum owns a separate ROI ladder.  Running the generic
+        # ladder afterwards double-counts reductions against remaining size.
+        if self.is_v5_no_news_momentum_position(position):
+            return None
         side = str(position.get("side") or "").lower()
         if side not in {"long", "short"}:
             return None
@@ -8432,6 +10432,18 @@ class V6ExecutionEngine:
         side = str(position.get("side") or "").lower()
         if side not in {"long", "short"} or not bool(self.config.logic_weakening_exit_enabled):
             return None
+        risk_plan = position.get("risk_plan") if isinstance(position.get("risk_plan"), dict) else {}
+        horizon = str(risk_plan.get("horizon") or position.get("horizon") or "").lower()
+        entry_timeframe = str(
+            risk_plan.get("entry_timeframe") or position.get("entry_timeframe") or ""
+        ).lower()
+        # A 15M countertrend/scalp entry can intentionally oppose the current 4H
+        # thesis. Closing it immediately with the 4H weakening rule creates churn.
+        # Keep the legacy fallback only for old positions without horizon metadata.
+        if horizon and horizon != "4h_trend":
+            return None
+        if not horizon and entry_timeframe and entry_timeframe != "4h":
+            return None
         h4 = signal.h4 if isinstance(signal.h4, dict) else {}
         right_side = h4.get("right_side") if isinstance(h4.get("right_side"), dict) else {}
         guard = right_side.get("logic_weakening_exit") if isinstance(right_side.get("logic_weakening_exit"), dict) else {}
@@ -8475,7 +10487,98 @@ class V6ExecutionEngine:
         }
         return watch
 
-    def daily_ma7_short_reversal_exit_candidate(self, signal: V6Signal, position: dict[str, Any]) -> dict[str, Any] | None:
+    @staticmethod
+    def position_entry_macro_arbitration(position: dict[str, Any]) -> dict[str, Any]:
+        risk_plans: list[dict[str, Any]] = []
+        position_risk_plan = position.get("risk_plan") if isinstance(position.get("risk_plan"), dict) else {}
+        if position_risk_plan:
+            risk_plans.append(position_risk_plan)
+        for lot in reversed(position.get("lots") or []):
+            if not isinstance(lot, dict):
+                continue
+            lot_risk_plan = lot.get("risk_plan") if isinstance(lot.get("risk_plan"), dict) else {}
+            if lot_risk_plan:
+                risk_plans.append(lot_risk_plan)
+        for risk_plan in risk_plans:
+            context = risk_plan.get("entry_context") if isinstance(risk_plan.get("entry_context"), dict) else {}
+            arbitration = (
+                context.get("mixed_structure_macro_arbitration")
+                if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+                else {}
+            )
+            if arbitration.get("active") and arbitration.get("arbitration_mode") == "daily_4h_weakening":
+                return dict(arbitration)
+        return {}
+
+    def active_4h_defers_conflicting_daily_exit(
+        self,
+        position: dict[str, Any],
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.config.mixed_structure_macro_arbitration_enabled:
+            return None
+        side = str(position.get("side") or "").lower()
+        if side not in {"long", "short"}:
+            return None
+        expected_action = "open_long" if side == "long" else "open_short"
+        entry_arbitration = self.position_entry_macro_arbitration(position)
+        if not entry_arbitration:
+            return None
+        if (
+            entry_arbitration.get("status") != "active_4h"
+            or entry_arbitration.get("allowed_action") != expected_action
+            or entry_arbitration.get("h4_action") != expected_action
+            or entry_arbitration.get("h4_logic_weakened")
+        ):
+            return None
+
+        symbol = str(position.get("symbol") or "").upper()
+        if not isinstance(state, dict):
+            return None
+        observations = state.get("cross_timeframe_macro_observations")
+        observation = observations.get(symbol) if isinstance(observations, dict) else None
+        if not isinstance(observation, dict) or not observation:
+            return None
+        current = observation
+        status = str(current.get("status") or entry_arbitration.get("status") or "")
+        allowed_action = str(current.get("allowed_action") or entry_arbitration.get("allowed_action") or "")
+        h4_direction = str(
+            current.get("original_h4_direction")
+            or current.get("h4_direction")
+            or entry_arbitration.get("h4_direction")
+            or ""
+        )
+        h4_logic_weakened = bool(current.get("h4_logic_weakened"))
+        if status != "active_4h" or allowed_action != expected_action or h4_direction != side or h4_logic_weakened:
+            return None
+        return {
+            "enabled": True,
+            "status": "deferred_active_4h",
+            "symbol": symbol,
+            "side": side,
+            "allowed_action": expected_action,
+            "daily_direction": current.get("daily_direction") or entry_arbitration.get("daily_direction"),
+            "h4_direction": h4_direction,
+            "current_h4_direction": current.get("current_h4_direction"),
+            "required_closed_4h_candles": int(
+                current.get("required_closed_4h_candles")
+                or entry_arbitration.get("required_closed_4h_candles")
+                or self.config.logic_weakening_exit_required_4h_candles
+            ),
+            "weakened_count": int(current.get("weakened_count") or 0),
+            "reason": "active 4H position thesis still has priority over the conflicting daily exit gate",
+            "entry_arbitration": entry_arbitration,
+            "current_arbitration": dict(current),
+        }
+
+    def daily_ma7_short_reversal_exit_candidate(
+        self,
+        signal: V6Signal,
+        position: dict[str, Any],
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         symbol = str(position.get("symbol") or signal.symbol or "").upper()
         side = str(position.get("side") or "").lower()
         target_symbols = {item.upper() for item in self.config.daily_ma7_short_reversal_symbols}
@@ -8514,6 +10617,14 @@ class V6ExecutionEngine:
         position["daily_ma7_short_reversal_watch"] = watch
         if not held:
             return None
+        arbitration_deferral = self.active_4h_defers_conflicting_daily_exit(position, state=state)
+        if arbitration_deferral is not None:
+            watch.update({
+                "status": "deferred_active_4h",
+                "reason": arbitration_deferral["reason"],
+                "macro_arbitration": arbitration_deferral,
+            })
+            return None
         watch["reason"] = (
             f"{symbol} short global daily reversal: BTC/ETH 1D first reclaimed MA7 and then held above MA20; "
             f"close short because market bearish thesis has failed at the second daily checkpoint"
@@ -8545,7 +10656,13 @@ class V6ExecutionEngine:
             "market_daily_ma7_reversal": market,
         }
 
-    def daily_ma20_long_reversal_exit_candidate(self, signal: V6Signal, position: dict[str, Any]) -> dict[str, Any] | None:
+    def daily_ma20_long_reversal_exit_candidate(
+        self,
+        signal: V6Signal,
+        position: dict[str, Any],
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         symbol = str(position.get("symbol") or signal.symbol or "").upper()
         side = str(position.get("side") or "").lower()
         if side != "long" or not bool(self.config.daily_ma7_short_reversal_exit_enabled):
@@ -8573,6 +10690,14 @@ class V6ExecutionEngine:
         }
         position["daily_ma20_long_reversal_watch"] = watch
         if not invalidated:
+            return None
+        arbitration_deferral = self.active_4h_defers_conflicting_daily_exit(position, state=state)
+        if arbitration_deferral is not None:
+            watch.update({
+                "status": "deferred_active_4h",
+                "reason": arbitration_deferral["reason"],
+                "macro_arbitration": arbitration_deferral,
+            })
             return None
         watch["reason"] = (
             f"{symbol} long daily reversal: 1D first lost MA7 and then held below MA20; "
@@ -8611,19 +10736,61 @@ class V6ExecutionEngine:
         if side not in {"long", "short"}:
             return None
         context = self.v6_smart_signal_context(signal, side)
+        raw_state = position.get("smart_signal_risk_state")
+        risk_state: dict[str, Any] = raw_state if isinstance(raw_state, dict) else {}
+        snapshot_id = self._v5_momentum_snapshot_id(context.get("snapshot_updated_at"))
         if not context.get("adverse_to_side"):
+            risk_state.update(
+                {
+                    "state": "watching" if context.get("has_signal") else "no_signal",
+                    "risk_side": side,
+                    "confirmation_count": 0,
+                    "last_snapshot_id": "",
+                    "last_observed_snapshot_id": snapshot_id,
+                    "checked_at": utc_now_iso(),
+                }
+            )
+            position["smart_signal_risk_state"] = risk_state
             position["smart_signal_risk_watch"] = {
-                "state": "watching" if context.get("has_signal") else "no_signal",
-                "checked_at": utc_now_iso(),
+                "state": risk_state["state"],
+                "checked_at": risk_state["checked_at"],
                 "context": context,
             }
             return None
+
+        if str(risk_state.get("risk_side") or "") != side:
+            risk_state = {"risk_side": side, "confirmation_count": 0, "last_snapshot_id": ""}
+        confirmation_count = max(0, int(self._v5_momentum_safe_float(risk_state.get("confirmation_count"))))
+        last_snapshot_id = self._v5_momentum_snapshot_id(risk_state.get("last_snapshot_id"))
+        if snapshot_id and snapshot_id != last_snapshot_id:
+            confirmation_count += 1
+        risk_state.update(
+            {
+                "state": "confirming",
+                "risk_side": side,
+                "confirmation_count": confirmation_count,
+                "required_confirmations": max(1, int(self.config.smart_signal_risk_confirmation_snapshots)),
+                "last_snapshot_id": snapshot_id,
+                "checked_at": utc_now_iso(),
+            }
+        )
+        position["smart_signal_risk_state"] = risk_state
+        if not snapshot_id or confirmation_count < risk_state["required_confirmations"]:
+            position["smart_signal_risk_watch"] = {
+                "state": "confirming",
+                "checked_at": risk_state["checked_at"],
+                "confirmation_count": confirmation_count,
+                "required_confirmations": risk_state["required_confirmations"],
+                "context": context,
+            }
+            return None
+
         if side == "short":
             name = "v6_smart_signal_short_squeeze_reduce_30"
-            reason = "short smart-signal squeeze risk: crowded shorts reclaimed 15M MA20; reduce 30%"
+            reason = "short smart-signal squeeze risk confirmed across snapshots; reduce 30%"
         else:
             name = "v6_smart_signal_long_crowded_flush_reduce_30"
-            reason = "long smart-signal crowded flush risk: crowded longs lost 15M MA20; reduce 30%"
+            reason = "long smart-signal crowded flush risk confirmed across snapshots; reduce 30%"
         trigger = {
             "rule": "v6_smart_signal_risk_guard",
             "symbol": signal.symbol,
@@ -8632,8 +10799,10 @@ class V6ExecutionEngine:
             "current_roi_pct": round(float(tracker.get("current_roi_pct") or 0.0), 6),
             "max_roi_pct": round(float(tracker.get("max_roi_pct") or 0.0), 6),
             "giveback_pct": round(float(tracker.get("giveback_pct") or 0.0), 6),
+            "confirmation_count": confirmation_count,
             "smart_signal": context,
         }
+        risk_state["state"] = "reduce_ready"
         position["smart_signal_risk_watch"] = {
             "state": "reduce_ready",
             "checked_at": utc_now_iso(),
@@ -8999,7 +11168,13 @@ class V6ExecutionEngine:
             "hard_stop_price": round(float(position.get("stop_loss_price") or 0.0), 8),
         }
 
-    def exit_intent_if_needed(self, signal: V6Signal, position: dict[str, Any]) -> V6OrderIntent | None:
+    def exit_intent_if_needed(
+        self,
+        signal: V6Signal,
+        position: dict[str, Any],
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> V6OrderIntent | None:
         side = str(position.get("side") or "").lower()
         price = float(signal.price)
         stop_price = float(position.get("stop_loss_price") or 0.0)
@@ -9018,6 +11193,30 @@ class V6ExecutionEngine:
         v5_soft_stop_exit: dict[str, Any] | None = None
         hold_expired = self.position_max_hold_expired(position)
         profit_tracker = self.update_position_profit_tracker(signal, position) if side in {"long", "short"} else {}
+        if self.config.stop_only_manual_profit():
+            stop_touched = bool(
+                stop_price > 0
+                and (
+                    (side == "short" and price >= stop_price)
+                    or (side == "long" and price <= stop_price)
+                )
+            )
+            position["manual_profit_management"] = {
+                "enabled": True,
+                "mode": "stop_only_manual_profit",
+                "updated_at": utc_now_iso(),
+                "current_price": round(price, 8),
+                "stop_loss_price": round(stop_price, 8),
+                "reference_take_profit_price": round(take_profit_price, 8),
+                "stop_touched": stop_touched,
+                "profit_tracker": dict(profit_tracker or {}),
+                "note": "V6 may open, scale in, and stop out; profit-taking and reductions are operator managed.",
+            }
+            if side not in {"long", "short"} or not stop_touched:
+                return None
+            # The existing side branch now resolves only the hard stop. Prevent
+            # max-hold from replacing the stop reason in the emitted intent.
+            hold_expired = False
         if side == "short":
             if hold_expired:
                 should_exit = True
@@ -9028,7 +11227,13 @@ class V6ExecutionEngine:
             elif (v5_soft_stop_exit := self.v5_overlay_soft_stop_candidate(signal, position, risk_plan)) is not None:
                 should_exit = True
                 reason = str(v5_soft_stop_exit.get("reason") or "short V5 soft stop confirmed")
-            elif (daily_ma7_short_reversal_exit := self.daily_ma7_short_reversal_exit_candidate(signal, position)) is not None:
+            elif (
+                daily_ma7_short_reversal_exit := self.daily_ma7_short_reversal_exit_candidate(
+                    signal,
+                    position,
+                    state=state,
+                )
+            ) is not None:
                 should_exit = True
                 reason = str(daily_ma7_short_reversal_exit.get("reason") or "short daily MA7 reversal")
             elif (logic_weakening_exit := self.logic_weakening_exit_candidate(signal, position)) is not None:
@@ -9092,7 +11297,13 @@ class V6ExecutionEngine:
             elif (v5_soft_stop_exit := self.v5_overlay_soft_stop_candidate(signal, position, risk_plan)) is not None:
                 should_exit = True
                 reason = str(v5_soft_stop_exit.get("reason") or "long V5 soft stop confirmed")
-            elif (daily_ma20_long_reversal_exit := self.daily_ma20_long_reversal_exit_candidate(signal, position)) is not None:
+            elif (
+                daily_ma20_long_reversal_exit := self.daily_ma20_long_reversal_exit_candidate(
+                    signal,
+                    position,
+                    state=state,
+                )
+            ) is not None:
                 should_exit = True
                 reason = str(daily_ma20_long_reversal_exit.get("reason") or "long daily MA20 reversal")
             elif (profit_guard_full_exit := self.v5_no_news_momentum_take_profit_candidate(signal, position, profit_tracker)) is not None:
@@ -9245,7 +11456,7 @@ class V6ExecutionEngine:
             action=action,
             symbol=signal.symbol,
             side=order_side,
-            quantity_hint_usdt=float(position.get("notional_usdt") or self.config.base_notional_usdt),
+            quantity_hint_usdt=float(position.get("notional_usdt") or self.config.base_notional_for(signal.symbol)),
             leverage=int(position.get("leverage") or self.config.default_leverage),
             reduce_only=True,
             entry_price=price,
@@ -9349,6 +11560,7 @@ class V6ExecutionEngine:
         signal: V6Signal,
         position: dict[str, Any],
         require_probability: bool = True,
+        state: dict[str, Any] | None = None,
     ) -> V6OrderIntent | None:
         if not self.config.scale_in_enabled:
             return None
@@ -9410,6 +11622,17 @@ class V6ExecutionEngine:
         if self.ma20_trend_entry_block(signal, action):
             return None
         entry_context = self.entry_context_for_action(action, signal.levels or {}, symbol=signal.symbol)
+        macro_block = self.macro_direction_entry_block(signal, action, entry_context, state=state)
+        if macro_block and str(macro_block.get("reason") or "") in {
+            "mixed_structure_macro_direction_mismatch",
+            "mixed_structure_macro_direction_neutral",
+            "mixed_structure_probability_fallback_loss_streak",
+            "mixed_structure_cross_timeframe_4h_direction_active",
+            "mixed_structure_cross_timeframe_4h_logic_weakened",
+            "mixed_structure_cross_timeframe_wait_key_structure_break",
+        }:
+            self.apply_entry_structure_block(signal, macro_block)
+            return None
         if self.smart_signal_entry_block(signal, action, entry_context):
             return None
         generic_indicator_block = self.generic_indicator_entry_block(signal, action, entry_context)
@@ -9432,7 +11655,7 @@ class V6ExecutionEngine:
         if trigger_name and trigger_name in used_names:
             return None
 
-        base_notional = max(float(self.config.base_notional_usdt), 1.0)
+        base_notional = max(self.config.base_notional_for(signal.symbol), 1.0)
         add_notional = max(5.0, base_notional * max(0.0, float(self.config.scale_in_notional_fraction)))
         current_notional = float(position.get("notional_usdt") or position.get("original_notional_usdt") or base_notional)
         max_total_notional = base_notional * max(1.0, float(self.config.scale_in_max_total_notional_multiplier))
@@ -9440,6 +11663,8 @@ class V6ExecutionEngine:
             return None
 
         stop, take_profit, risk_plan = self.stop_take_profit(signal, action)
+        self.inherit_position_strategy_provenance(position, risk_plan)
+        risk_plan["entry_context"] = entry_context
         combined_entry = self.weighted_average_entry(avg_entry, current_notional, current_price, add_notional)
         four_h_stop = self.scale_in_4h_stop_price(signal, side, current_price, fallback=stop)
         if four_h_stop > 0:
@@ -9715,7 +11940,15 @@ class V6ExecutionEngine:
         state.setdefault("position_lots", [])
         state.setdefault("journal", [])
         state.setdefault("entry_cooldowns", {})
+        state.setdefault("manager_reentry_locks", {})
+        state.setdefault("manager_reentry_lock_history", [])
+        state.setdefault("manager_reversal_observations", {})
+        state.setdefault("manager_reversal_observation_history", [])
         state.setdefault("v5_profit_reentry_guards", {})
+        state.setdefault("mixed_structure_probability_fallback_guards", {})
+        state.setdefault("cross_timeframe_macro_observations", {})
+        state["instance_name"] = self.config.instance_name
+        state["exit_control_mode"] = self.config.exit_control_mode
         return state
 
     def strategy_dust_threshold(self) -> float:
@@ -9790,18 +12023,33 @@ class V6ExecutionEngine:
         return None
 
     @staticmethod
-    def entry_cooldown_active(state: dict[str, Any], symbol: str) -> bool:
+    def entry_cooldown_active(state: dict[str, Any], symbol: str, side: str = "") -> bool:
         cooldowns = state.get("entry_cooldowns") if isinstance(state.get("entry_cooldowns"), dict) else {}
-        row = cooldowns.get(symbol.upper()) if isinstance(cooldowns, dict) else None
-        if not isinstance(row, dict):
+        if not isinstance(cooldowns, dict):
             return False
-        until = row.get("until")
-        if not until:
-            return False
-        try:
-            return datetime.fromisoformat(str(until).replace("Z", "+00:00")) > datetime.now(timezone.utc)
-        except Exception:
-            return False
+        symbol_key = symbol.upper()
+        side_key = str(side or "").lower()
+        keys = [symbol_key]
+        if side_key in {"long", "short"}:
+            keys.insert(0, f"{symbol_key}:{side_key}")
+        now = datetime.now(timezone.utc)
+        for key in keys:
+            row = cooldowns.get(key)
+            if not isinstance(row, dict):
+                continue
+            row_side = str(row.get("side") or "").lower()
+            if row_side and side_key and row_side != side_key:
+                continue
+            until = row.get("until")
+            try:
+                active = bool(until) and datetime.fromisoformat(str(until).replace("Z", "+00:00")) > now
+            except Exception:
+                active = False
+            if active:
+                return True
+            cooldowns.pop(key, None)
+        state["entry_cooldowns"] = cooldowns
+        return False
 
     @staticmethod
     def iso_after_15m_candles(candles: int) -> str:
@@ -9825,7 +12073,7 @@ class V6ExecutionEngine:
         side: str = "",
         candles_15m: int = 0,
         timeframe: str = "",
-    ) -> None:
+    ) -> dict[str, Any]:
         cooldowns = state.get("entry_cooldowns") if isinstance(state.get("entry_cooldowns"), dict) else {}
         if not isinstance(cooldowns, dict):
             cooldowns = {}
@@ -9839,15 +12087,450 @@ class V6ExecutionEngine:
         if int(candles_15m or 0) > 0:
             cooldown["timeframe"] = timeframe or "15m"
             cooldown["candles"] = int(candles_15m)
-        cooldowns[symbol.upper()] = {
+        side_key = str(side or "").lower()
+        storage_key = f"{symbol.upper()}:{side_key}" if side_key in {"long", "short"} else symbol.upper()
+        cooldowns[storage_key] = {
             **cooldown,
         }
         state["entry_cooldowns"] = cooldowns
+        return dict(cooldown)
+
+    @staticmethod
+    def manager_reentry_lock_key(symbol: str, side: str) -> str:
+        return f"{str(symbol or '').upper()}:{str(side or '').lower()}"
+
+    @staticmethod
+    def manager_close_reason_type(intent: V6OrderIntent) -> tuple[str, str]:
+        risk_plan = intent.risk_plan if isinstance(intent.risk_plan, dict) else {}
+        if isinstance(risk_plan.get("logic_weakening_exit"), dict):
+            return "logic_weakening_exit", "4h"
+        if isinstance(risk_plan.get("daily_ma7_short_reversal_exit"), dict):
+            return "daily_ma7_short_reversal_exit", "1d"
+        if isinstance(risk_plan.get("daily_ma20_long_reversal_exit"), dict):
+            return "daily_ma20_long_reversal_exit", "1d"
+        return "", ""
+
+    def register_manager_reentry_lock(
+        self,
+        state: dict[str, Any],
+        position: dict[str, Any],
+        intent: V6OrderIntent,
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.config.manager_reentry_lock_active_for(intent.symbol):
+            return None
+        reason_type, timeframe = self.manager_close_reason_type(intent)
+        if not reason_type:
+            return None
+        side = str(position.get("side") or local_side_for_action(intent.action)).lower()
+        if side not in {"long", "short"}:
+            return None
+        created_at = str(result.get("submitted_at") or utc_now_iso())
+        minimum_hours = (
+            float(self.config.manager_reentry_lock_4h_min_hours)
+            if timeframe == "4h"
+            else float(self.config.manager_reentry_lock_daily_min_hours)
+        )
+        max_hours = max(minimum_hours, float(self.config.manager_reentry_lock_max_hours))
+        raw_evidence = (intent.risk_plan or {}).get(reason_type)
+        raw_evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+        evidence_keys = {
+            "status",
+            "timeframe",
+            "basis",
+            "required_closed_candles",
+            "checked_closed_candles",
+            "weakened_count",
+            "h4_right_side_state",
+            "h4_long_confirmed",
+            "h4_short_confirmed",
+            "daily_ma7_lost",
+            "daily_ma7_loss_held",
+            "daily_ma20_lost",
+            "daily_ma20_loss_held",
+            "held_count",
+            "ma7_held_count",
+            "ma20_held_count",
+        }
+        lock = {
+            "symbol": intent.symbol.upper(),
+            "side": side,
+            "reason_type": reason_type,
+            "timeframe": timeframe,
+            "created_at": created_at,
+            "minimum_until": iso_add_hours(created_at, max(0.0, minimum_hours)),
+            "expires_at": iso_add_hours(created_at, max(0.0, max_hours)),
+            "close_order_id": self.order_id_from_result(result),
+            "close_reason": str(intent.rationale or ""),
+            "close_source": "confirmed_manager_full_close",
+            "evidence": {key: raw_evidence.get(key) for key in evidence_keys if raw_evidence.get(key) is not None},
+        }
+        locks = state.get("manager_reentry_locks") if isinstance(state.get("manager_reentry_locks"), dict) else {}
+        locks[self.manager_reentry_lock_key(intent.symbol, side)] = lock
+        state["manager_reentry_locks"] = locks
+        history = [dict(item) for item in state.get("manager_reentry_lock_history") or [] if isinstance(item, dict)]
+        history.append({**lock, "event": "created"})
+        state["manager_reentry_lock_history"] = history[-200:]
+        if reason_type == "logic_weakening_exit":
+            self.register_manager_reversal_observation(state, lock)
+        return lock
+
+    def register_manager_reversal_observation(
+        self,
+        state: dict[str, Any],
+        manager_lock: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        symbol = str(manager_lock.get("symbol") or "").upper()
+        closed_side = str(manager_lock.get("side") or "").lower()
+        if not symbol or closed_side not in {"long", "short"}:
+            return None
+        target_side = "short" if closed_side == "long" else "long"
+        observation = {
+            "symbol": symbol,
+            "closed_side": closed_side,
+            "target_side": target_side,
+            "reason_type": "logic_weakening_exit",
+            "timeframe": "4h",
+            "created_at": manager_lock.get("created_at"),
+            "minimum_until": manager_lock.get("minimum_until"),
+            "expires_at": manager_lock.get("expires_at"),
+            "close_order_id": manager_lock.get("close_order_id"),
+            "close_reason": manager_lock.get("close_reason"),
+            "close_source": manager_lock.get("close_source"),
+            "evidence": dict(manager_lock.get("evidence") or {}),
+        }
+        observations = (
+            state.get("manager_reversal_observations")
+            if isinstance(state.get("manager_reversal_observations"), dict)
+            else {}
+        )
+        history = [
+            dict(item)
+            for item in state.get("manager_reversal_observation_history") or []
+            if isinstance(item, dict)
+        ]
+        previous = observations.get(symbol)
+        if isinstance(previous, dict):
+            history.append({
+                **previous,
+                "event": "superseded",
+                "superseded_at": utc_now_iso(),
+                "superseded_by_closed_side": closed_side,
+            })
+        observations[symbol] = observation
+        history.append({**observation, "event": "created"})
+        state["manager_reversal_observations"] = observations
+        state["manager_reversal_observation_history"] = history[-200:]
+        return observation
+
+    @staticmethod
+    def h4_right_side_from_signal(signal: V6Signal, entry_context: dict[str, Any] | None = None) -> dict[str, Any]:
+        context = entry_context if isinstance(entry_context, dict) else {}
+        right_side = context.get("h4_right_side") if isinstance(context.get("h4_right_side"), dict) else {}
+        if not right_side:
+            levels = signal.levels if isinstance(signal.levels, dict) else {}
+            right_side = levels.get("h4_right_side") if isinstance(levels.get("h4_right_side"), dict) else {}
+        if not right_side:
+            h4 = signal.h4 if isinstance(signal.h4, dict) else {}
+            right_side = h4.get("right_side") if isinstance(h4.get("right_side"), dict) else {}
+        return right_side
+
+    @staticmethod
+    def latest_closed_4h_open_time(right_side: dict[str, Any]) -> int:
+        try:
+            explicit = int(right_side.get("last_closed_open_time") or 0)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit > 0:
+            return explicit
+        weakening = (
+            right_side.get("logic_weakening_exit")
+            if isinstance(right_side.get("logic_weakening_exit"), dict)
+            else {}
+        )
+        open_times: list[int] = []
+        for item in weakening.get("recent_closed_candles") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                open_time = int(item.get("open_time") or 0)
+            except (TypeError, ValueError):
+                continue
+            if open_time > 0:
+                open_times.append(open_time)
+        return max(open_times, default=0)
+
+    def manager_reversal_entry_block(
+        self,
+        signal: V6Signal,
+        state: dict[str, Any],
+        action: str,
+        entry_context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.config.manager_reentry_lock_active_for(signal.symbol) or action not in {"open_long", "open_short"}:
+            return None
+        observations = (
+            state.get("manager_reversal_observations")
+            if isinstance(state.get("manager_reversal_observations"), dict)
+            else {}
+        )
+        symbol = str(signal.symbol or "").upper()
+        row = observations.get(symbol) if isinstance(observations, dict) else None
+        if not isinstance(row, dict):
+            return None
+        target_side = "long" if action == "open_long" else "short"
+        if str(row.get("target_side") or "").lower() != target_side:
+            return None
+
+        now = datetime.now(timezone.utc)
+        expires_at = self.parse_utc_datetime(row.get("expires_at"))
+        history = [
+            dict(item)
+            for item in state.get("manager_reversal_observation_history") or []
+            if isinstance(item, dict)
+        ]
+        if expires_at is None or expires_at <= now:
+            observations.pop(symbol, None)
+            state["manager_reversal_observations"] = observations
+            event = "removed" if expires_at is None else "expired"
+            history.append({
+                **row,
+                "event": event,
+                "removed_at": utc_now_iso(),
+                "remove_reason": "invalid_expiry" if expires_at is None else "maximum_observation_elapsed",
+            })
+            state["manager_reversal_observation_history"] = history[-200:]
+            return None
+
+        freshness = signal.market_data_freshness if isinstance(signal.market_data_freshness, dict) else {}
+        market_data_stale = bool(freshness.get("stale"))
+        created_at = self.parse_utc_datetime(row.get("created_at"))
+        minimum_until = self.parse_utc_datetime(row.get("minimum_until"))
+        minimum_elapsed = bool(minimum_until is not None and minimum_until <= now)
+        right_side = self.h4_right_side_from_signal(signal, entry_context)
+        last_closed_open_time = self.latest_closed_4h_open_time(right_side)
+        created_at_ms = int(created_at.timestamp() * 1000) if created_at is not None else 0
+        full_4h_candle_observed = bool(
+            created_at_ms > 0
+            and last_closed_open_time >= created_at_ms
+        )
+        opposite_h4_confirmed = bool(
+            right_side.get("long_confirmed") if target_side == "long" else right_side.get("short_confirmed")
+        )
+        try:
+            selector_count = int(entry_context.get("h4_confirmed_15m_selector_candidate_count") or 0)
+        except (TypeError, ValueError):
+            selector_count = 0
+        selector_15m_confirmed = selector_count > 0
+        approved = bool(
+            not market_data_stale
+            and minimum_elapsed
+            and right_side.get("ready")
+            and full_4h_candle_observed
+            and opposite_h4_confirmed
+            and selector_15m_confirmed
+        )
+
+        daily = entry_context.get("daily_ma7_trend") if isinstance(entry_context.get("daily_ma7_trend"), dict) else {}
+        daily_long = bool(daily.get("ready") and (daily.get("long_confirmed") or daily.get("bullish_stack")))
+        daily_short = bool(daily.get("ready") and (daily.get("short_confirmed") or daily.get("bearish_stack")))
+        if daily_long and not daily_short:
+            daily_direction = "long"
+        elif daily_short and not daily_long:
+            daily_direction = "short"
+        elif daily_long and daily_short:
+            daily_direction = "conflict"
+        else:
+            daily_direction = "neutral"
+        daily_conflict = daily_direction in {"conflict", "short" if target_side == "long" else "long"}
+        notional_multiplier = float(self.config.entry_gate_macro_mismatch_multiplier) if daily_conflict else 1.0
+        confirmation = {
+            "approved": approved,
+            "symbol": symbol,
+            "closed_side": row.get("closed_side"),
+            "target_side": target_side,
+            "created_at": row.get("created_at"),
+            "minimum_elapsed": minimum_elapsed,
+            "full_4h_candle_observed": full_4h_candle_observed,
+            "last_closed_4h_open_time": last_closed_open_time,
+            "opposite_h4_confirmed": opposite_h4_confirmed,
+            "selector_15m_confirmed": selector_15m_confirmed,
+            "selector_15m_candidate_count": selector_count,
+            "market_data_stale": market_data_stale,
+            "daily_direction": daily_direction,
+            "daily_conflict": daily_conflict,
+            "notional_multiplier": round(notional_multiplier, 6),
+        }
+        if approved:
+            entry_context["manager_reversal_confirmation"] = confirmation
+            entry_context["horizon"] = "4h_trend"
+            entry_context["entry_timeframe"] = "4h"
+            entry_context["max_hold_days"] = float(self.config.max_hold_days_4h)
+            return None
+        return {
+            "enabled": True,
+            "blocked": True,
+            "watchable": True,
+            "action": action,
+            "side": target_side,
+            "reason": "manager_reversal_observation_active",
+            "message": (
+                "entry waiting: after a 4H manager exit, the opposite side needs one fully closed new 4H candle, "
+                "fresh opposite 4H right-side confirmation, and a 15M selector structure"
+            ),
+            "manager_reversal_observation": dict(row),
+            **confirmation,
+        }
+
+    def complete_manager_reversal_observation_after_open(
+        self,
+        state: dict[str, Any],
+        intent: V6OrderIntent,
+        result: dict[str, Any],
+    ) -> None:
+        if not self.config.manager_reentry_lock_active_for(intent.symbol):
+            return
+        observations = (
+            state.get("manager_reversal_observations")
+            if isinstance(state.get("manager_reversal_observations"), dict)
+            else {}
+        )
+        symbol = str(intent.symbol or "").upper()
+        row = observations.get(symbol) if isinstance(observations, dict) else None
+        if not isinstance(row, dict):
+            return
+        opened_side = "long" if intent.action == "open_long" else "short" if intent.action == "open_short" else ""
+        target_side = str(row.get("target_side") or "").lower()
+        closed_side = str(row.get("closed_side") or "").lower()
+        if opened_side == target_side:
+            event = "completed"
+            reason = "confirmed_opposite_position_opened"
+        elif opened_side == closed_side:
+            event = "cancelled"
+            reason = "closed_side_revalidated_and_reopened"
+        else:
+            return
+        observations.pop(symbol, None)
+        state["manager_reversal_observations"] = observations
+        history = [
+            dict(item)
+            for item in state.get("manager_reversal_observation_history") or []
+            if isinstance(item, dict)
+        ]
+        history.append({
+            **row,
+            "event": event,
+            "resolved_at": str(result.get("submitted_at") or utc_now_iso()),
+            "resolve_reason": reason,
+            "opened_side": opened_side,
+            "open_order_id": self.order_id_from_result(result),
+        })
+        state["manager_reversal_observation_history"] = history[-200:]
+
+    @staticmethod
+    def manager_reentry_revalidated(signal: V6Signal, side: str, reason_type: str) -> bool:
+        freshness = signal.market_data_freshness if isinstance(signal.market_data_freshness, dict) else {}
+        if freshness.get("stale"):
+            return False
+        levels = signal.levels if isinstance(signal.levels, dict) else {}
+        right_side = levels.get("h4_right_side") if isinstance(levels.get("h4_right_side"), dict) else {}
+        if not right_side:
+            h4 = signal.h4 if isinstance(signal.h4, dict) else {}
+            right_side = h4.get("right_side") if isinstance(h4.get("right_side"), dict) else {}
+        weakening = right_side.get("logic_weakening_exit") if isinstance(right_side.get("logic_weakening_exit"), dict) else {}
+        if reason_type == "logic_weakening_exit":
+            confirmed = bool(right_side.get("long_confirmed") if side == "long" else right_side.get("short_confirmed"))
+            weakened = bool(weakening.get("long_logic_weakened") if side == "long" else weakening.get("short_logic_weakened"))
+            weakened_count = int(
+                (weakening.get("long_weakened_count") if side == "long" else weakening.get("short_weakened_count")) or 0
+            )
+            return confirmed and not weakened and weakened_count == 0
+        daily = levels.get("daily_ma7_trend") if isinstance(levels.get("daily_ma7_trend"), dict) else {}
+        if reason_type == "daily_ma7_short_reversal_exit" and side == "short":
+            market = levels.get("market_daily_ma7_reversal") if isinstance(levels.get("market_daily_ma7_reversal"), dict) else {}
+            return (
+                bool(daily.get("ready"))
+                and bool(daily.get("short_confirmed") or daily.get("bearish_stack"))
+                and not bool(market.get("reversal_confirmed"))
+            )
+        if reason_type == "daily_ma20_long_reversal_exit" and side == "long":
+            invalidated = bool(
+                daily.get("long_reversal_on_ma20_loss")
+                or (daily.get("ma7_loss_held") and daily.get("ma20_loss_held"))
+            )
+            return bool(daily.get("ready")) and bool(daily.get("long_confirmed") or daily.get("bullish_stack")) and not invalidated
+        return False
+
+    def manager_reentry_lock_block(
+        self,
+        signal: V6Signal,
+        state: dict[str, Any],
+        action: str,
+    ) -> dict[str, Any] | None:
+        if not self.config.manager_reentry_lock_active_for(signal.symbol) or action not in {"open_long", "open_short"}:
+            return None
+        side = "long" if action == "open_long" else "short"
+        key = self.manager_reentry_lock_key(signal.symbol, side)
+        locks = state.get("manager_reentry_locks") if isinstance(state.get("manager_reentry_locks"), dict) else {}
+        row = locks.get(key) if isinstance(locks, dict) else None
+        if not isinstance(row, dict):
+            return None
+        now = datetime.now(timezone.utc)
+        expires_at = self.parse_utc_datetime(row.get("expires_at"))
+        if expires_at is None:
+            locks.pop(key, None)
+            state["manager_reentry_locks"] = locks
+            history = [dict(item) for item in state.get("manager_reentry_lock_history") or [] if isinstance(item, dict)]
+            history.append({**row, "event": "removed", "removed_at": utc_now_iso(), "remove_reason": "invalid_expiry"})
+            state["manager_reentry_lock_history"] = history[-200:]
+            return None
+        if expires_at <= now:
+            locks.pop(key, None)
+            state["manager_reentry_locks"] = locks
+            history = [dict(item) for item in state.get("manager_reentry_lock_history") or [] if isinstance(item, dict)]
+            history.append({**row, "event": "expired", "expired_at": utc_now_iso()})
+            state["manager_reentry_lock_history"] = history[-200:]
+            return None
+        minimum_until = self.parse_utc_datetime(row.get("minimum_until"))
+        minimum_elapsed = minimum_until is not None and minimum_until <= now
+        revalidated = self.manager_reentry_revalidated(signal, side, str(row.get("reason_type") or ""))
+        if minimum_elapsed and revalidated:
+            locks.pop(key, None)
+            state["manager_reentry_locks"] = locks
+            history = [dict(item) for item in state.get("manager_reentry_lock_history") or [] if isinstance(item, dict)]
+            history.append({
+                **row,
+                "event": "released",
+                "released_at": utc_now_iso(),
+                "release_reason": "fresh_same_side_structure_revalidated",
+            })
+            state["manager_reentry_lock_history"] = history[-200:]
+            return None
+        return {
+            "enabled": True,
+            "blocked": True,
+            "watchable": False,
+            "action": action,
+            "side": side,
+            "reason": "manager_reentry_lock_active",
+            "message": (
+                "entry blocked: the position manager invalidated this side; "
+                "wait for minimum lock time and a fresh same-side structure confirmation"
+            ),
+            "manager_reentry_lock": dict(row),
+            "minimum_elapsed": minimum_elapsed,
+            "same_side_revalidated": revalidated,
+        }
 
     @staticmethod
     def position_reconcile_from_result(result: dict[str, Any]) -> dict[str, Any]:
         payload = result.get("position_reconcile") if isinstance(result.get("position_reconcile"), dict) else {}
         return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def submitted_order_has_no_confirmed_position_delta(result: dict[str, Any]) -> bool:
+        """Use the Binance client reconciliation rule as the single source of truth."""
+        return V6BinanceClient.submitted_order_has_no_confirmed_position_delta(result)
 
     @staticmethod
     def exchange_after_from_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -9880,6 +12563,75 @@ class V6ExecutionEngine:
         response = result.get("response") if isinstance(result.get("response"), dict) else {}
         return response.get("orderId") or response.get("clientOrderId") if isinstance(response, dict) else None
 
+    def execution_account_metadata(self) -> dict[str, Any]:
+        raw_asset_mode = str(self.config.account_asset_mode or "SINGLE_ASSET").strip().upper().replace("-", "_")
+        asset_mode = "MULTI_ASSET" if raw_asset_mode in {"MULTI", "MULTI_ASSET", "MULTI_ASSETS"} else "SINGLE_ASSET"
+        margin_type = str(self.config.margin_type or "ISOLATED").strip().upper().replace("-", "_")
+        virtual_isolation = bool(self.config.virtual_risk_isolation_enabled)
+        return {
+            "instance_name": self.config.instance_name,
+            "account_asset_mode": asset_mode,
+            "exchange_margin_type": margin_type,
+            "exchange_margin_shared": margin_type == "CROSSED",
+            "local_isolation_mode": "virtual_subledger" if virtual_isolation else "exchange_native",
+            "virtual_risk_isolation_enabled": virtual_isolation,
+            "order_mode": self.config.order_mode,
+            "exit_control_mode": self.config.exit_control_mode,
+        }
+
+    @staticmethod
+    def local_risk_budget_from_values(
+        *,
+        action: str,
+        side: str,
+        entry_price: float,
+        stop_loss_price: float,
+        notional_usdt: float,
+        leverage: int,
+    ) -> dict[str, Any]:
+        entry = float(entry_price or 0.0)
+        stop = float(stop_loss_price or 0.0)
+        notional = max(0.0, float(notional_usdt or 0.0))
+        leverage = max(1, int(leverage or 1))
+        stop_distance_pct = abs(stop - entry) / entry if entry > 0 and stop > 0 else 0.0
+        return {
+            "action": action,
+            "side": side,
+            "notional_budget_usdt": round(notional, 8),
+            "initial_margin_budget_usdt": round(notional / leverage, 8),
+            "leverage": leverage,
+            "entry_price": round(entry, 8),
+            "stop_loss_price": round(stop, 8),
+            "stop_distance_pct": round(stop_distance_pct * 100.0, 8),
+            "planned_loss_at_stop_usdt": round(notional * stop_distance_pct, 8),
+            "calculation": "notional_budget_usdt * stop_distance_pct",
+        }
+
+    @classmethod
+    def local_risk_budget_for_intent(
+        cls,
+        intent: V6OrderIntent,
+        *,
+        entry_price: float | None = None,
+        notional_usdt: float | None = None,
+    ) -> dict[str, Any]:
+        return cls.local_risk_budget_from_values(
+            action=intent.action,
+            side="short" if intent.action in {"open_short", "close_short"} else "long",
+            entry_price=float(entry_price if entry_price is not None else intent.entry_price or 0.0),
+            stop_loss_price=float(intent.stop_loss_price or 0.0),
+            notional_usdt=float(notional_usdt if notional_usdt is not None else intent.quantity_hint_usdt or 0.0),
+            leverage=int(intent.leverage or 1),
+        )
+
+    def annotate_intent_execution_risk(self, intent: V6OrderIntent) -> None:
+        risk_plan = dict(intent.risk_plan or {})
+        risk_plan["execution_account"] = self.execution_account_metadata()
+        risk_plan["exit_control_mode"] = self.config.exit_control_mode
+        if intent.action in {"open_long", "open_short"}:
+            risk_plan["local_risk_budget"] = self.local_risk_budget_for_intent(intent)
+        intent.risk_plan = risk_plan
+
     @staticmethod
     def compact_risk_plan_for_lot(risk_plan: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(risk_plan, dict):
@@ -9889,6 +12641,9 @@ class V6ExecutionEngine:
         return {
             "mode": risk_plan.get("mode"),
             "action": risk_plan.get("action"),
+            "strategy_id": risk_plan.get("strategy_id") or "",
+            "strategy_version": risk_plan.get("strategy_version") or "",
+            "strategy_provenance": risk_plan.get("strategy_provenance") or "",
             "strategy_labels": [str(item) for item in risk_plan.get("strategy_labels") or [] if str(item or "")],
             "strategy_label": risk_plan.get("strategy_label") or "",
             "horizon": risk_plan.get("horizon"),
@@ -9904,6 +12659,7 @@ class V6ExecutionEngine:
                 "macro_trend_context": context.get("macro_trend_context") or "",
                 "strategy_labels": [str(item) for item in context.get("strategy_labels") or [] if str(item or "")],
                 "generic_indicator": dict(context.get("generic_indicator") or {}),
+                "mixed_structure_macro_arbitration": dict(context.get("mixed_structure_macro_arbitration") or {}),
             },
             "selected_entry_level": dict(selected),
             "stop_anchor": dict(risk_plan.get("stop_anchor") or {}),
@@ -9914,10 +12670,24 @@ class V6ExecutionEngine:
                 dict(stage) for stage in risk_plan.get("staged_take_profit_targets") or [] if isinstance(stage, dict)
             ],
             "scale_in": dict(risk_plan.get("scale_in") or {}),
+            "execution_account": dict(risk_plan.get("execution_account") or {}),
+            "local_risk_budget": dict(risk_plan.get("local_risk_budget") or {}),
             "v5_candidate_metadata": dict(risk_plan.get("v5_candidate_metadata") or {})
             if isinstance(risk_plan.get("v5_candidate_metadata"), dict)
             else {},
         }
+
+    @staticmethod
+    def risk_plan_uses_mixed_probability_fallback(risk_plan: dict[str, Any] | None) -> bool:
+        if not isinstance(risk_plan, dict):
+            return False
+        context = risk_plan.get("entry_context") if isinstance(risk_plan.get("entry_context"), dict) else {}
+        arbitration = (
+            context.get("mixed_structure_macro_arbitration")
+            if isinstance(context.get("mixed_structure_macro_arbitration"), dict)
+            else {}
+        )
+        return bool(arbitration.get("active") and arbitration.get("probability_fallback"))
 
     @staticmethod
     def lot_id(intent: V6OrderIntent, result: dict[str, Any], *, fill_price: float, quantity: float) -> str:
@@ -9943,6 +12713,14 @@ class V6ExecutionEngine:
         strategy_labels = [str(item) for item in risk_plan.get("strategy_labels") or [] if str(item or "")]
         submitted_at = result.get("submitted_at") or utc_now_iso()
         response = result.get("response") if isinstance(result.get("response"), dict) else {}
+        local_risk_accounting = {
+            "execution_account": self.execution_account_metadata(),
+            "risk_budget": self.local_risk_budget_for_intent(
+                intent,
+                entry_price=fill_price,
+                notional_usdt=notional,
+            ),
+        }
         lot = {
             "lot_id": self.lot_id(intent, result, fill_price=fill_price, quantity=quantity),
             "symbol": intent.symbol,
@@ -9959,13 +12737,18 @@ class V6ExecutionEngine:
             "client_order_id": response.get("clientOrderId") if isinstance(response, dict) else None,
             "strategy_labels": strategy_labels,
             "strategy_label": strategy_labels[0] if strategy_labels else "",
+            "strategy_id": str(risk_plan.get("strategy_id") or "v6_execution"),
+            "strategy_version": str(risk_plan.get("strategy_version") or "v6"),
+            "strategy_provenance": str(risk_plan.get("strategy_provenance") or ""),
             "horizon": risk_plan.get("horizon"),
             "entry_timeframe": risk_plan.get("entry_timeframe"),
             "selected_entry_level": dict(selected),
             "stop_loss_price": intent.stop_loss_price,
             "take_profit_price": intent.take_profit_price,
             "risk_plan": self.compact_risk_plan_for_lot(risk_plan),
+            "local_risk_accounting": local_risk_accounting,
             "position_reconcile": self.position_reconcile_from_result(result),
+            "mixed_structure_probability_fallback": self.risk_plan_uses_mixed_probability_fallback(risk_plan),
         }
         if self.is_scale_in_intent(intent):
             lot["kind"] = "scale_in"
@@ -9984,6 +12767,8 @@ class V6ExecutionEngine:
             quantity = float(position.get("notional_usdt") or 0.0) / float(position.get("entry_price") or 1.0)
         if quantity <= 0:
             return []
+        raw_risk_plan = position.get("risk_plan")
+        risk_plan: dict[str, Any] = raw_risk_plan if isinstance(raw_risk_plan, dict) else {}
         return [{
             "lot_id": hashlib.sha1(
                 f"legacy|{position.get('symbol')}|{position.get('side')}|{position.get('opened_at')}|{position.get('entry_price')}".encode("utf-8")
@@ -9998,10 +12783,15 @@ class V6ExecutionEngine:
             "notional_usdt": float(position.get("notional_usdt") or 0.0),
             "remaining_notional_usdt": float(position.get("notional_usdt") or 0.0),
             "leverage": int(position.get("leverage") or 0),
-            "horizon": position.get("horizon") or (position.get("risk_plan") or {}).get("horizon"),
-            "entry_timeframe": position.get("entry_timeframe") or (position.get("risk_plan") or {}).get("entry_timeframe"),
-            "selected_entry_level": ((position.get("risk_plan") or {}).get("entry_context") or {}).get("selected_entry_level") or {},
-            "risk_plan": V6ExecutionEngine.compact_risk_plan_for_lot(position.get("risk_plan") or {}),
+            "strategy_id": str(position.get("strategy_id") or risk_plan.get("strategy_id") or "v6_execution"),
+            "strategy_version": str(position.get("strategy_version") or risk_plan.get("strategy_version") or "v6"),
+            "strategy_provenance": str(
+                position.get("strategy_provenance") or risk_plan.get("strategy_provenance") or "legacy_recovered"
+            ),
+            "horizon": position.get("horizon") or risk_plan.get("horizon"),
+            "entry_timeframe": position.get("entry_timeframe") or risk_plan.get("entry_timeframe"),
+            "selected_entry_level": (risk_plan.get("entry_context") or {}).get("selected_entry_level") or {},
+            "risk_plan": V6ExecutionEngine.compact_risk_plan_for_lot(risk_plan),
             "kind": "legacy_recovered",
         }]
 
@@ -10028,6 +12818,44 @@ class V6ExecutionEngine:
         position["entry_timeframes"] = timeframes
         position["strategy_labels"] = labels
         position["strategy_label"] = labels[0] if len(labels) == 1 else "mixed" if len(labels) > 1 else position.get("strategy_label", "")
+        strategy_ids = sorted({
+            str(lot.get("strategy_id") or (lot.get("risk_plan") or {}).get("strategy_id") or "v6_execution")
+            for lot in lots
+        })
+        position["strategy_id"] = strategy_ids[0] if len(strategy_ids) == 1 else "mixed"
+        strategy_versions = sorted({
+            str(lot.get("strategy_version") or (lot.get("risk_plan") or {}).get("strategy_version") or "")
+            for lot in lots
+            if str(lot.get("strategy_version") or (lot.get("risk_plan") or {}).get("strategy_version") or "")
+        })
+        strategy_provenances = sorted({
+            str(lot.get("strategy_provenance") or (lot.get("risk_plan") or {}).get("strategy_provenance") or "")
+            for lot in lots
+            if str(lot.get("strategy_provenance") or (lot.get("risk_plan") or {}).get("strategy_provenance") or "")
+        })
+        if strategy_versions:
+            position["strategy_version"] = strategy_versions[0] if len(strategy_versions) == 1 else "mixed"
+        if strategy_provenances:
+            position["strategy_provenance"] = strategy_provenances[0] if len(strategy_provenances) == 1 else "mixed"
+        remaining_notional = 0.0
+        remaining_initial_margin = 0.0
+        remaining_stop_risk = 0.0
+        for lot in lots:
+            accounting = lot.get("local_risk_accounting") if isinstance(lot.get("local_risk_accounting"), dict) else {}
+            budget = accounting.get("risk_budget") if isinstance(accounting.get("risk_budget"), dict) else {}
+            original_qty = max(0.0, float(lot.get("quantity") or 0.0))
+            remaining_qty = self.lot_remaining_quantity(lot)
+            remaining_ratio = min(1.0, remaining_qty / original_qty) if original_qty > 0 else 0.0
+            remaining_notional += float(budget.get("notional_budget_usdt") or 0.0) * remaining_ratio
+            remaining_initial_margin += float(budget.get("initial_margin_budget_usdt") or 0.0) * remaining_ratio
+            remaining_stop_risk += float(budget.get("planned_loss_at_stop_usdt") or 0.0) * remaining_ratio
+        position["local_risk_accounting"] = {
+            "execution_account": self.execution_account_metadata(),
+            "open_lot_count": len(lots),
+            "remaining_notional_budget_usdt": round(remaining_notional, 8),
+            "remaining_initial_margin_budget_usdt": round(remaining_initial_margin, 8),
+            "remaining_stop_risk_budget_usdt": round(remaining_stop_risk, 8),
+        }
         if len(horizons) == 1:
             position["horizon"] = horizons[0]
         elif len(horizons) > 1:
@@ -10097,16 +12925,159 @@ class V6ExecutionEngine:
             }
         position["lots"] = lots
 
+    def local_position_quantity(self, position: dict[str, Any]) -> float:
+        for key in ("position_qty", "remaining_quantity", "quantity"):
+            try:
+                value = abs(float(position.get(key) or 0.0))
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return sum(self.lot_remaining_quantity(lot) for lot in self.normalize_lots(position))
+
+    def record_manual_exchange_action(
+        self,
+        state: dict[str, Any],
+        position: dict[str, Any],
+        *,
+        previous_qty: float,
+        exchange_qty: float,
+        snapshot: dict[str, Any] | None = None,
+        close_order: dict[str, Any] | None = None,
+        source: str = "scheduled_exchange_position_reconcile",
+    ) -> dict[str, Any] | None:
+        if not self.config.manual_exchange_action_audit_enabled:
+            return None
+        previous_qty = max(0.0, float(previous_qty or 0.0))
+        exchange_qty = max(0.0, float(exchange_qty or 0.0))
+        tolerance = max(1e-9, previous_qty * 0.001)
+        if abs(exchange_qty - previous_qty) <= tolerance:
+            return None
+
+        symbol = str(position.get("symbol") or "").upper()
+        side = str(position.get("side") or "").lower()
+        if not symbol or side not in {"long", "short"}:
+            return None
+        close_order = close_order if isinstance(close_order, dict) else {}
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        reduced_qty = max(0.0, previous_qty - exchange_qty)
+        increased_qty = max(0.0, exchange_qty - previous_qty)
+        order_type = str(close_order.get("orig_type") or close_order.get("type") or "").upper()
+        order_id = str(close_order.get("order_id") or "")
+        client_order_id = str(close_order.get("client_order_id") or "")
+        protective_ids = {
+            str(position.get("protective_stop_order_id") or ""),
+            str(position.get("protective_stop_client_order_id") or ""),
+        } - {""}
+        if exchange_qty <= tolerance:
+            if "STOP" in order_type or order_id in protective_ids or client_order_id in protective_ids:
+                action = "protective_stop_close"
+            elif close_order.get("status") == "found":
+                action = "manual_close"
+            else:
+                action = "manual_or_exchange_close"
+        elif reduced_qty > tolerance:
+            action = "manual_reduce"
+        else:
+            action = "manual_increase"
+
+        entry_price = float(position.get("entry_price") or 0.0)
+        action_price = float(
+            close_order.get("avg_price")
+            or snapshot.get("mark_price")
+            or position.get("current_price")
+            or entry_price
+            or 0.0
+        )
+        price_return_pct = 0.0
+        if entry_price > 0 and action_price > 0:
+            raw_return = (action_price - entry_price) / entry_price * 100.0
+            price_return_pct = raw_return if side == "long" else -raw_return
+        leverage = max(1, int(position.get("leverage") or self.config.default_leverage))
+        event_key = "|".join(
+            [
+                self.config.instance_name,
+                symbol,
+                side,
+                f"{previous_qty:.12f}",
+                f"{exchange_qty:.12f}",
+                str(position.get("last_exchange_sync_at") or position.get("opened_at") or ""),
+            ]
+        )
+        event_id = hashlib.sha1(event_key.encode("utf-8")).hexdigest()[:20]
+        processed_ids = [str(item) for item in state.get("manual_exchange_action_event_ids") or []]
+        if event_id in processed_ids:
+            return None
+        event = {
+            "event": "v6_manual_exchange_action_detected",
+            "event_id": event_id,
+            "detected_at": utc_now_iso(),
+            "instance_name": self.config.instance_name,
+            "exit_control_mode": self.config.exit_control_mode,
+            "source": source,
+            "classification": action,
+            "symbol": symbol,
+            "side": side,
+            "previous_quantity": round(previous_qty, 12),
+            "exchange_quantity": round(exchange_qty, 12),
+            "reduced_quantity": round(reduced_qty, 12),
+            "increased_quantity": round(increased_qty, 12),
+            "change_fraction": round(abs(exchange_qty - previous_qty) / previous_qty, 8) if previous_qty > 0 else 1.0,
+            "entry_price": round(entry_price, 8),
+            "action_price_estimate": round(action_price, 8),
+            "price_return_pct_estimate": round(price_return_pct, 6),
+            "leveraged_return_pct_estimate": round(price_return_pct * leverage, 6),
+            "leverage": leverage,
+            "exchange_order": {
+                "status": close_order.get("status"),
+                "source": close_order.get("source"),
+                "order_id": close_order.get("order_id"),
+                "client_order_id": close_order.get("client_order_id"),
+                "type": close_order.get("type"),
+                "orig_type": close_order.get("orig_type"),
+                "executed_qty": close_order.get("executed_qty"),
+                "avg_price": close_order.get("avg_price"),
+                "close_time": close_order.get("close_time"),
+            },
+        }
+        audit_file = self.config.manual_exchange_action_audit_file or (
+            self.config.state_dir / "manual_exchange_actions.jsonl"
+        )
+        append_text_line(audit_file, json.dumps(event, ensure_ascii=False))
+        journal = [dict(item) for item in state.get("journal") or [] if isinstance(item, dict)]
+        journal.append(event)
+        state["journal"] = journal[-1000:]
+        state["manual_exchange_action_event_ids"] = (processed_ids + [event_id])[-500:]
+        history = [dict(item) for item in position.get("manual_exchange_action_history") or [] if isinstance(item, dict)]
+        history.append(event)
+        position["manual_exchange_action_history"] = history[-100:]
+        position["last_manual_exchange_action"] = event
+        return event
+
     def recovered_lot_from_position(self, position: dict[str, Any], *, actual_qty: float, reason: str) -> dict[str, Any]:
         entry = float(position.get("entry_price") or 0.0)
         mark = float(position.get("current_price") or entry or 0.0)
         notional = actual_qty * (mark if mark > 0 else entry)
+        side = str(position.get("side") or "").lower()
+        leverage = int(position.get("leverage") or self.config.default_leverage)
+        local_risk_accounting = {
+            "execution_account": self.execution_account_metadata(),
+            "risk_budget": self.local_risk_budget_from_values(
+                action="open_short" if side == "short" else "open_long",
+                side=side or "long",
+                entry_price=entry,
+                stop_loss_price=float(position.get("stop_loss_price") or 0.0),
+                notional_usdt=notional,
+                leverage=leverage,
+            ),
+            "source": "exchange_recovered",
+        }
         return {
             "lot_id": hashlib.sha1(
                 f"exchange_recovered|{position.get('symbol')}|{position.get('side')}|{utc_now_iso()}|{actual_qty}".encode("utf-8")
             ).hexdigest()[:16],
             "symbol": str(position.get("symbol") or "").upper(),
-            "side": str(position.get("side") or "").lower(),
+            "side": side,
             "status": "open",
             "opened_at": position.get("opened_at") or utc_now_iso(),
             "entry_price": round(entry, 8),
@@ -10114,11 +13085,12 @@ class V6ExecutionEngine:
             "remaining_quantity": round(actual_qty, 12),
             "notional_usdt": round(notional, 6),
             "remaining_notional_usdt": round(notional, 6),
-            "leverage": int(position.get("leverage") or self.config.default_leverage),
+            "leverage": leverage,
             "horizon": position.get("horizon") or "exchange_recovered",
             "entry_timeframe": position.get("entry_timeframe") or "exchange_recovered",
             "selected_entry_level": {},
             "risk_plan": {"mode": "exchange_recovered", "reason": reason},
+            "local_risk_accounting": local_risk_accounting,
             "kind": "exchange_recovered",
         }
 
@@ -10147,7 +13119,12 @@ class V6ExecutionEngine:
             "order_mode": self.config.order_mode,
             "source": "exchange_reconciled",
             "risk_status": "missing_local_lot_recovered_from_binance_positionRisk",
-            "risk_plan": {"mode": "exchange_recovered", "reason": "present_in_binance_positionRisk_but_absent_in_v6_state"},
+            "risk_plan": {
+                "mode": "exchange_recovered",
+                "reason": "present_in_binance_positionRisk_but_absent_in_v6_state",
+                "exit_control_mode": self.config.exit_control_mode,
+                "execution_account": self.execution_account_metadata(),
+            },
             "horizon": "exchange_recovered",
             "entry_timeframe": "exchange_recovered",
             "original_notional_usdt": round(abs(float(snapshot.get("notional") or qty * mark)), 6),
@@ -10453,7 +13430,11 @@ class V6ExecutionEngine:
             "entry_price": float(position.get("entry_price") or 0.0),
             "close_price": close_price,
             "leverage": int(position.get("leverage") or self.config.default_leverage),
-            "original_notional_usdt": float(position.get("original_notional_usdt") or position.get("notional_usdt") or self.config.base_notional_usdt),
+            "original_notional_usdt": float(
+                position.get("original_notional_usdt")
+                or position.get("notional_usdt")
+                or self.config.base_notional_for(symbol)
+            ),
             "close_reason": close_reason,
             "target_name": "",
             "risk_plan": position.get("risk_plan") if isinstance(position.get("risk_plan"), dict) else {},
@@ -10469,6 +13450,163 @@ class V6ExecutionEngine:
             },
         }
         append_text_line(self.config.closed_trade_review_queue_file, json.dumps(review, ensure_ascii=False))
+
+    def position_uses_mixed_probability_fallback(self, position: dict[str, Any]) -> bool:
+        if bool(position.get("mixed_structure_probability_fallback")):
+            return True
+        if self.risk_plan_uses_mixed_probability_fallback(position.get("risk_plan")):
+            return True
+        return any(
+            bool(lot.get("mixed_structure_probability_fallback"))
+            or self.risk_plan_uses_mixed_probability_fallback(lot.get("risk_plan"))
+            for lot in position.get("lots") or []
+            if isinstance(lot, dict)
+        )
+
+    @staticmethod
+    def estimate_closed_position_return(
+        position: dict[str, Any],
+        *,
+        final_close_price: float,
+    ) -> dict[str, float]:
+        side = str(position.get("side") or "").lower()
+        if side not in {"long", "short"} or final_close_price <= 0:
+            return {}
+
+        realized_pnl = 0.0
+        entry_notional = 0.0
+        exit_notional = 0.0
+        quantity_total = 0.0
+
+        def add_fill(entry_price: Any, close_price: Any, quantity: Any) -> None:
+            nonlocal realized_pnl, entry_notional, exit_notional, quantity_total
+            try:
+                entry = float(entry_price or 0.0)
+                close = float(close_price or 0.0)
+                qty = abs(float(quantity or 0.0))
+            except (TypeError, ValueError):
+                return
+            if entry <= 0 or close <= 0 or qty <= 0:
+                return
+            realized_pnl += (close - entry) * qty if side == "long" else (entry - close) * qty
+            entry_notional += entry * qty
+            exit_notional += close * qty
+            quantity_total += qty
+
+        for close_event in position.get("lot_close_history") or []:
+            if not isinstance(close_event, dict):
+                continue
+            event_close_price = close_event.get("close_price")
+            allocations = [item for item in close_event.get("allocations") or [] if isinstance(item, dict)]
+            for allocation in allocations:
+                add_fill(
+                    allocation.get("entry_price") or position.get("entry_price"),
+                    event_close_price,
+                    allocation.get("closed_quantity"),
+                )
+
+        remaining_lots = [lot for lot in position.get("lots") or [] if isinstance(lot, dict)]
+        for lot in remaining_lots:
+            add_fill(
+                lot.get("entry_price") or position.get("entry_price"),
+                final_close_price,
+                lot.get("remaining_quantity") if lot.get("remaining_quantity") is not None else lot.get("quantity"),
+            )
+
+        if entry_notional <= 0:
+            try:
+                fallback_entry = float(position.get("entry_price") or 0.0)
+                fallback_qty = abs(float(position.get("remaining_quantity") or position.get("position_qty") or 0.0))
+                if fallback_qty <= 0 and fallback_entry > 0:
+                    fallback_qty = abs(float(position.get("original_notional_usdt") or 0.0)) / fallback_entry
+            except (TypeError, ValueError, ZeroDivisionError):
+                fallback_entry = 0.0
+                fallback_qty = 0.0
+            add_fill(fallback_entry, final_close_price, fallback_qty)
+
+        if entry_notional <= 0:
+            return {}
+        leverage = max(1.0, float(position.get("leverage") or 1.0))
+        raw_return_pct = realized_pnl / entry_notional * 100.0
+        return {
+            "realized_pnl_quote_estimate": round(realized_pnl, 8),
+            "entry_notional_estimate": round(entry_notional, 8),
+            "weighted_exit_price_estimate": round(exit_notional / quantity_total, 8)
+            if exit_notional > 0 and quantity_total > 0
+            else round(final_close_price, 8),
+            "raw_return_pct": round(raw_return_pct, 8),
+            "leveraged_roi_pct": round(raw_return_pct * leverage, 8),
+        }
+
+    def record_mixed_probability_fallback_outcome(
+        self,
+        state: dict[str, Any],
+        position: dict[str, Any],
+        *,
+        final_close_price: float,
+        closed_at: str,
+        order_id: Any,
+        source: str,
+    ) -> dict[str, Any] | None:
+        if not self.position_uses_mixed_probability_fallback(position):
+            return None
+        metrics = self.estimate_closed_position_return(position, final_close_price=final_close_price)
+        if not metrics:
+            return None
+        symbol = str(position.get("symbol") or "").upper()
+        side = str(position.get("side") or "").lower()
+        if not symbol or side not in {"long", "short"}:
+            return None
+        event_source = "|".join([
+            symbol,
+            side,
+            str(position.get("opened_at") or ""),
+            str(closed_at or ""),
+            str(order_id or ""),
+        ])
+        event_id = hashlib.sha256(event_source.encode("utf-8")).hexdigest()[:24]
+        guard = self.mixed_structure_probability_fallback_guard(state, symbol)
+        processed = [str(item) for item in guard.get("processed_event_ids") or [] if str(item or "")]
+        if event_id in processed:
+            return None
+
+        loss = float(metrics.get("realized_pnl_quote_estimate") or 0.0) < 0.0
+        consecutive_losses = int(guard.get("consecutive_losses") or 0) + 1 if loss else 0
+        max_losses = max(1, int(self.config.mixed_structure_probability_fallback_max_losses or 3))
+        status = "observing" if consecutive_losses >= max_losses else "active"
+        event = {
+            "event": "mixed_structure_probability_fallback_trade_closed",
+            "event_id": event_id,
+            "symbol": symbol,
+            "side": side,
+            "opened_at": position.get("opened_at"),
+            "closed_at": closed_at or utc_now_iso(),
+            "order_id": order_id,
+            "source": source,
+            "outcome": "loss" if loss else "non_loss",
+            "consecutive_losses": consecutive_losses,
+            "status": status,
+            **metrics,
+        }
+        history = [dict(item) for item in guard.get("history") or [] if isinstance(item, dict)]
+        history.append(event)
+        guard.update({
+            "symbol": symbol,
+            "status": status,
+            "consecutive_losses": consecutive_losses,
+            "total_trades": int(guard.get("total_trades") or 0) + 1,
+            "total_losses": int(guard.get("total_losses") or 0) + (1 if loss else 0),
+            "last_direction": side,
+            "last_outcome": event["outcome"],
+            "last_closed_at": event["closed_at"],
+            "history": history[-30:],
+            "processed_event_ids": (processed + [event_id])[-100:],
+            "updated_at": utc_now_iso(),
+        })
+        journal = [dict(item) for item in state.get("journal") or [] if isinstance(item, dict)]
+        journal.append(event)
+        state["journal"] = journal[-1000:]
+        return event
 
     def reconcile_state_with_exchange(
         self,
@@ -10496,21 +13634,34 @@ class V6ExecutionEngine:
                         "position_qty": snapshot.get("abs_position_qty"),
                         "notional": round(self.client.exchange_snapshot_notional(snapshot), 8),
                     })
+                    actual_by_key[key] = row
                     continue
                 actual_by_key[key] = row
             actual_keys = set(actual_by_key)
             kept = []
             updated = []
             v5_overlay_migrations = []
+            manual_exchange_actions = []
             for item in positions:
                 key = self.position_key_from_state(item)
                 if key not in actual_keys:
                     continue
                 snapshot = V6BinanceClient.exchange_position_snapshot(actual_by_key[key])
+                previous_qty = self.local_position_quantity(item)
+                actual_qty = abs(float(snapshot.get("position_amt") or snapshot.get("abs_position_qty") or 0.0))
+                manual_action = self.record_manual_exchange_action(
+                    state,
+                    item,
+                    previous_qty=previous_qty,
+                    exchange_qty=actual_qty,
+                    snapshot=snapshot,
+                )
+                if manual_action:
+                    manual_exchange_actions.append(manual_action)
                 self.apply_exchange_snapshot_to_position(item, snapshot)
                 self.reconcile_lots_to_exchange_quantity(
                     item,
-                    abs(float(snapshot.get("position_amt") or snapshot.get("abs_position_qty") or 0.0)),
+                    actual_qty,
                     reason="scheduled_exchange_position_reconcile",
                 )
                 migration = self.ensure_v5_overlay_stop_on_position(item)
@@ -10532,7 +13683,7 @@ class V6ExecutionEngine:
             recovered = [
                 self.recovered_position_from_exchange_row(row)
                 for key, row in actual_by_key.items()
-                if key not in local_keys
+                if key not in local_keys and key not in ignored_dust_keys
             ]
             reconciled_positions = kept + recovered
             stop_sync = (
@@ -10554,6 +13705,7 @@ class V6ExecutionEngine:
                     "protective_stop_sync": stop_sync,
                     "exchange_side_effects_enabled": sync_exchange_side_effects,
                     "v5_overlay_migrations": v5_overlay_migrations,
+                    "manual_exchange_actions": manual_exchange_actions,
                 }
             cancellations = []
             local_dust_removed = []
@@ -10579,13 +13731,36 @@ class V6ExecutionEngine:
                     continue
                 close_order = (
                     self.recent_exchange_close_order_for_missing_position(position)
-                    if sync_exchange_side_effects
+                    if sync_exchange_side_effects or self.config.manual_exchange_action_audit_enabled
                     else {
                         "status": "skipped",
                         "reason": "exchange_side_effects_disabled",
                         "source": "local_reconcile",
                     }
                 )
+                manual_action = self.record_manual_exchange_action(
+                    state,
+                    position,
+                    previous_qty=self.local_position_quantity(position),
+                    exchange_qty=0.0,
+                    close_order=close_order,
+                )
+                if manual_action:
+                    manual_exchange_actions.append(manual_action)
+                if isinstance(close_order, dict) and close_order.get("status") == "found":
+                    try:
+                        reconciled_close_price = float(close_order.get("avg_price") or 0.0)
+                    except (TypeError, ValueError):
+                        reconciled_close_price = 0.0
+                    if reconciled_close_price > 0:
+                        self.record_mixed_probability_fallback_outcome(
+                            state,
+                            position,
+                            final_close_price=reconciled_close_price,
+                            closed_at=str(close_order.get("close_time") or utc_now_iso()),
+                            order_id=close_order.get("order_id"),
+                            source="exchange_position_reconcile",
+                        )
                 self.enqueue_reconciled_closed_trade_review(
                     position,
                     close_reason="exchange position missing after protective stop or manual close",
@@ -10659,6 +13834,7 @@ class V6ExecutionEngine:
                 "protective_stop_sync": stop_sync,
                 "exchange_side_effects_enabled": sync_exchange_side_effects,
                 "v5_overlay_migrations": v5_overlay_migrations,
+                "manual_exchange_actions": manual_exchange_actions,
             }
         except Exception as exc:
             LOGGER.warning("V6 exchange position reconcile failed: %s", exc)
@@ -10818,7 +13994,17 @@ class V6ExecutionEngine:
             expected_quantity = self.quantity_from_position_amount(str(position.get("symbol") or ""), actual)
             expected_trigger = self.client.resolve_price(str(position.get("symbol") or ""), float(position.get("stop_loss_price") or 0.0))
             current_stops = stops_by_key.get(key, [])
-            matching = [order for order in current_stops if self.protective_stop_matches(order, expected_quantity, expected_trigger)]
+            close_remaining_position = self.config.stop_only_manual_profit()
+            matching = [
+                order
+                for order in current_stops
+                if self.protective_stop_matches(
+                    order,
+                    expected_quantity,
+                    expected_trigger,
+                    close_position=close_remaining_position,
+                )
+            ]
             if len(current_stops) == 1 and matching:
                 self.record_protective_stop_on_position(position, matching[0])
                 continue
@@ -10872,6 +14058,7 @@ class V6ExecutionEngine:
                 "side": position.get("side"),
                 "quantity": expected_quantity,
                 "trigger_price": expected_trigger,
+                "close_position": close_remaining_position,
                 "result_status": submitted.get("status") if isinstance(submitted, dict) else "",
             })
         return actions
@@ -10895,16 +14082,28 @@ class V6ExecutionEngine:
         return V6BinanceClient.format_decimal(quantity)
 
     @staticmethod
-    def protective_stop_matches(order: dict[str, Any], expected_quantity: str, expected_trigger: str) -> bool:
-        quantity = str(order.get("quantity") or order.get("origQty") or "")
+    def protective_stop_matches(
+        order: dict[str, Any],
+        expected_quantity: str,
+        expected_trigger: str,
+        *,
+        close_position: bool = False,
+    ) -> bool:
         trigger = str(order.get("triggerPrice") or order.get("stopPrice") or "")
+        try:
+            trigger_matches = Decimal(trigger) == Decimal(expected_trigger)
+        except Exception:
+            trigger_matches = trigger == expected_trigger
+        if close_position:
+            closes_remaining = str(order.get("closePosition") or "").lower() == "true" or order.get("closePosition") is True
+            return trigger_matches and closes_remaining
+
+        quantity = str(order.get("quantity") or order.get("origQty") or "")
         reduce_only = str(order.get("reduceOnly") or "").lower() == "true" or order.get("reduceOnly") is True
         try:
             quantity_matches = Decimal(quantity) == Decimal(expected_quantity)
-            trigger_matches = Decimal(trigger) == Decimal(expected_trigger)
         except Exception:
             quantity_matches = quantity == expected_quantity
-            trigger_matches = trigger == expected_trigger
         return quantity_matches and trigger_matches and reduce_only
 
     def intent_from_state_position(self, position: dict[str, Any]) -> V6OrderIntent:
@@ -10914,7 +14113,10 @@ class V6ExecutionEngine:
             action=action,
             symbol=str(position.get("symbol") or "").upper(),
             side="SELL" if action == "open_short" else "BUY",
-            quantity_hint_usdt=float(position.get("notional_usdt") or self.config.base_notional_usdt),
+            quantity_hint_usdt=float(
+                position.get("notional_usdt")
+                or self.config.base_notional_for(position.get("symbol") or "")
+            ),
             leverage=int(position.get("leverage") or self.config.default_leverage),
             reduce_only=False,
             entry_price=float(position.get("entry_price") or 0.0),
@@ -10938,6 +14140,10 @@ class V6ExecutionEngine:
         status = order.get("algoStatus") or order.get("status")
         if status:
             position["protective_stop_status"] = status
+        position["protective_stop_close_position"] = (
+            str(order.get("closePosition") or "").lower() == "true"
+            or order.get("closePosition") is True
+        )
         position["protective_stop_submit_status"] = "submitted"
 
     def apply_lot_close_allocation(
@@ -10961,6 +14167,7 @@ class V6ExecutionEngine:
             position["lots"] = lots
             return
         close_ratio = close_qty / total_qty
+        close_price = self.filled_entry_price_for_state(intent, result)
         allocations: list[dict[str, Any]] = []
         for lot in lots:
             previous_qty = self.lot_remaining_quantity(lot)
@@ -10973,6 +14180,7 @@ class V6ExecutionEngine:
                 lot["close_reason"] = intent.rationale
             allocations.append({
                 "lot_id": lot.get("lot_id"),
+                "entry_price": lot.get("entry_price"),
                 "previous_quantity": round(previous_qty, 12),
                 "closed_quantity": round(lot_close_qty, 12),
                 "remaining_quantity": round(remaining_qty, 12),
@@ -10986,25 +14194,12 @@ class V6ExecutionEngine:
             "close_quantity": round(close_qty, 12),
             "total_quantity_before": round(total_qty, 12),
             "close_ratio": round(close_ratio, 8),
+            "close_price": round(close_price, 8) if close_price > 0 else None,
             "allocations": allocations,
             "order_id": self.order_id_from_result(result),
         })
         position["lot_close_history"] = history[-50:]
         position["lots"] = [lot for lot in lots if self.lot_remaining_quantity(lot) > 0]
-
-    @staticmethod
-    def submitted_order_has_no_confirmed_position_delta(result: dict[str, Any]) -> bool:
-        status = str(result.get("status") or "")
-        if status not in {"submitted", "submitted_unprotected", "submitted_no_position_delta"}:
-            return False
-        reconcile = result.get("position_reconcile")
-        if not isinstance(reconcile, dict):
-            return False
-        try:
-            delta_qty = abs(float(reconcile.get("delta_qty_abs") or 0.0))
-        except Exception:
-            delta_qty = 0.0
-        return delta_qty <= 0.0
 
     def apply_partial_take_profit_to_position(self, position: dict[str, Any], intent: V6OrderIntent, result: dict[str, Any]) -> dict[str, Any] | None:
         partial = (intent.risk_plan or {}).get("partial_take_profit") or {}
@@ -11018,6 +14213,7 @@ class V6ExecutionEngine:
             "v5_no_news_momentum_tp",
             "v5_no_news_momentum_final_giveback_exit",
             "v5_momentum_guard",
+            "v6_smart_signal_risk_guard",
         }:
             stage_key = "profit_guard_stages"
             stages = [stage for stage in position.get(stage_key) or [] if isinstance(stage, dict)]
@@ -11093,7 +14289,11 @@ class V6ExecutionEngine:
 
         position[stage_key] = stages
         position["remaining_fraction"] = round(remaining, 6)
-        original_notional = float(position.get("original_notional_usdt") or position.get("notional_usdt") or self.config.base_notional_usdt)
+        original_notional = float(
+            position.get("original_notional_usdt")
+            or position.get("notional_usdt")
+            or self.config.base_notional_for(position.get("symbol") or "")
+        )
         position["original_notional_usdt"] = original_notional
         position["notional_usdt"] = round(original_notional * remaining, 6)
         position["current_price"] = intent.entry_price
@@ -11117,20 +14317,51 @@ class V6ExecutionEngine:
             result,
             fallback_fraction=fraction_of_initial,
         )
+        reconcile = self.position_reconcile_from_result(result)
         after = self.exchange_after_from_result(result)
+        after_state = str(reconcile.get("after_state") or "")
+        confirmation_state = str(reconcile.get("confirmation_state") or "confirmed")
         if after:
+            after_qty = abs(float(after.get("position_amt") or after.get("abs_position_qty") or 0.0))
             self.apply_exchange_snapshot_to_position(position, after)
             self.reconcile_lots_to_exchange_quantity(
                 position,
-                abs(float(after.get("position_amt") or after.get("abs_position_qty") or 0.0)),
+                after_qty,
                 reason="partial_take_profit_after_order_reconcile",
             )
+            before = reconcile.get("before") if isinstance(reconcile.get("before"), dict) else {}
+            before_qty = abs(float(before.get("position_amt") or before.get("abs_position_qty") or 0.0))
+            if before_qty > 0:
+                position["remaining_fraction"] = round(previous_remaining * min(1.0, after_qty / before_qty), 6)
+            if after_qty <= 0:
+                position["remaining_fraction"] = 0.0
+                position["notional_usdt"] = 0.0
+                position["position_qty"] = 0.0
+                position["remaining_quantity"] = 0.0
+                self.update_position_layer_summary(position)
+                return None
+        elif confirmation_state == "confirmed" and after_state == "flat":
+            self.reconcile_lots_to_exchange_quantity(
+                position,
+                0.0,
+                reason="partial_take_profit_confirmed_exchange_flat",
+            )
+            position["remaining_fraction"] = 0.0
+            position["notional_usdt"] = 0.0
+            position["position_qty"] = 0.0
+            position["remaining_quantity"] = 0.0
+            self.update_position_layer_summary(position)
+            return None
         else:
             total_remaining_qty = sum(self.lot_remaining_quantity(lot) for lot in self.normalize_lots(position))
             if total_remaining_qty > 0:
                 position["position_qty"] = round(total_remaining_qty, 12)
                 position["remaining_quantity"] = round(total_remaining_qty, 12)
         self.update_position_layer_summary(position)
+        if str(result.get("status") or "") == "dry_run":
+            return None if remaining <= 0.001 else position
+        if self.config.close_resolver_enabled:
+            return position
         return None if remaining <= 0.001 else position
 
     def enqueue_closed_take_profit_review(self, position: dict[str, Any], intent: V6OrderIntent, result: dict[str, Any]) -> None:
@@ -11238,6 +14469,7 @@ class V6ExecutionEngine:
         position["original_notional_usdt"] = round(combined_original, 6)
         position["remaining_fraction"] = round(combined_notional / combined_original, 6) if combined_original > 0 else 1.0
         position["risk_plan"] = intent.risk_plan
+        position["mixed_structure_probability_fallback"] = bool(position.get("mixed_structure_probability_fallback"))
         position["take_profit_stages"] = stages
         position["scale_in_count"] = len(history)
         position["scale_in_history"] = history[-10:]
@@ -11251,6 +14483,88 @@ class V6ExecutionEngine:
                 abs(float(after.get("position_amt") or after.get("abs_position_qty") or 0.0)),
                 reason="scale_in_after_order_reconcile",
             )
+        self.update_position_layer_summary(position)
+        return position
+
+    def residual_position_after_full_close(
+        self,
+        position: dict[str, Any],
+        intent: V6OrderIntent,
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Apply a close result without deleting state on an uncertain snapshot."""
+        reconcile = self.position_reconcile_from_result(result)
+        after = reconcile.get("after") if isinstance(reconcile.get("after"), dict) else {}
+        after_error = str(reconcile.get("after_error") or "")
+        confirmation_state = str(reconcile.get("confirmation_state") or ("unknown" if after_error else "confirmed"))
+        after_state = str(reconcile.get("after_state") or "")
+        if not after_state:
+            if after_error:
+                after_state = "unknown"
+            elif "after" in reconcile:
+                after_state = "position" if after else "flat"
+            else:
+                after_state = "unknown"
+
+        event = {
+            "closed_at": result.get("submitted_at") or utc_now_iso(),
+            "order_id": self.order_id_from_result(result),
+            "executed_quantity": (
+                (result.get("response") or {}).get("executedQty")
+                if isinstance(result.get("response"), dict)
+                else None
+            ),
+            "avg_price": (
+                (result.get("response") or {}).get("avgPrice")
+                if isinstance(result.get("response"), dict)
+                else None
+            ),
+            "close_mode": ((intent.risk_plan or {}).get("close_decision") or {}).get("mode"),
+            "position_reconcile": reconcile,
+        }
+
+        if confirmation_state != "confirmed" or after_state == "unknown":
+            position["reconcile_pending"] = True
+            position["reconcile_pending_reason"] = after_error or "post_close_exchange_snapshot_unknown"
+            position["reconcile_pending_since"] = result.get("submitted_at") or utc_now_iso()
+            history = [dict(item) for item in position.get("close_events") or [] if isinstance(item, dict)]
+            history.append({**event, "status": "reconcile_pending"})
+            position["close_events"] = history[-20:]
+            return position
+
+        if after_state == "flat" and not after:
+            self.reconcile_lots_to_exchange_quantity(position, 0.0, reason="close_result_confirmed_exchange_flat")
+            position["position_qty"] = 0.0
+            position["remaining_quantity"] = 0.0
+            position["notional_usdt"] = 0.0
+            position["remaining_fraction"] = 0.0
+            return None
+
+        try:
+            after_qty = abs(float(after.get("position_amt") or after.get("abs_position_qty") or 0.0))
+        except (TypeError, ValueError):
+            after_qty = 0.0
+        if after_qty <= 0:
+            self.reconcile_lots_to_exchange_quantity(position, 0.0, reason="close_result_confirmed_exchange_flat")
+            position["position_qty"] = 0.0
+            position["remaining_quantity"] = 0.0
+            position["notional_usdt"] = 0.0
+            position["remaining_fraction"] = 0.0
+            return None
+
+        self.apply_exchange_snapshot_to_position(position, after)
+        self.reconcile_lots_to_exchange_quantity(
+            position,
+            after_qty,
+            reason="close_result_residual_exchange_quantity",
+        )
+        position.pop("reconcile_pending", None)
+        position.pop("reconcile_pending_reason", None)
+        position.pop("reconcile_pending_since", None)
+        history = [dict(item) for item in position.get("close_events") or [] if isinstance(item, dict)]
+        history.append({**event, "status": "residual_position_retained", "residual_quantity": round(after_qty, 12)})
+        position["close_events"] = history[-20:]
+        position["close_residual_reconciled_at"] = utc_now_iso()
         self.update_position_layer_summary(position)
         return position
 
@@ -11316,6 +14630,18 @@ class V6ExecutionEngine:
                             result,
                             event="partial_take_profit",
                         )
+                    if updated is None:
+                        partial_close_price = self.filled_entry_price_for_state(intent, result)
+                        if partial_close_price > 0:
+                            self.record_mixed_probability_fallback_outcome(
+                                state,
+                                position,
+                                final_close_price=partial_close_price,
+                                closed_at=str(result.get("submitted_at") or utc_now_iso()),
+                                order_id=self.order_id_from_result(result),
+                                source="partial_take_profit_confirmed_flat",
+                            )
+                        self.enqueue_closed_take_profit_review(position, intent, result)
                     if updated is not None:
                         updated_positions.append(updated)
                 positions = updated_positions
@@ -11338,6 +14664,21 @@ class V6ExecutionEngine:
                         position["close_skipped_history"] = history[-20:]
                         updated_positions.append(position)
                         continue
+                    if self.config.close_resolver_enabled:
+                        residual = self.residual_position_after_full_close(position, intent, result)
+                        if residual is not None:
+                            updated_positions.append(residual)
+                            continue
+                    full_close_price = self.filled_entry_price_for_state(intent, result)
+                    if full_close_price > 0:
+                        self.record_mixed_probability_fallback_outcome(
+                            state,
+                            position,
+                            final_close_price=full_close_price,
+                            closed_at=str(result.get("submitted_at") or utc_now_iso()),
+                            order_id=self.order_id_from_result(result),
+                            source="execution_full_close",
+                        )
                     self.record_v5_profit_reentry_guard(
                         state,
                         position,
@@ -11345,6 +14686,7 @@ class V6ExecutionEngine:
                         result,
                         event="full_close",
                     )
+                    self.register_manager_reentry_lock(state, position, intent, result)
                     stop_loss_cooldown_minutes = max(0.0, float(self.config.v5_stop_loss_cooldown_minutes or 0.0))
                     close_reason_text = str(intent.rationale or "").lower()
                     if (
@@ -11453,9 +14795,13 @@ class V6ExecutionEngine:
                 "leverage": intent.leverage,
                 "order_mode": result.get("order_mode"),
                 "source": "v6_execution",
+                "strategy_id": str(intent.risk_plan.get("strategy_id") or "v6_execution"),
+                "strategy_version": str(intent.risk_plan.get("strategy_version") or "v6"),
                 "strategy_labels": strategy_labels,
                 "strategy_label": strategy_labels[0] if strategy_labels else "",
                 "risk_plan": intent.risk_plan,
+                "local_risk_accounting": dict(lot.get("local_risk_accounting") or {}),
+                "mixed_structure_probability_fallback": self.risk_plan_uses_mixed_probability_fallback(intent.risk_plan),
                 "horizon": (intent.risk_plan or {}).get("horizon"),
                 "entry_timeframe": (intent.risk_plan or {}).get("entry_timeframe"),
                 "max_hold_days": (intent.risk_plan or {}).get("max_hold_days"),
@@ -11485,6 +14831,7 @@ class V6ExecutionEngine:
                     position["emergency_close_status"] = emergency_close.get("status")
             self.update_position_layer_summary(position)
             positions.append(position)
+            self.complete_manager_reversal_observation_after_open(state, intent, result)
         state["positions"] = positions
         self.refresh_position_lot_index(state)
         journal = list(state.get("journal") or [])

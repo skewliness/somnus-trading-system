@@ -92,7 +92,7 @@ def v5_execution_lock(state_dir: Path, timeout_seconds: float = 240.0):
         if os.name == "posix":
             import fcntl
 
-            deadline = time.time() + max(1.0, float(timeout_seconds))
+            deadline = time.time() + max(0.0, float(timeout_seconds))
             while True:
                 try:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -101,7 +101,7 @@ def v5_execution_lock(state_dir: Path, timeout_seconds: float = 240.0):
                 except BlockingIOError:
                     if time.time() >= deadline:
                         raise TimeoutError(f"Timed out waiting for V5 execution lock: {lock_path}")
-                    time.sleep(0.25)
+                    time.sleep(min(0.25, max(0.01, deadline - time.time())))
         yield
     finally:
         if os.name == "posix" and locked:
@@ -742,6 +742,7 @@ def configure_v6_with_v5_keys(
     config.v5_profit_reentry_guard_enabled = env_bool("TS_V5_PROFIT_REENTRY_GUARD_ENABLED", True)
     config.v5_staged_entry_enabled = env_bool("TS_V5_STAGED_ENTRY_ENABLED", True)
     config.v5_initial_entry_notional_fraction = float(os.getenv("TS_V5_INITIAL_ENTRY_NOTIONAL_FRACTION", "0.30"))
+    config.v5_staged_entry_min_notional_usdt = float(os.getenv("TS_V5_STAGED_ENTRY_MIN_NOTIONAL_USDT", "5"))
     config.v5_scale_in_min_hold_minutes = float(os.getenv("TS_V5_SCALE_IN_MIN_HOLD_MINUTES", "0"))
     config.v5_scale_in_require_15m_ma20_retest = env_bool("TS_V5_SCALE_IN_REQUIRE_15M_MA20_RETEST", True)
     config.v5_scale_in_15m_ma20_retest_near_pct = float(os.getenv("TS_V5_SCALE_IN_15M_MA20_RETEST_NEAR_PCT", "0.6"))
@@ -753,6 +754,9 @@ def configure_v6_with_v5_keys(
     config.scale_in_min_adverse_move_pct = float(os.getenv("TS_V5_SCALE_IN_MIN_ADVERSE_MOVE_PCT", "1.0"))
     config.scale_in_max_total_notional_multiplier = float(os.getenv("TS_V5_SCALE_IN_MAX_TOTAL_NOTIONAL_MULTIPLIER", "1.0"))
     config.v5_overlay_rules_enabled = env_bool("TS_V5_OVERLAY_RULES_ENABLED", True)
+    v5_manager_reentry_lock_enabled = env_bool("TS_V5_MANAGER_REENTRY_LOCK_ENABLED", False)
+    config.manager_reentry_lock_enabled = v5_manager_reentry_lock_enabled
+    config.manager_reentry_lock_v5_overlay_enabled = v5_manager_reentry_lock_enabled
     config.v5_block_ma7_15m_single_entry = env_bool("TS_V5_BLOCK_MA7_15M_SINGLE_ENTRY", True)
     config.v5_block_mixed_avoid_low_quality_entry = env_bool("TS_V5_BLOCK_MIXED_AVOID_LOW_QUALITY_ENTRY", True)
     config.v5_entry_location_guard_enabled = env_bool("TS_V5_ENTRY_LOCATION_GUARD_ENABLED", True)

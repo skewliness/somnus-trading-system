@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.somnus.v6-entry-gate-labeler</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/ma7/binance-trading-skill-system/scripts/macos_run_somnus_service.sh</string>
+		<string>v6-entry-gate-labeler</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/ma7/binance-trading-skill-system</string>
+	<key>StandardOutPath</key>
+	<string>/Users/ma7/binance-trading-skill-system/data/trading_system/logs/launchd/v6-entry-gate-labeler.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ma7/binance-trading-skill-system/data/trading_system/logs/launchd/v6-entry-gate-labeler.err.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StartInterval</key>
+	<integer>900</integer>
+</dict>
+</plist>
