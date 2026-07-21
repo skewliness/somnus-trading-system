@@ -10,7 +10,7 @@ from trading_system.redaction import redact_sensitive_text
 from trading_system.order_state import project_order_result
 
 
-EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 2
 VALID_EVENT_TYPES = {"signal", "order", "fill", "position", "exit"}
 SENSITIVE_KEY_PARTS = ("api_key", "secret", "token", "cookie", "authorization", "password", "signature")
 
@@ -256,6 +256,8 @@ class ExitEvent:
 class EventEnvelope:
     schema_version: int
     event_id: str
+    trade_id: str
+    parent_event_id: str
     event_type: str
     occurred_at: str
     emitted_at: str
@@ -282,6 +284,8 @@ class EventEnvelope:
         model_version: str = "",
         config_hash: str = "",
         occurred_at: str = "",
+        trade_id: str = "",
+        parent_event_id: str = "",
     ) -> "EventEnvelope":
         if event_type not in VALID_EVENT_TYPES:
             raise ValueError(f"unsupported event type: {event_type}")
@@ -290,6 +294,8 @@ class EventEnvelope:
         identity = {
             "schema_version": EVENT_SCHEMA_VERSION,
             "event_type": event_type,
+            "trade_id": _compact_identifier(trade_id),
+            "parent_event_id": _compact_identifier(parent_event_id),
             "occurred_at": timestamp,
             "account_id": _compact_identifier(account_id),
             "runtime_mode": _compact_identifier(runtime_mode),
