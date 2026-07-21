@@ -6481,14 +6481,25 @@ class V6ExecutionEngine:
             self.cross_timeframe_macro_entry_block(signal, "open_long", context, state=state)
 
     def intents_for_signal(self, signal: V6Signal, state: dict[str, Any]) -> list[V6OrderIntent]:
-        primary_intent = self.intent_for_signal(signal, state)
+        return self._collect_primary_and_hedge_exits(self.intent_for_signal(signal, state), signal, state)
+
+    def intents_for_context(self, context: TradingContext, state: dict[str, Any]) -> list[V6OrderIntent]:
+        """Run the canonical V6 decision path for live, dry-run, and replay callers."""
+        return self._collect_primary_and_hedge_exits(self.intent_for_context(context, state), context.signal, state)
+
+    def _collect_primary_and_hedge_exits(
+        self,
+        primary_intent: V6OrderIntent | None,
+        signal: V6Signal,
+        state: dict[str, Any],
+    ) -> list[V6OrderIntent]:
         if primary_intent is None:
             return []
         if primary_intent.action not in {"close_long", "close_short"}:
             return [primary_intent]
 
-        # intent_for_signal remains the compatibility entrypoint and refreshes macro
-        # state once. Only inspect the opposite hedge side for an additional exit.
+        # The primary decision refreshes macro state once. Only inspect the
+        # opposite hedge side for an additional exit.
         exit_intents = [primary_intent]
         for position in self.find_positions(state, signal.symbol):
             position_side = str(position.get("side") or "").lower()
@@ -6502,13 +6513,17 @@ class V6ExecutionEngine:
 
     def intent_for_signal(self, signal: V6Signal, state: dict[str, Any]) -> V6OrderIntent | None:
         """Return one action for compatibility with external callers and tests."""
+        return self.intent_for_context(self.trading_context(signal), state)
+
+    def intent_for_context(self, context: TradingContext, state: dict[str, Any]) -> V6OrderIntent | None:
+        """Return one action from the shared context-based strategy boundary."""
+        signal = context.signal
         self.refresh_cross_timeframe_macro_observation(signal, state)
         positions = self.find_positions(state, signal.symbol)
         for position in positions:
             exit_intent = self.exit_intent_if_needed(signal, position, state=state)
             if exit_intent:
                 return exit_intent
-        context = self.trading_context(signal)
         return self._entry_intent_for_signal(context, state, positions)
 
     def _entry_intent_for_signal(
@@ -11581,8 +11596,8 @@ class V6ExecutionEngine:
 
     def exit_intent_if_needed(
         self,
-        signal: V6Signal,
-        position: dict[str, Any],
+        signal_or_context: V6Signal | TradingContext,
+        position: dict[str, Any] | None = None,
         *,
         state: dict[str, Any] | None = None,
     ) -> V6OrderIntent | None:
@@ -11592,9 +11607,16 @@ class V6ExecutionEngine:
             self.exit_manager = manager
         evaluate_context = getattr(manager, "evaluate_context", None)
         if callable(evaluate_context):
-            context = self.trading_context(signal, position)
+            context = self.trading_context(signal_or_context, position)
+            if context.position is None:
+                raise TypeError("exit context requires a position")
             return evaluate_context(self, context, state=state)
-        return manager.evaluate(self, signal, position, state=state)
+        if isinstance(signal_or_context, TradingContext):
+            context = self.trading_context(signal_or_context, position)
+            if context.position is None:
+                raise TypeError("exit context requires a position")
+            return manager.evaluate(self, context.signal, context.position, state=state)
+        return manager.evaluate(self, signal_or_context, position, state=state)
 
     @staticmethod
     def is_scale_in_intent(intent: V6OrderIntent) -> bool:

@@ -14,3 +14,8 @@ accept or construct `TradingContext`. Existing public methods continue to
 accept `V6Signal` and normalize it at the boundary, preserving compatibility
 for scripts and tests. No thresholds, indicator values, rule ordering, sizing,
 or order fields change in this phase.
+
+`V6ExecutionEngine.intents_for_context()` is the canonical decision entrypoint.
+The live and dry-run loops normalize their signal into a context and delegate to
+that method. `ReplayDecisionAdapter` also delegates to the same method, so a
+replay adapter cannot maintain a second copy of the entry/exit decision rules.
