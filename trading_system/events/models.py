@@ -7,6 +7,7 @@ import json
 from typing import Any, Mapping
 
 from trading_system.redaction import redact_sensitive_text
+from trading_system.order_state import project_order_result
 
 
 EVENT_SCHEMA_VERSION = 1
@@ -113,10 +114,13 @@ class FillEvent:
     executed_quantity: float | None
     average_price: float | None
     error: str
+    order_state: str
+    order_state_path: tuple[str, ...]
 
     @classmethod
     def from_summary(cls, row: Mapping[str, Any]) -> "FillEvent":
         intent = row.get("intent") if isinstance(row.get("intent"), Mapping) else {}
+        projection = project_order_result(row)
         return cls(
             symbol=_compact_identifier(row.get("symbol") or intent.get("symbol")),
             action=_compact_identifier(row.get("action") or intent.get("action")),
@@ -126,6 +130,8 @@ class FillEvent:
             executed_quantity=row.get("executed_quantity") or row.get("executed_qty") or row.get("quantity"),
             average_price=row.get("average_price") or row.get("avg_price") or row.get("price"),
             error=redact_sensitive_text(row.get("error") or "")[:1200],
+            order_state=projection.current_state,
+            order_state_path=tuple(item.to_state for item in projection.transitions),
         )
 
     def to_payload(self) -> dict[str, Any]:
