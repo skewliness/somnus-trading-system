@@ -66,6 +66,8 @@ ALLOWED_TRANSITIONS = {
         OrderState.CANCEL_PENDING,
         OrderState.CANCELLED,
         OrderState.EXPIRED,
+        OrderState.RECONCILED_FILLED,
+        OrderState.RECONCILED_NOT_FILLED,
     },
     OrderState.PARTIAL_FILLED: {
         OrderState.FILLED,
@@ -152,6 +154,25 @@ PENDING_RECOVERY_STATES = {
 }
 
 
+def _record_requires_reconciliation(record: Mapping[str, Any]) -> bool:
+    """Return whether a persisted order needs exchange-authoritative recovery.
+
+    Normal orders acknowledged as ``NEW`` can still fill after a process
+    restart, so they remain pending. A protective stop is intentionally a
+    long-lived acknowledged order and is reconciled by the dedicated stop
+    synchronizer instead.
+    """
+
+    try:
+        state = OrderState(str(record.get("current_state") or ""))
+    except ValueError:
+        return False
+    if state in PENDING_RECOVERY_STATES:
+        return True
+    action = str(record.get("action") or "").lower()
+    return state == OrderState.ACKED and not action.startswith("protective_stop_")
+
+
 class OrderStateStore:
     """Durable sidecar for order lifecycles.
 
@@ -198,7 +219,7 @@ class OrderStateStore:
         unresolved = {
             key: value
             for key, value in orders.items()
-            if str(value.get("current_state") or "") in {state.value for state in PENDING_RECOVERY_STATES}
+            if isinstance(value, Mapping) and _record_requires_reconciliation(value)
         }
         terminal = [
             (key, value)
@@ -311,7 +332,13 @@ class OrderStateStore:
                     current = OrderState.ACKED
                 if target == OrderState.CANCELLED and current != OrderState.CANCEL_PENDING:
                     self._transition_record(record, OrderState.CANCEL_PENDING, "exchange_cancel_pending", occurred_at=timestamp)
-            self._transition_record(record, target, f"exchange_status:{_exchange_status({'response': response_dict}) or target.value}", occurred_at=timestamp)
+            exchange_status = _exchange_status({"response": response_dict}) or target.value
+            self._transition_record(
+                record,
+                target,
+                f"exchange_status:{exchange_status}",
+                occurred_at=timestamp,
+            )
             record["response"] = self._copy(response_dict)
             exchange_id = response_dict.get("orderId") or response_dict.get("algoId")
             client_id = response_dict.get("clientOrderId")
@@ -375,8 +402,7 @@ class OrderStateStore:
             pending = [
                 self._copy(record)
                 for record in payload["orders"].values()
-                if isinstance(record, dict)
-                and str(record.get("current_state") or "") in {state.value for state in PENDING_RECOVERY_STATES}
+                if isinstance(record, dict) and _record_requires_reconciliation(record)
             ]
         pending.sort(key=lambda item: str(item.get("updated_at") or ""))
         return pending

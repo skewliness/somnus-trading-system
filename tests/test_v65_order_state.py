@@ -135,6 +135,53 @@ def test_partial_fill_survives_restart_and_can_finish(tmp_path) -> None:
     assert completed["terminal"] is True
 
 
+def test_acknowledged_normal_order_remains_pending_after_restart(tmp_path) -> None:
+    path = tmp_path / "orders.json"
+    store = OrderStateStore(path)
+    created = store.begin_order(symbol="BTCUSDT", action="open_long")
+    acknowledged = store.apply_exchange_response(
+        created["order_key"],
+        {"orderId": 92, "status": "NEW", "executedQty": "0", "origQty": "0.01"},
+    )
+
+    restarted = OrderStateStore(path)
+
+    assert acknowledged["current_state"] == "acked"
+    assert [item["order_key"] for item in restarted.pending_reconciliation()] == [created["order_key"]]
+
+
+def test_acknowledged_normal_order_can_be_resolved_after_restart(tmp_path) -> None:
+    path = tmp_path / "orders.json"
+    first = OrderStateStore(path)
+    created = first.begin_order(symbol="BTCUSDT", action="open_long")
+    first.apply_exchange_response(
+        created["order_key"],
+        {"orderId": 94, "status": "NEW", "executedQty": "0", "origQty": "0.01"},
+    )
+
+    restarted = OrderStateStore(path)
+    reconciled = restarted.reconcile(created["order_key"], filled=True, event="startup_exchange_query")
+
+    assert reconciled["current_state"] == "reconciled_filled"
+    assert reconciled["terminal"] is True
+    assert restarted.pending_reconciliation() == []
+
+
+def test_acknowledged_protective_stop_is_not_restart_reconciliation_work(tmp_path) -> None:
+    path = tmp_path / "orders.json"
+    store = OrderStateStore(path)
+    created = store.begin_order(symbol="BTCUSDT", action="protective_stop_long")
+    acknowledged = store.apply_exchange_response(
+        created["order_key"],
+        {"algoId": 93, "status": "NEW"},
+    )
+
+    restarted = OrderStateStore(path)
+
+    assert acknowledged["current_state"] == "acked"
+    assert restarted.pending_reconciliation() == []
+
+
 def test_timeout_survives_restart_until_exchange_reconciliation(tmp_path) -> None:
     path = tmp_path / "orders.json"
     store = OrderStateStore(path)
