@@ -11,6 +11,20 @@ from trading_system.redaction import redact_sensitive_text
 
 
 SENSITIVE_KEY_PARTS = ("api_key", "secret", "token", "cookie", "authorization", "password", "signature")
+EXCHANGE_SERVER_ERROR_TOKENS = (
+    "500 internal server error",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "signed request failed 500",
+    "signed request failed 502",
+    "signed request failed 503",
+    "signed request failed 504",
+    "bad gateway",
+    "gateway timeout",
+    "service unavailable",
+    "internal server error",
+)
 
 
 class ErrorCategory(str, Enum):
@@ -28,6 +42,17 @@ class ErrorSeverity(str, Enum):
     WARNING = "warning"
     ERROR = "error"
     CRITICAL = "critical"
+
+
+class ErrorRiskAction(str, Enum):
+    """Operational response already expected at a failed V6 boundary."""
+
+    OBSERVE = "observe"
+    SKIP_SYMBOL = "skip_symbol"
+    BLOCK_ORDER = "block_order"
+    RECONCILE_ORDER = "reconcile_order"
+    HALT_POSITION_MUTATION = "halt_position_mutation"
+    RETRY_RECOVERY = "retry_recovery"
 
 
 class TradingSystemError(RuntimeError):
@@ -124,7 +149,17 @@ def _derived_code(message: str) -> str:
         return "reduce_only_rejected"
     if "no exchange position found" in lowered:
         return "exchange_position_missing"
+    if any(token in lowered for token in EXCHANGE_SERVER_ERROR_TOKENS):
+        return "exchange_server_error"
     return "unclassified_exception"
+
+
+def _is_order_mutation(operation: str, action: str) -> bool:
+    operation_lower = str(operation or "").lower()
+    return bool(action) or any(
+        token in operation_lower
+        for token in ("post /fapi", "delete /fapi", "submit_order", "submit order", "open_order", "close_order", "cancel_order")
+    )
 
 
 def _infer_category(message: str, operation: str, action: str) -> ErrorCategory:
@@ -153,6 +188,7 @@ class ErrorRecord:
     severity: str
     transient: bool
     ambiguous_order_status: bool
+    risk_action: str
     exception_type: str
     message: str
     operation: str
@@ -177,11 +213,18 @@ def classify_exception(
     raw_message = str(exc)
     message = redact_sensitive_text(raw_message)[:2000]
     lowered = raw_message.lower()
-    ambiguous = "-1007" in lowered or "status unknown" in lowered or "timeout waiting for response" in lowered
+    exchange_server_error = any(token in lowered for token in EXCHANGE_SERVER_ERROR_TOKENS)
+    order_mutation = _is_order_mutation(operation, action)
+    ambiguous = (
+        "-1007" in lowered
+        or "status unknown" in lowered
+        or "timeout waiting for response" in lowered
+        or (exchange_server_error and order_mutation)
+    )
     transient = any(
         token in lowered
         for token in ("timeout", "timed out", "429", "418", "too many requests", "name resolution", "connection", "ssl")
-    )
+    ) or exchange_server_error
     category = _infer_category(raw_message, operation, action)
     code = _derived_code(raw_message)
     severity = ErrorSeverity.WARNING if transient else ErrorSeverity.ERROR
@@ -195,6 +238,15 @@ def classify_exception(
             derived = _derived_code(raw_message)
             code = derived if derived != "unclassified_exception" else code
             category = _infer_category(raw_message, operation, action)
+    if exchange_server_error and order_mutation:
+        code = "order_status_unknown"
+        category = ErrorCategory.ORDER
+    risk_action = _risk_action_for(
+        category=category,
+        code=code,
+        operation=operation,
+        ambiguous_order_status=ambiguous,
+    )
     return ErrorRecord(
         occurred_at=datetime.now(timezone.utc).isoformat(),
         category=category.value,
@@ -202,6 +254,7 @@ def classify_exception(
         severity=severity.value,
         transient=bool(transient),
         ambiguous_order_status=bool(ambiguous),
+        risk_action=risk_action.value,
         exception_type=type(exc).__name__,
         message=message,
         operation=str(operation or "")[:160],
@@ -210,6 +263,44 @@ def classify_exception(
         account_id=str(account_id or "")[:160],
         context=_safe_context(dict(context or {})),
     )
+
+
+def _risk_action_for(
+    *,
+    category: ErrorCategory,
+    code: str,
+    operation: str,
+    ambiguous_order_status: bool,
+) -> ErrorRiskAction:
+    operation_lower = str(operation or "").lower()
+    if ambiguous_order_status or code == "order_status_unknown":
+        return ErrorRiskAction.RECONCILE_ORDER
+    if category == ErrorCategory.MARKET_DATA:
+        return ErrorRiskAction.SKIP_SYMBOL
+    if category in {ErrorCategory.ORDER, ErrorCategory.RISK}:
+        return ErrorRiskAction.BLOCK_ORDER
+    if category == ErrorCategory.STATE:
+        return ErrorRiskAction.HALT_POSITION_MUTATION
+    if category == ErrorCategory.RECOVERY or "reconcile" in operation_lower:
+        return ErrorRiskAction.RETRY_RECOVERY
+    return ErrorRiskAction.OBSERVE
+
+
+def record_caught_exception(
+    logger: logging.Logger,
+    exc: BaseException,
+    *,
+    operation: str,
+    level: int = logging.DEBUG,
+    **fields: Any,
+) -> ErrorRecord:
+    """Classify and log a caught exception without changing control flow."""
+
+    try:
+        return log_classified_exception(logger, exc, operation=operation, level=level, **fields)
+    except Exception as logging_exc:  # pragma: no cover - logging must never mask the original failure
+        logger.error("failed to classify caught exception operation=%s error=%s", operation, logging_exc)
+        return classify_exception(exc, operation=operation, **fields)
 
 
 def log_classified_exception(
@@ -221,5 +312,6 @@ def log_classified_exception(
     **fields: Any,
 ) -> ErrorRecord:
     record = classify_exception(exc, operation=operation, **fields)
-    logger.log(level, "trade_error=%s", json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")))
+    if logger.isEnabledFor(level):
+        logger.log(level, "trade_error=%s", json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")))
     return record

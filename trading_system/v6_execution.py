@@ -35,7 +35,7 @@ from trading_system.close_resolver import (
     resolve_close_quantity as resolve_close_quantity_decision,
 )
 from trading_system.entry_gate_policy import EntryGateFinding, evaluate_entry_gate_findings, finding_from_block
-from trading_system.errors import V6ExecutionError, classify_exception, log_classified_exception
+from trading_system.errors import V6ExecutionError, classify_exception, log_classified_exception, record_caught_exception
 from trading_system.events import EventWriter
 from trading_system.exit import ExitManager
 from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
@@ -1369,14 +1369,16 @@ class V6BinanceClient:
             return {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='load_public_cache')
             return {}
         if not isinstance(payload, dict):
             return {}
         if max_age_seconds is not None and max_age_seconds > 0:
             try:
                 updated_at = float(payload.get("updated_at_epoch") or 0)
-            except Exception:
+            except Exception as caught_exc:
+                record_caught_exception(LOGGER, caught_exc, operation='load_public_cache')
                 updated_at = 0.0
             if updated_at <= 0 or time.time() - updated_at > max_age_seconds:
                 return {}
@@ -1612,7 +1614,8 @@ class V6BinanceClient:
             return {}
         try:
             payload = json.loads(path.read_text())
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='load_kline_cache')
             return {}
         if isinstance(payload, list):
             return {"klines": payload, "earliest_exhausted": False}
@@ -1624,7 +1627,8 @@ class V6BinanceClient:
     def kline_cache_age_seconds(payload: dict[str, Any]) -> float | None:
         try:
             updated_at = float(payload.get("updated_at_epoch") or 0)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='kline_cache_age_seconds')
             updated_at = 0.0
         if updated_at <= 0:
             return None
@@ -1691,6 +1695,7 @@ class V6BinanceClient:
             try:
                 rows = self.fetch_supplemental_4h_klines_with_cache(symbol, source, limit)
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='fetch_supplemental_4h_klines')
                 LOGGER.warning("V6 supplemental 4h kline fetch failed source=%s symbol=%s: %s", source, symbol, exc)
                 continue
             if len(rows) >= limit:
@@ -1724,7 +1729,8 @@ class V6BinanceClient:
             return {}
         try:
             payload = json.loads(path.read_text())
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='load_supplemental_kline_cache')
             return {}
         return payload if isinstance(payload, dict) else {}
 
@@ -1913,7 +1919,8 @@ class V6BinanceClient:
         mark = 0.0
         try:
             mark = float(self.public_get("/fapi/v1/premiumIndex", {"symbol": symbol}, order_endpoint=True).get("markPrice") or 0.0)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='order_endpoint_percent_price_context')
             mark = 0.0
 
         filter_type = str(price_filter.get("filterType") or "")
@@ -2259,7 +2266,8 @@ class V6BinanceClient:
             return False
         try:
             delta_qty = abs(float(reconcile.get("delta_qty_abs") or 0.0))
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='submitted_order_has_no_confirmed_position_delta')
             delta_qty = 0.0
         return delta_qty <= 0.0
 
@@ -2394,6 +2402,7 @@ class V6BinanceClient:
         try:
             max_leverage = self.max_initial_leverage(symbol)
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='set_leverage')
             LOGGER.warning("Failed to load leverage bracket for %s: %s", symbol, exc)
         if max_leverage > 0:
             resolved_leverage = min(requested_leverage, max_leverage)
@@ -2442,6 +2451,7 @@ class V6BinanceClient:
         try:
             before_position = self.actual_position_for_intent(intent)
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='submit_order')
             before_position_error = f"{type(exc).__name__}: {exc}"
         margin_type_result = None
         leverage_result = None
@@ -2488,6 +2498,7 @@ class V6BinanceClient:
             try:
                 result["protective_stop"] = self.submit_protective_stop(intent, quantity=quantity)
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='submit_order')
                 result["protective_stop"] = {
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
@@ -2500,6 +2511,7 @@ class V6BinanceClient:
                     )
                     result["status"] = "closed_after_protective_stop_failed"
                 except Exception as close_exc:
+                    record_caught_exception(LOGGER, close_exc, operation='submit_order')
                     result["emergency_close"] = {
                         "status": "failed",
                         "error": f"{type(close_exc).__name__}: {close_exc}",
@@ -2511,6 +2523,7 @@ class V6BinanceClient:
         try:
             after_position = self.actual_position_for_intent(intent)
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='submit_order')
             after_position_error = f"{type(exc).__name__}: {exc}"
         result["position_reconcile"] = self.position_reconcile_payload(
             intent,
@@ -2550,6 +2563,7 @@ class V6BinanceClient:
                     if parsed > 0:
                         enriched[key] = value
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='enrich_order_fill_payload')
             errors.append(f"order:{type(exc).__name__}: {exc}")
 
         if self.filled_price_from_response(enriched, 0.0) <= 0:
@@ -2579,6 +2593,7 @@ class V6BinanceClient:
                         enriched["avgPrice"] = self.format_decimal(cum_quote / executed_qty)
                         enriched["fillTradeCount"] = len(trades)
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='enrich_order_fill_payload')
                 errors.append(f"trades:{type(exc).__name__}: {exc}")
         if errors:
             enriched["fillDetailErrors"] = errors[-3:]
@@ -2621,6 +2636,7 @@ class V6BinanceClient:
             mark = float(self.mark_price(intent.symbol) or 0.0)
             stop_price = float(self.resolve_price(intent.symbol, intent.stop_loss_price))
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='protective_stop_precheck')
             return {
                 "checked": False,
                 "status": "failed",
@@ -2684,7 +2700,8 @@ class V6BinanceClient:
             return None
         try:
             mark = float(self.mark_price(intent.symbol) or 0.0)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='adjust_open_stop_after_fill')
             mark = 0.0
         original_stop = float(intent.stop_loss_price or 0.0)
         if original_stop <= 0:
@@ -2893,7 +2910,8 @@ class V6ExecutionEngine:
             return {}
         try:
             payload = reader()
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='exchange_request_health')
             LOGGER.exception("V6 request-health sidecar read failed")
             return {}
         return dict(payload) if isinstance(payload, dict) else {}
@@ -3189,6 +3207,7 @@ class V6ExecutionEngine:
                         try:
                             reconcile_result = self.reconcile_state_with_exchange(state)
                         except Exception as reconcile_exc:
+                            record_caught_exception(LOGGER, reconcile_exc, operation='_run_once_locked')
                             retry_result["reconcile"] = {
                                 "event": "exchange_position_reconcile_after_percent_price_close_rejected",
                                 "status": "failed",
@@ -3217,6 +3236,7 @@ class V6ExecutionEngine:
                     try:
                         reconcile_result = self.reconcile_state_with_exchange(state)
                     except Exception as reconcile_exc:
+                        record_caught_exception(LOGGER, reconcile_exc, operation='_run_once_locked')
                         failed["reconcile"] = {
                             "event": "exchange_position_reconcile_after_close_status_unknown",
                             "status": "failed",
@@ -3252,6 +3272,7 @@ class V6ExecutionEngine:
                     try:
                         reconcile_result = self.reconcile_state_with_exchange(state)
                     except Exception as reconcile_exc:
+                        record_caught_exception(LOGGER, reconcile_exc, operation='_run_once_locked')
                         failed["reconcile"] = {
                             "event": "exchange_position_reconcile_after_missing_close",
                             "status": "failed",
@@ -3278,6 +3299,7 @@ class V6ExecutionEngine:
                     try:
                         reconcile_result = self.reconcile_state_with_exchange(state)
                     except Exception as reconcile_exc:
+                        record_caught_exception(LOGGER, reconcile_exc, operation='_run_once_locked')
                         failed["reconcile"] = {
                             "event": "exchange_position_reconcile_after_zero_partial_close",
                             "status": "failed",
@@ -3317,6 +3339,7 @@ class V6ExecutionEngine:
                     try:
                         reconcile_result = self.reconcile_state_with_exchange(state)
                     except Exception as reconcile_exc:
+                        record_caught_exception(LOGGER, reconcile_exc, operation='_run_once_locked')
                         failed["reconcile"] = {
                             "event": "exchange_position_reconcile_after_reduce_only_rejected",
                             "status": "failed",
@@ -3335,6 +3358,7 @@ class V6ExecutionEngine:
                             try:
                                 close_retry = self.client.submit_order(intent)
                             except Exception as retry_exc:
+                                record_caught_exception(LOGGER, retry_exc, operation='_run_once_locked')
                                 close_retry_error = f"{type(retry_exc).__name__}: {retry_exc}"
                             else:
                                 close_retry["reduce_only_rejected_retry"] = {
@@ -3393,6 +3417,7 @@ class V6ExecutionEngine:
                     try:
                         reconcile_result = self.reconcile_state_with_exchange(state)
                     except Exception as reconcile_exc:
+                        record_caught_exception(LOGGER, reconcile_exc, operation='_run_once_locked')
                         failed["reconcile"] = {
                             "event": "exchange_position_reconcile_after_open_exception",
                             "status": "failed",
@@ -3606,6 +3631,7 @@ class V6ExecutionEngine:
                 "error": f"TimeoutExpired: {exc}",
             }
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='run_ledger_reconcile_after_action')
             return {
                 "event": "post_action_ledger_reconcile",
                 "status": "failed",
@@ -4917,6 +4943,7 @@ class V6ExecutionEngine:
                     "daily_ma7_trend": daily,
                 })
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='market_daily_ma7_reversal_state')
                 drivers.append({
                     "symbol": symbol,
                     "ready": False,
@@ -5691,6 +5718,7 @@ class V6ExecutionEngine:
                         if symbol:
                             rows[symbol] = dict(row)
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='v5_sentiment_metadata_cache')
             LOGGER.warning("V5 no-news momentum metadata load failed: %s", exc)
         self._v5_sentiment_metadata_cache = rows
         return rows
@@ -7518,6 +7546,7 @@ class V6ExecutionEngine:
                 events_file.replace(archive_file)
             append_text_line(self.config.entry_gate_events_file, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='record_entry_gate_event')
             LOGGER.warning("V6 entry gate event recording failed for %s %s: %s", signal.symbol, action, exc)
 
     def entry_gate_policy_v2_decision(
@@ -7900,7 +7929,8 @@ class V6ExecutionEngine:
     def can_open_opposite_symbol_position(self) -> bool:
         try:
             return self.client.current_position_mode() == "hedge"
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='can_open_opposite_symbol_position')
             return False
 
     def ma20_trend_entry_block(self, signal: V6Signal, action: str) -> dict[str, Any] | None:
@@ -8942,7 +8972,8 @@ class V6ExecutionEngine:
         reference_price = 0.0
         try:
             reference_price = float(self.client.order_endpoint_reference_price(intent.symbol) or 0.0)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='retry_percent_price_order_after_spike')
             reference_price = 0.0
         entry_price = float(intent.entry_price or 0.0)
         if is_close and entry_price <= 0 and reference_price > 0:
@@ -8982,6 +9013,7 @@ class V6ExecutionEngine:
             counterparty_context = self.client.order_endpoint_percent_price_context(intent.symbol, intent.action)
             retry_meta["counterparty_filter"] = counterparty_context
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='retry_percent_price_order_after_spike')
             retry_meta["counterparty_filter_error"] = f"{type(exc).__name__}: {exc}"
         if counterparty_context and counterparty_context.get("valid") is False:
             return {
@@ -9003,6 +9035,7 @@ class V6ExecutionEngine:
         try:
             result = self.client.submit_order(intent)
         except Exception as retry_exc:
+            record_caught_exception(LOGGER, retry_exc, operation='retry_percent_price_order_after_spike')
             retry_error = f"{type(retry_exc).__name__}: {retry_exc}"
             retry_meta["retry_error"] = retry_error
             if self.is_percent_price_filter_error(retry_error):
@@ -9271,7 +9304,8 @@ class V6ExecutionEngine:
             return None
         try:
             parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='parse_utc_datetime')
             return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
@@ -9370,7 +9404,8 @@ class V6ExecutionEngine:
             return None
         try:
             return datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='position_opened_at')
             return None
 
     @classmethod
@@ -9497,7 +9532,8 @@ class V6ExecutionEngine:
                 if retry_after:
                     try:
                         retry_blocked = datetime.fromisoformat(retry_after.replace("Z", "+00:00")) > datetime.now(timezone.utc)
-                    except Exception:
+                    except Exception as caught_exc:
+                        record_caught_exception(LOGGER, caught_exc, operation='profit_guard_take_profit')
                         retry_blocked = False
                 if retry_blocked:
                     return None
@@ -9550,7 +9586,8 @@ class V6ExecutionEngine:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='_v5_momentum_iso_is_fresh')
             return False
         age_seconds = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
         return 0.0 <= age_seconds <= max(0.1, float(max_age_hours)) * 3600.0
@@ -9563,7 +9600,8 @@ class V6ExecutionEngine:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='_v5_momentum_snapshot_id')
             return ""
         return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
@@ -9575,7 +9613,8 @@ class V6ExecutionEngine:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='_v5_momentum_iso_is_fresh_seconds')
             return False
         age_seconds = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
         return 0.0 <= age_seconds <= max(1.0, float(max_age_seconds))
@@ -9659,6 +9698,7 @@ class V6ExecutionEngine:
         try:
             payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='smart_signal_cache')
             LOGGER.warning("V6 smart-signal cache load failed for %s: %s", path, exc)
             self._smart_signal_cache = cache
             return cache
@@ -9899,6 +9939,7 @@ class V6ExecutionEngine:
             try:
                 payload = json.loads(Path(path).read_text(encoding="utf-8")) if Path(path).exists() else {}
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='v5_momentum_panel_cache')
                 LOGGER.warning("V5 momentum panel cache load failed for %s: %s", path, exc)
                 continue
             generated_at = payload.get("generated_at") if isinstance(payload, dict) else ""
@@ -10049,6 +10090,7 @@ class V6ExecutionEngine:
                     "age_minutes": round(age_minutes, 3),
                 })
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='v5_momentum_oi_context')
             guard.update({
                 "oi_status": "error",
                 "oi_error": f"{type(exc).__name__}: {exc}"[:300],
@@ -10467,7 +10509,8 @@ class V6ExecutionEngine:
                 if retry_after:
                     try:
                         retry_blocked = datetime.fromisoformat(retry_after.replace("Z", "+00:00")) > datetime.now(timezone.utc)
-                    except Exception:
+                    except Exception as caught_exc:
+                        record_caught_exception(LOGGER, caught_exc, operation='next_roi_take_profit')
                         retry_blocked = False
                 if retry_blocked:
                     continue
@@ -10584,7 +10627,8 @@ class V6ExecutionEngine:
             return False
         try:
             opened = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='position_max_hold_expired')
             return False
         return datetime.now(timezone.utc) >= opened + timedelta(days=max_days)
 
@@ -11482,7 +11526,8 @@ class V6ExecutionEngine:
                 anchor_text = str(position.get("last_scale_in_at") or position.get("opened_at") or "")
                 try:
                     anchor_at = datetime.fromisoformat(anchor_text.replace("Z", "+00:00"))
-                except Exception:
+                except Exception as caught_exc:
+                    record_caught_exception(LOGGER, caught_exc, operation='scale_in_intent_if_needed')
                     anchor_at = None
                 if anchor_at is not None:
                     age_minutes = (datetime.now(timezone.utc) - anchor_at).total_seconds() / 60.0
@@ -11925,7 +11970,8 @@ class V6ExecutionEngine:
             until = row.get("until")
             try:
                 active = bool(until) and datetime.fromisoformat(str(until).replace("Z", "+00:00")) > now
-            except Exception:
+            except Exception as caught_exc:
+                record_caught_exception(LOGGER, caught_exc, operation='entry_cooldown_active')
                 active = False
             if active:
                 return True
@@ -13020,6 +13066,7 @@ class V6ExecutionEngine:
         try:
             return self.client.cancel_order(symbol, order_id)
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='cancel_protective_stop_if_present')
             return {
                 "status": "failed",
                 "order_id": order_id,
@@ -13036,6 +13083,7 @@ class V6ExecutionEngine:
         try:
             open_orders = self.open_protective_stop_orders()
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='cancel_all_protective_stops_for_position')
             return {
                 "status": "failed",
                 "symbol": symbol,
@@ -13056,6 +13104,7 @@ class V6ExecutionEngine:
             try:
                 result = self.client.cancel_order(symbol, order_id)
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='cancel_all_protective_stops_for_position')
                 result = {
                     "status": "failed",
                     "order_id": order_id,
@@ -13098,6 +13147,7 @@ class V6ExecutionEngine:
             try:
                 open_orders = self.open_protective_stop_orders()
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='wait_for_protective_stop_cancel')
                 return {
                     "status": "failed",
                     "symbol": symbol,
@@ -13140,7 +13190,8 @@ class V6ExecutionEngine:
         try:
             opened_at = datetime.fromisoformat(str(position.get("opened_at") or "").replace("Z", "+00:00"))
             start_time = int((opened_at - timedelta(minutes=5)).timestamp() * 1000)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='recent_exchange_close_order_for_missing_position')
             start_time = int((datetime.now(timezone.utc) - timedelta(hours=12)).timestamp() * 1000)
         close_side = "SELL" if side == "long" else "BUY"
         try:
@@ -13150,7 +13201,8 @@ class V6ExecutionEngine:
                 or position.get("quantity")
                 or 0.0
             ))
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='recent_exchange_close_order_for_missing_position')
             expected_qty = 0.0
         try:
             orders = self.client.signed_request("GET", "/fapi/v1/allOrders", {
@@ -13160,6 +13212,7 @@ class V6ExecutionEngine:
                 **self.client.signed_params(),
             })
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='recent_exchange_close_order_for_missing_position')
             LOGGER.warning("V6 recent close order lookup failed for %s: %s", symbol, exc)
             return {}
         if not isinstance(orders, list):
@@ -13177,7 +13230,8 @@ class V6ExecutionEngine:
             try:
                 executed = abs(float(order.get("executedQty") or 0.0))
                 avg_price = float(order.get("avgPrice") or 0.0)
-            except Exception:
+            except Exception as caught_exc:
+                record_caught_exception(LOGGER, caught_exc, operation='recent_exchange_close_order_for_missing_position')
                 executed = 0.0
                 avg_price = 0.0
             if executed <= 0 or avg_price <= 0:
@@ -13192,7 +13246,8 @@ class V6ExecutionEngine:
             for order in candidates:
                 try:
                     executed = abs(float(order.get("executedQty") or 0.0))
-                except Exception:
+                except Exception as caught_exc:
+                    record_caught_exception(LOGGER, caught_exc, operation='recent_exchange_close_order_for_missing_position')
                     executed = 0.0
                 if abs(executed - expected_qty) <= qty_tolerance:
                     quantity_matched.append(order)
@@ -13201,7 +13256,8 @@ class V6ExecutionEngine:
         latest = max(matched_candidates, key=lambda item: int(item.get("updateTime") or item.get("time") or 0))
         try:
             close_time = datetime.fromtimestamp(int(latest.get("updateTime") or latest.get("time") or 0) / 1000, timezone.utc).isoformat()
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='recent_exchange_close_order_for_missing_position')
             close_time = utc_now_iso()
         return {
             "status": "found",
@@ -13235,7 +13291,8 @@ class V6ExecutionEngine:
             entry = float(position.get("entry_price") or 0.0)
             close_price = float(close_order.get("avg_price") or 0.0)
             leverage = float(position.get("leverage") or self.config.default_leverage or 1.0)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='record_v5_profit_reentry_guard_from_exchange_close')
             return
         roi_pct = self.position_roi_pct(side, entry, close_price, leverage)
         if roi_pct <= 0:
@@ -13695,6 +13752,7 @@ class V6ExecutionEngine:
                 "manual_exchange_actions": manual_exchange_actions,
             }
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='reconcile_state_with_exchange')
             LOGGER.warning("V6 exchange position reconcile failed: %s", exc)
             return {
                 "event": "exchange_position_reconcile",
@@ -13717,6 +13775,7 @@ class V6ExecutionEngine:
                 "actions": actions,
             }
         except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation='refresh_protective_stop_after_partial_take_profit')
             LOGGER.warning("V6 partial take-profit protective stop sync failed: %s", exc)
             return {
                 "event": "partial_take_profit_protective_stop_sync",
@@ -13889,6 +13948,7 @@ class V6ExecutionEngine:
             try:
                 submitted = self.client.submit_protective_stop(intent, quantity=expected_quantity)
             except Exception as exc:
+                record_caught_exception(LOGGER, exc, operation='sync_protective_stops_with_exchange')
                 error_text = f"{type(exc).__name__}: {exc}"
                 if "-2021" in error_text or "Order would immediately trigger" in error_text:
                     position["protective_stop_submit_status"] = "skipped_immediate_trigger"
@@ -13950,7 +14010,8 @@ class V6ExecutionEngine:
         trigger = str(order.get("triggerPrice") or order.get("stopPrice") or "")
         try:
             trigger_matches = Decimal(trigger) == Decimal(expected_trigger)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='protective_stop_matches')
             trigger_matches = trigger == expected_trigger
         if close_position:
             closes_remaining = str(order.get("closePosition") or "").lower() == "true" or order.get("closePosition") is True
@@ -13960,7 +14021,8 @@ class V6ExecutionEngine:
         reduce_only = str(order.get("reduceOnly") or "").lower() == "true" or order.get("reduceOnly") is True
         try:
             quantity_matches = Decimal(quantity) == Decimal(expected_quantity)
-        except Exception:
+        except Exception as caught_exc:
+            record_caught_exception(LOGGER, caught_exc, operation='protective_stop_matches')
             quantity_matches = quantity == expected_quantity
         return quantity_matches and trigger_matches and reduce_only
 

@@ -5,6 +5,7 @@ import logging
 
 from trading_system.errors import (
     ErrorCategory,
+    ErrorRiskAction,
     MarketDataError,
     OrderError,
     RiskError,
@@ -46,6 +47,40 @@ def test_status_unknown_is_order_error_and_requires_reconciliation() -> None:
     assert record.code == "order_status_unknown"
     assert record.transient is True
     assert record.ambiguous_order_status is True
+    assert record.risk_action == ErrorRiskAction.RECONCILE_ORDER.value
+
+
+def test_order_submit_gateway_error_requires_reconciliation_but_market_read_does_not() -> None:
+    submitted = classify_exception(
+        V6ExecutionError("Binance signed request failed 502: Bad Gateway"),
+        operation="POST /fapi/v1/order",
+        symbol="BTCUSDT",
+        action="open_long",
+    )
+    market_read = classify_exception(
+        V6ExecutionError("Binance public request failed 502: Bad Gateway"),
+        operation="GET /fapi/v1/klines",
+        symbol="BTCUSDT",
+    )
+
+    assert submitted.code == "order_status_unknown"
+    assert submitted.ambiguous_order_status is True
+    assert submitted.transient is True
+    assert submitted.risk_action == ErrorRiskAction.RECONCILE_ORDER.value
+    assert market_read.code == "exchange_server_error"
+    assert market_read.ambiguous_order_status is False
+    assert market_read.transient is True
+    assert market_read.risk_action != ErrorRiskAction.RECONCILE_ORDER.value
+
+
+def test_error_categories_map_to_existing_risk_boundaries() -> None:
+    market = classify_exception(MarketDataError("kline unavailable"), operation="build_signal")
+    risk = classify_exception(RiskError("risk budget breached"), operation="risk_check")
+    state = classify_exception(RuntimeError("ledger state mismatch"), operation="state_update")
+
+    assert market.risk_action == "skip_symbol"
+    assert risk.risk_action == "block_order"
+    assert state.risk_action == "halt_position_mutation"
 
 
 def test_structured_record_redacts_secrets_in_message_and_context() -> None:
