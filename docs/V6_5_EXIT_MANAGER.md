@@ -15,7 +15,11 @@ The move preserves, in order:
 7. fixed take profit and opposite-probability exits;
 8. quarantine, retry cooldown, close fractions, and risk-plan construction.
 
-The files under `exit/rules/` classify emitted exit intents for diagnostics.
-They do not decide whether an exit is allowed and cannot change exit priority.
-All candidate calculations, thresholds, state mutation, and intent fields are
+The files under `exit/rules/` convert the already selected legacy exit intent
+into immutable `ExitSignal` values with `triggered`, `reason`, and `priority`.
+`exit/resolver.py` deterministically resolves those adapters and returns the
+same intent object. In this migration phase the resolver is deliberately
+downstream of the unchanged legacy decision chain, so it cannot alter whether
+an exit is allowed, the existing exit priority, or any order field. All
+candidate calculations, thresholds, state mutation, and intent fields remain
 the existing V6 implementations.

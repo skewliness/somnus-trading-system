@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from trading_system.exit.models import ExitRuleFamily, ExitSignal
+
+
+PRIORITY = 100
+
 
 def matches(intent: Any) -> bool:
     risk_plan = getattr(intent, "risk_plan", {}) if intent is not None else {}
@@ -16,4 +21,14 @@ def matches(intent: Any) -> bool:
         or "max hold days reached" in reason
         or "opposite long probability" in reason
         or "opposite short probability" in reason
+    )
+
+
+def evaluate(intent: Any) -> ExitSignal:
+    return ExitSignal(
+        triggered=matches(intent),
+        reason=str(getattr(intent, "rationale", "") or ""),
+        priority=PRIORITY,
+        family=ExitRuleFamily.TREND_EXIT,
+        intent=intent,
     )

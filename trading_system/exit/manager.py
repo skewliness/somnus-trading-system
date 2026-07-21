@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from trading_system.exit.models import ExitRuleFamily
-from trading_system.exit.rules import classify_exit_intent
+from trading_system.exit.resolver import resolve_exit_signals
+from trading_system.exit.rules import build_exit_signals, classify_exit_intent
 
 
 LEGACY_EXIT_SOURCE_SHA256 = "95b4d8c73f3857d0c8559348a704ea64a6cc5d54f9143af9a54a44c3d84ee9a7"
@@ -306,7 +307,7 @@ class ExitManager:
             partial_risk_plan = {
                 "profit_guard_full_exit": profit_guard_full_exit,
             }
-        return self.intent_factory(
+        intent = self.intent_factory(
             action=action,
             symbol=signal.symbol,
             side=order_side,
@@ -325,3 +326,4 @@ class ExitManager:
             close_fraction=close_fraction,
             target_name=target_name,
         )
+        return resolve_exit_signals(build_exit_signals(intent)).intent
