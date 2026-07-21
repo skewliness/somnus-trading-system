@@ -26,8 +26,8 @@ class TradingContext:
         position: dict[str, Any] | None = None,
     ) -> "TradingContext":
         return cls(
-            symbol=str(signal.symbol),
-            price=float(signal.price),
+            symbol=str(getattr(signal, "symbol", "") or ""),
+            price=float(getattr(signal, "price", 0.0) or 0.0),
             position=position,
             market_regime=str(getattr(signal, "side_bias", "") or ""),
             indicators=getattr(signal, "indicators", {}),

@@ -5,8 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from trading_system.decision_replay import ReplayDecisionAdapter
 from trading_system.trading_context import TradingContext
-from trading_system.v6_execution import V6ExecutionEngine, V6Signal
+from trading_system.v6_execution import V6ExecutionEngine, V6OrderIntent, V6Signal
 
 
 def make_signal() -> V6Signal:
@@ -127,3 +128,87 @@ def test_legacy_signal_input_is_normalized_without_copying() -> None:
 
     assert same_context is context
     assert context.signal is signal
+
+
+def make_decision_engine() -> V6ExecutionEngine:
+    engine = V6ExecutionEngine.__new__(V6ExecutionEngine)
+    engine.config = SimpleNamespace()
+    engine.refresh_cross_timeframe_macro_observation = lambda signal, state: None
+    engine.find_positions = lambda state, symbol: []
+
+    def deterministic_entry(context, state, positions):
+        signal = context.signal
+        return V6OrderIntent(
+            action="open_long",
+            symbol=context.symbol,
+            side="BUY",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=False,
+            entry_price=context.price,
+            stop_loss_price=99.0,
+            take_profit_price=105.0,
+            long_probability=signal.long_probability,
+            short_probability=signal.short_probability,
+            wait_probability=signal.wait_probability,
+            rationale="shared-context-test",
+            generated_at=signal.computed_at,
+        )
+
+    engine._entry_intent_for_signal = deterministic_entry
+    return engine
+
+
+def test_live_dry_run_and_replay_use_identical_context_decision_path() -> None:
+    signal = make_signal()
+    state = {"positions": []}
+    engine = make_decision_engine()
+    context = engine.trading_context(signal)
+
+    live_style = [intent.to_dict() for intent in engine.intents_for_signal(signal, state)]
+    dry_run_style = [intent.to_dict() for intent in engine.intents_for_context(context, state)]
+    replay_style = [intent.to_dict() for intent in ReplayDecisionAdapter(engine).decide(context, state)]
+
+    assert live_style == dry_run_style == replay_style
+
+
+def test_legacy_single_intent_entrypoint_delegates_to_context_path() -> None:
+    signal = make_signal()
+    engine = V6ExecutionEngine.__new__(V6ExecutionEngine)
+    engine.config = SimpleNamespace()
+    captured = {}
+    sentinel = object()
+
+    def decide(context, state):
+        captured["context"] = context
+        captured["state"] = state
+        return sentinel
+
+    engine.intent_for_context = decide
+    state = {"positions": []}
+
+    assert engine.intent_for_signal(signal, state) is sentinel
+    assert isinstance(captured["context"], TradingContext)
+    assert captured["context"].signal is signal
+    assert captured["state"] is state
+
+
+def test_exit_boundary_accepts_prebuilt_context_without_rebuilding() -> None:
+    signal = make_signal()
+    position = {"symbol": "BTCUSDT", "side": "long"}
+    context = TradingContext.from_signal(signal, config=object(), position=position)
+    captured = {}
+    sentinel = object()
+
+    class Recorder:
+        @staticmethod
+        def evaluate_context(engine, received, *, state=None):
+            captured["context"] = received
+            return sentinel
+
+    engine = V6ExecutionEngine.__new__(V6ExecutionEngine)
+    engine.config = context.config
+    engine.exit_manager = Recorder()
+
+    assert engine.exit_intent_if_needed(context, state={}) is sentinel
+    assert captured["context"] is context
