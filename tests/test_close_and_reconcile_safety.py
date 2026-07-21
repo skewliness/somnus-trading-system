@@ -835,7 +835,7 @@ def test_v6_ledger_reconcile_reads_exchange_snapshot_after_execution_lock(tmp_pa
         payload = run_v6_ledger_reconcile(check_only=False, tolerance=0.0)
 
     assert payload["status"] == "ok"
-    assert events == ["lock_enter", "exchange_snapshot", "state_reconciled", "lock_exit", "exchange_snapshot"]
+    assert events == ["lock_enter", "exchange_snapshot", "state_reconciled", "exchange_snapshot", "lock_exit"]
 
 
 def test_v6_ledger_reconcile_waits_for_an_active_execution_cycle_by_default(tmp_path) -> None:
