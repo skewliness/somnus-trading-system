@@ -3104,6 +3104,17 @@ class V6ExecutionEngine:
             return {}
         return dict(payload) if isinstance(payload, dict) else {}
 
+    def pending_order_reconciliation(self) -> list[dict[str, Any]]:
+        reader = getattr(self.client, "pending_order_reconciliation", None)
+        if not callable(reader):
+            return []
+        try:
+            payload = reader()
+        except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation="pending_order_reconciliation")
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
     def trading_context(
         self,
         signal_or_context: V6Signal | TradingContext,
@@ -3673,7 +3684,7 @@ class V6ExecutionEngine:
             "symbols": self.config.symbols,
             "runtime_versions": self.runtime_versions(),
             "exchange_request_health": self.exchange_request_health(),
-            "pending_order_reconciliation": self.client.pending_order_reconciliation(),
+            "pending_order_reconciliation": self.pending_order_reconciliation(),
             "last_ledger_reconcile": dict(state.get("last_ledger_reconcile") or {}),
             "protective_stop_required": bool(self.config.submit_protective_stop),
             "entry_thresholds": {
