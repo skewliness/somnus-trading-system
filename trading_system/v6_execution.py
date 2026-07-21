@@ -35,6 +35,7 @@ from trading_system.close_resolver import (
     resolve_close_quantity as resolve_close_quantity_decision,
 )
 from trading_system.entry_gate_policy import EntryGateFinding, evaluate_entry_gate_findings, finding_from_block
+from trading_system.events import EventWriter
 from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
 from trading_system.gate_registry import default_entry_gate_registry
 from trading_system.h4_structure import compute_h4_structure
@@ -442,6 +443,10 @@ class V6ExecutionConfig:
     closed_trade_review_queue_file: Path = DEFAULT_STATE_DIR / "closed_trade_review_queue.jsonl"
     post_trade_training_samples_file: Path = DEFAULT_STATE_DIR / "post_trade_training_samples.jsonl"
     manual_exchange_action_audit_file: Path | None = None
+    trade_event_logging_enabled: bool = False
+    trade_events_file: Path | None = None
+    trade_events_max_bytes: int = 32 * 1024 * 1024
+    trade_event_strategy_version: str = "6.0-baseline"
     kline_cache_dir: Path = DEFAULT_EXECUTION_KLINE_CACHE_DIR
     kline_cache_enabled: bool = True
     public_cache_ttl_seconds: int = 90
@@ -661,6 +666,8 @@ class V6ExecutionConfig:
     def __post_init__(self) -> None:
         if self.manual_exchange_action_audit_file is None:
             self.manual_exchange_action_audit_file = self.state_dir / "manual_exchange_actions.jsonl"
+        if self.trade_events_file is None:
+            self.trade_events_file = self.state_dir / "trade_events.jsonl"
 
     @classmethod
     def from_env(cls) -> "V6ExecutionConfig":
@@ -701,6 +708,10 @@ class V6ExecutionConfig:
             manual_exchange_action_audit_file=Path(
                 os.getenv("TS_V6_MANUAL_EXCHANGE_ACTION_AUDIT_FILE", str(state_dir / "manual_exchange_actions.jsonl"))
             ),
+            trade_event_logging_enabled=_env_bool("TS_V6_TRADE_EVENT_LOGGING_ENABLED", False),
+            trade_events_file=Path(os.getenv("TS_V6_TRADE_EVENTS_FILE", str(state_dir / "trade_events.jsonl"))),
+            trade_events_max_bytes=_env_int("TS_V6_TRADE_EVENTS_MAX_BYTES", 32 * 1024 * 1024),
+            trade_event_strategy_version=os.getenv("TS_V6_TRADE_EVENT_STRATEGY_VERSION", "6.0-baseline").strip() or "6.0-baseline",
             kline_cache_dir=Path(
                 os.getenv(
                     "TS_V6_KLINE_CACHE_DIR",
@@ -985,10 +996,12 @@ class V6ExecutionConfig:
         self.post_trade_training_samples_file.parent.mkdir(parents=True, exist_ok=True)
         assert self.manual_exchange_action_audit_file is not None
         self.manual_exchange_action_audit_file.parent.mkdir(parents=True, exist_ok=True)
+        assert self.trade_events_file is not None
+        self.trade_events_file.parent.mkdir(parents=True, exist_ok=True)
         self.kline_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def mutable_runtime_paths(self) -> tuple[Path, ...]:
-        return (
+        paths = (
             self.state_file,
             self.signals_file,
             self.entry_gate_events_file,
@@ -999,6 +1012,9 @@ class V6ExecutionConfig:
             self.post_trade_training_samples_file,
             self.manual_exchange_action_audit_file or (self.state_dir / "manual_exchange_actions.jsonl"),
         )
+        if self.trade_event_logging_enabled:
+            return paths + (self.trade_events_file or (self.state_dir / "trade_events.jsonl"),)
+        return paths
 
     def validate_runtime_isolation(self) -> None:
         if self.exit_control_mode not in {"automatic", "stop_only_manual_profit"}:
@@ -2779,6 +2795,15 @@ class V6ExecutionEngine:
         self._smart_signal_cache: dict[str, dict[str, Any]] | None = None
         self.telegram_whale_bridge = TelegramWhaleBridgeReader(self.config.telegram_whale_bridge_file)
         self.entry_gate_registry = default_entry_gate_registry()
+        assert self.config.trade_events_file is not None
+        self.event_writer = EventWriter(
+            self.config.trade_events_file,
+            enabled=self.config.trade_event_logging_enabled,
+            account_id=self.config.instance_name,
+            runtime_mode=self.config.order_mode,
+            strategy_version=self.config.trade_event_strategy_version,
+            max_bytes=self.config.trade_events_max_bytes,
+        )
 
     def close(self) -> None:
         self.client.close()
@@ -3404,6 +3429,7 @@ class V6ExecutionEngine:
             ],
         }
         append_text_line(self.config.wal_file, json.dumps(compact_wal, ensure_ascii=False))
+        self.event_writer.safe_emit_run_summary(summary)
         return summary
 
     @staticmethod
