@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from trading_system.exit import ExitManager, ExitRuleFamily, ExitSignal, resolve_exit_signals
+from trading_system.exit.manager import LONG_EXIT_RULES, SHORT_EXIT_RULES
+from trading_system.exit.resolver import resolve_exit_rules
 from trading_system.exit.rules import build_exit_signals
 from trading_system.v6_execution import V6ExecutionConfig, V6ExecutionEngine, V6OrderIntent, V6Signal, utc_now_iso
 
@@ -125,3 +127,58 @@ def test_resolver_rejects_an_empty_or_untriggered_signal_set() -> None:
         assert str(exc) == "at least one triggered exit signal is required"
     else:
         raise AssertionError("resolver accepted an untriggered signal set")
+
+
+def test_rule_resolver_is_lazy_and_stops_after_first_trigger() -> None:
+    calls: list[str] = []
+
+    def miss(context):
+        calls.append("miss")
+        return ExitSignal(False, "", 1, ExitRuleFamily.OTHER)
+
+    def hit(context):
+        calls.append("hit")
+        return ExitSignal(True, "selected", 1, ExitRuleFamily.TREND_EXIT)
+
+    def must_not_run(context):
+        calls.append("late")
+        raise AssertionError("late rule was evaluated")
+
+    selected = resolve_exit_rules(object(), (miss, hit, must_not_run))  # type: ignore[arg-type]
+
+    assert selected is not None and selected.reason == "selected"
+    assert calls == ["miss", "hit"]
+
+
+def test_short_rule_order_matches_v6_baseline_precedence() -> None:
+    assert [rule.__name__ for rule in SHORT_EXIT_RULES] == [
+        "evaluate_max_hold",
+        "evaluate_hard_stop",
+        "evaluate_v5_soft_stop",
+        "evaluate_daily_reversal",
+        "evaluate_logic_weakening",
+        "evaluate_smart_signal",
+        "evaluate_v5_no_news",
+        "evaluate_roi_take_profit",
+        "evaluate_staged_take_profit",
+        "evaluate_fixed_take_profit",
+        "evaluate_opposite_probability",
+    ]
+
+
+def test_long_rule_order_matches_v6_baseline_precedence() -> None:
+    assert [rule.__name__ for rule in LONG_EXIT_RULES] == [
+        "evaluate_max_hold",
+        "evaluate_hard_stop",
+        "evaluate_v5_soft_stop",
+        "evaluate_daily_reversal",
+        "evaluate_v5_no_news",
+        "evaluate_fifteen_m_giveback",
+        "evaluate_h4_lower_reversal",
+        "evaluate_logic_weakening",
+        "evaluate_smart_signal",
+        "evaluate_roi_take_profit",
+        "evaluate_staged_take_profit",
+        "evaluate_fixed_take_profit",
+        "evaluate_opposite_probability",
+    ]

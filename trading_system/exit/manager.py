@@ -3,13 +3,61 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from trading_system.exit.models import ExitRuleFamily
-from trading_system.exit.resolver import resolve_exit_signals
+from trading_system.exit.models import ExitRuleContext, ExitRuleFamily
+from trading_system.exit.resolver import resolve_exit_rules, resolve_exit_signals
+from trading_system.exit.rules.bb_exit import (
+    evaluate_fixed_take_profit,
+    evaluate_roi_take_profit,
+    evaluate_staged_take_profit,
+)
+from trading_system.exit.rules.profit_guard import (
+    evaluate_fifteen_m_giveback,
+    evaluate_h4_lower_reversal,
+    evaluate_smart_signal,
+    evaluate_v5_no_news,
+)
 from trading_system.exit.rules import build_exit_signals, classify_exit_intent
+from trading_system.exit.rules.stop_loss import evaluate_hard_stop, evaluate_v5_soft_stop
+from trading_system.exit.rules.trend_exit import (
+    evaluate_daily_reversal,
+    evaluate_logic_weakening,
+    evaluate_max_hold,
+    evaluate_opposite_probability,
+)
 from trading_system.trading_context import TradingContext
 
 
 LEGACY_EXIT_SOURCE_SHA256 = "95b4d8c73f3857d0c8559348a704ea64a6cc5d54f9143af9a54a44c3d84ee9a7"
+
+SHORT_EXIT_RULES = (
+    evaluate_max_hold,
+    evaluate_hard_stop,
+    evaluate_v5_soft_stop,
+    evaluate_daily_reversal,
+    evaluate_logic_weakening,
+    evaluate_smart_signal,
+    evaluate_v5_no_news,
+    evaluate_roi_take_profit,
+    evaluate_staged_take_profit,
+    evaluate_fixed_take_profit,
+    evaluate_opposite_probability,
+)
+
+LONG_EXIT_RULES = (
+    evaluate_max_hold,
+    evaluate_hard_stop,
+    evaluate_v5_soft_stop,
+    evaluate_daily_reversal,
+    evaluate_v5_no_news,
+    evaluate_fifteen_m_giveback,
+    evaluate_h4_lower_reversal,
+    evaluate_logic_weakening,
+    evaluate_smart_signal,
+    evaluate_roi_take_profit,
+    evaluate_staged_take_profit,
+    evaluate_fixed_take_profit,
+    evaluate_opposite_probability,
+)
 
 
 class ExitManager:
@@ -54,18 +102,7 @@ class ExitManager:
         price = float(signal.price)
         stop_price = float(position.get("stop_loss_price") or 0.0)
         take_profit_price = float(position.get("take_profit_price") or 0.0)
-        should_exit = False
-        reason = ""
         risk_plan = position.get("risk_plan") if isinstance(position.get("risk_plan"), dict) else {}
-        staged_take_profit: tuple[dict[str, Any], float] | None = None
-        roi_take_profit: tuple[dict[str, Any], float] | None = None
-        profit_guard_take_profit: dict[str, Any] | None = None
-        profit_guard_full_exit: dict[str, Any] | None = None
-        daily_ma7_short_reversal_exit: dict[str, Any] | None = None
-        daily_ma20_long_reversal_exit: dict[str, Any] | None = None
-        logic_weakening_exit: dict[str, Any] | None = None
-        smart_signal_risk_exit: dict[str, Any] | None = None
-        v5_soft_stop_exit: dict[str, Any] | None = None
         hold_expired = engine.position_max_hold_expired(position)
         profit_tracker = engine.update_position_profit_tracker(signal, position) if side in {"long", "short"} else {}
         if engine.config.stop_only_manual_profit():
@@ -89,163 +126,42 @@ class ExitManager:
             }
             if side not in {"long", "short"} or not stop_touched:
                 return None
-            # The existing side branch now resolves only the hard stop. Prevent
-            # max-hold from replacing the stop reason in the emitted intent.
             hold_expired = False
+        rule_context = ExitRuleContext(
+            engine=engine,
+            trading_context=context,
+            state=state,
+            side=side,
+            price=price,
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+            risk_plan=risk_plan,
+            profit_tracker=dict(profit_tracker or {}),
+            hold_expired=hold_expired,
+        )
+        selected = resolve_exit_rules(
+            rule_context,
+            SHORT_EXIT_RULES if side == "short" else LONG_EXIT_RULES,
+        )
+        if selected is None:
+            return None
+        reason = selected.reason
+        payload = selected.payload
+        staged_take_profit = payload.get("staged_take_profit")
+        roi_take_profit = payload.get("roi_take_profit")
+        profit_guard_take_profit = payload.get("profit_guard_take_profit")
+        profit_guard_full_exit = payload.get("profit_guard_full_exit")
+        daily_ma7_short_reversal_exit = payload.get("daily_ma7_short_reversal_exit")
+        daily_ma20_long_reversal_exit = payload.get("daily_ma20_long_reversal_exit")
+        logic_weakening_exit = payload.get("logic_weakening_exit")
+        smart_signal_risk_exit = payload.get("smart_signal_risk_exit")
+        v5_soft_stop_exit = payload.get("v5_soft_stop_exit")
         if side == "short":
-            if hold_expired:
-                should_exit = True
-                reason = "max hold days reached"
-            elif stop_price > 0 and price >= stop_price:
-                should_exit = True
-                reason = "short stop loss touched"
-            elif (v5_soft_stop_exit := engine.v5_overlay_soft_stop_candidate(signal, position, risk_plan)) is not None:
-                should_exit = True
-                reason = str(v5_soft_stop_exit.get("reason") or "short V5 soft stop confirmed")
-            elif (
-                daily_ma7_short_reversal_exit := engine.daily_ma7_short_reversal_exit_candidate(
-                    signal,
-                    position,
-                    state=state,
-                )
-            ) is not None:
-                should_exit = True
-                reason = str(daily_ma7_short_reversal_exit.get("reason") or "short daily MA7 reversal")
-            elif (logic_weakening_exit := engine.logic_weakening_exit_candidate(signal, position)) is not None:
-                should_exit = True
-                reason = str(logic_weakening_exit.get("reason") or "short original 4H logic weakened")
-            elif (smart_signal_risk_exit := engine.smart_signal_risk_guard_candidate(signal, position, profit_tracker)) is not None:
-                if smart_signal_risk_exit.get("kind") == "partial_take_profit":
-                    profit_guard_take_profit = smart_signal_risk_exit
-                    smart_signal_risk_exit = None
-                should_exit = True
-                reason = str((profit_guard_take_profit or smart_signal_risk_exit or {}).get("reason") or "short smart-signal risk guard")
-            elif (profit_guard_full_exit := engine.v5_no_news_momentum_take_profit_candidate(signal, position, profit_tracker)) is not None:
-                if profit_guard_full_exit.get("kind") == "partial_take_profit":
-                    profit_guard_take_profit = profit_guard_full_exit
-                    profit_guard_full_exit = None
-                should_exit = True
-                reason = str((profit_guard_take_profit or profit_guard_full_exit or {}).get("reason") or "V5 no-news momentum short take profit")
-            elif (roi_take_profit := engine.next_roi_take_profit(signal, position)) is not None:
-                stages, close_fraction = roi_take_profit
-                names = ",".join(str(stage.get("name") or "") for stage in stages)
-                total_initial = sum(float(stage.get("fraction_of_initial") or 0.0) for stage in stages)
-                max_roi = max(float(stage.get("trigger_roi_pct") or 0.0) for stage in stages)
-                should_exit = True
-                reason = (
-                    f"ROI short take profit threshold touched: {names} "
-                    f"roi={max_roi:.2f}% "
-                    f"close_initial={total_initial:.2f} "
-                    f"close_remaining={close_fraction:.4f}"
-                )
-            elif (staged_take_profit := engine.next_staged_take_profit(signal, position)) is not None:
-                stages, close_fraction = staged_take_profit
-                names = ",".join(str(stage.get("name") or "") for stage in stages)
-                total_initial = sum(
-                    float(stage.get("effective_fraction_of_initial") or stage.get("fraction_of_initial") or 0.0)
-                    for stage in stages
-                )
-                should_exit = True
-                reason = (
-                    f"staged short take profit touched with current/delayed 15M volume confirmation: {names} "
-                    f"close_initial={total_initial:.2f} "
-                    f"close_remaining={close_fraction:.4f}"
-                )
-            elif not engine.ensure_position_take_profit_stages(position, signal) and take_profit_price > 0 and price <= take_profit_price:
-                should_exit = True
-                reason = "short take profit touched"
-            elif (
-                not engine.config.technical_entry_only_for(signal.symbol)
-                and signal.long_probability >= engine.opposite_exit_threshold_for_position(position)
-            ):
-                should_exit = True
-                reason = "opposite long probability threshold"
             action = "close_short"
             order_side = "BUY"
         else:
-            if hold_expired:
-                should_exit = True
-                reason = "max hold days reached"
-            elif stop_price > 0 and price <= stop_price:
-                should_exit = True
-                reason = "long stop loss touched"
-            elif (v5_soft_stop_exit := engine.v5_overlay_soft_stop_candidate(signal, position, risk_plan)) is not None:
-                should_exit = True
-                reason = str(v5_soft_stop_exit.get("reason") or "long V5 soft stop confirmed")
-            elif (
-                daily_ma20_long_reversal_exit := engine.daily_ma20_long_reversal_exit_candidate(
-                    signal,
-                    position,
-                    state=state,
-                )
-            ) is not None:
-                should_exit = True
-                reason = str(daily_ma20_long_reversal_exit.get("reason") or "long daily MA20 reversal")
-            elif (profit_guard_full_exit := engine.v5_no_news_momentum_take_profit_candidate(signal, position, profit_tracker)) is not None:
-                if profit_guard_full_exit.get("kind") == "partial_take_profit":
-                    profit_guard_take_profit = profit_guard_full_exit
-                    profit_guard_full_exit = None
-                should_exit = True
-                reason = str((profit_guard_take_profit or profit_guard_full_exit or {}).get("reason") or "V5 no-news momentum long take profit")
-            elif (profit_guard_full_exit := engine.fifteen_m_h4_profit_giveback_candidate(signal, position, profit_tracker)) is not None:
-                if profit_guard_full_exit.get("kind") == "partial_take_profit":
-                    profit_guard_take_profit = profit_guard_full_exit
-                    profit_guard_full_exit = None
-                should_exit = True
-                reason = str((profit_guard_take_profit or profit_guard_full_exit or {}).get("reason") or "long profit guard")
-            elif (profit_guard_full_exit := engine.h4_lower_reversal_guard_candidate(signal, position, profit_tracker)) is not None:
-                if profit_guard_full_exit.get("kind") == "partial_take_profit":
-                    profit_guard_take_profit = profit_guard_full_exit
-                    profit_guard_full_exit = None
-                should_exit = True
-                reason = str((profit_guard_take_profit or profit_guard_full_exit or {}).get("reason") or "long h4 lower reversal guard")
-            elif (logic_weakening_exit := engine.logic_weakening_exit_candidate(signal, position)) is not None:
-                should_exit = True
-                reason = str(logic_weakening_exit.get("reason") or "long original 4H logic weakened")
-            elif (smart_signal_risk_exit := engine.smart_signal_risk_guard_candidate(signal, position, profit_tracker)) is not None:
-                if smart_signal_risk_exit.get("kind") == "partial_take_profit":
-                    profit_guard_take_profit = smart_signal_risk_exit
-                    smart_signal_risk_exit = None
-                should_exit = True
-                reason = str((profit_guard_take_profit or smart_signal_risk_exit or {}).get("reason") or "long smart-signal risk guard")
-            elif (roi_take_profit := engine.next_roi_take_profit(signal, position)) is not None:
-                stages, close_fraction = roi_take_profit
-                names = ",".join(str(stage.get("name") or "") for stage in stages)
-                total_initial = sum(float(stage.get("fraction_of_initial") or 0.0) for stage in stages)
-                max_roi = max(float(stage.get("trigger_roi_pct") or 0.0) for stage in stages)
-                should_exit = True
-                reason = (
-                    f"ROI long take profit threshold touched: {names} "
-                    f"roi={max_roi:.2f}% "
-                    f"close_initial={total_initial:.2f} "
-                    f"close_remaining={close_fraction:.4f}"
-                )
-            elif (staged_take_profit := engine.next_staged_take_profit(signal, position)) is not None:
-                stages, close_fraction = staged_take_profit
-                names = ",".join(str(stage.get("name") or "") for stage in stages)
-                total_initial = sum(
-                    float(stage.get("effective_fraction_of_initial") or stage.get("fraction_of_initial") or 0.0)
-                    for stage in stages
-                )
-                should_exit = True
-                reason = (
-                    f"staged long take profit touched with current/delayed 15M volume confirmation: {names} "
-                    f"close_initial={total_initial:.2f} "
-                    f"close_remaining={close_fraction:.4f}"
-                )
-            elif not engine.ensure_position_take_profit_stages(position, signal) and take_profit_price > 0 and price >= take_profit_price:
-                should_exit = True
-                reason = "long take profit touched"
-            elif (
-                not engine.config.technical_entry_only_for(signal.symbol)
-                and signal.short_probability >= engine.opposite_exit_threshold_for_position(position)
-            ):
-                should_exit = True
-                reason = "opposite short probability threshold"
             action = "close_long"
             order_side = "SELL"
-        if not should_exit:
-            return None
         manual_quarantine = position.get("manual_quarantine") if isinstance(position.get("manual_quarantine"), dict) else None
         quarantine_until = engine.parse_utc_datetime((manual_quarantine or {}).get("until"))
         if (manual_quarantine or {}).get("enabled") and quarantine_until and quarantine_until > datetime.now(timezone.utc):
