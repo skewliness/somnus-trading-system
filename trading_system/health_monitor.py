@@ -8,6 +8,19 @@ from typing import Any, Mapping, Sequence
 
 
 SEVERITY_RANK = {"ok": 0, "warning": 1, "critical": 2}
+SAFE_MODE_TRIGGER_CODES = frozenset(
+    {
+        "protective_stop_missing",
+        "position_reconcile_failed",
+        "position_reconcile_behind",
+        "position_reconcile_pending",
+        "market_data_unavailable",
+        "market_data_partial_stale",
+        "exchange_requests_failed",
+        "exchange_connection_unavailable",
+        "exchange_latency_critical",
+    }
+)
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -102,11 +115,13 @@ class RuntimeHealthReport:
     findings: tuple[HealthFinding, ...]
 
     def to_dict(self) -> dict[str, Any]:
+        safe_mode = safe_mode_from_report(self)
         return {
             "generated_at": self.generated_at,
             "overall_status": self.overall_status,
             "findings": [item.to_dict() for item in self.findings],
             "critical_digest": self.critical_digest(),
+            "safe_mode": safe_mode.to_dict(),
         }
 
     def critical_findings(self) -> tuple[HealthFinding, ...]:
@@ -134,6 +149,30 @@ class RuntimeHealthReport:
         ]
         encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()[:16] if payload else ""
+
+
+@dataclass(frozen=True, slots=True)
+class SafeModeDecision:
+    active: bool
+    block_new_entries: bool
+    allow_risk_actions: bool
+    trigger_codes: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def safe_mode_from_report(report: RuntimeHealthReport) -> SafeModeDecision:
+    triggers = tuple(item for item in report.findings if item.code in SAFE_MODE_TRIGGER_CODES)
+    active = bool(triggers)
+    return SafeModeDecision(
+        active=active,
+        block_new_entries=active,
+        allow_risk_actions=True,
+        trigger_codes=tuple(item.code for item in triggers),
+        reasons=tuple(item.summary for item in triggers),
+    )
 
 
 def _finding(code: str, severity: str, summary: str, **details: Any) -> HealthFinding:
@@ -210,7 +249,12 @@ def evaluate_runtime_health(
         "average_latency_ms": average_latency,
         "last_latency_ms": last_latency,
     }
-    if request_count > 0 and failure_count >= request_count:
+    connection_unavailable = bool(request_health.get("connection_unavailable"))
+    if connection_unavailable:
+        findings.append(
+            _finding("exchange_connection_unavailable", "critical", "exchange connection is unavailable", **request_details)
+        )
+    elif request_count > 0 and failure_count >= request_count:
         findings.append(_finding("exchange_requests_failed", "critical", "all recorded exchange requests failed", **request_details))
     elif observed_latency >= limits.request_latency_critical_ms:
         findings.append(_finding("exchange_latency_critical", "critical", "exchange request latency is critical", **request_details))
@@ -233,7 +277,18 @@ def evaluate_runtime_health(
         "latest_position_change_at": latest_change_text,
         "age_seconds": age_seconds(reconcile_at, now=checked_at),
     }
-    if reconcile_status in {"failed", "mismatch", "exchange_unavailable"}:
+    pending_reconcile = sorted(_position_identity(position) for position in positions if bool(position.get("reconcile_pending")))
+    if pending_reconcile:
+        findings.append(
+            _finding(
+                "position_reconcile_pending",
+                "critical",
+                "position reconciliation is pending after an uncertain exchange result",
+                positions=pending_reconcile,
+                **reconcile_details,
+            )
+        )
+    elif reconcile_status in {"failed", "mismatch", "exchange_unavailable"}:
         findings.append(_finding("position_reconcile_failed", "critical", "position reconciliation is not healthy", **reconcile_details))
     elif positions and reconcile_time is None:
         findings.append(

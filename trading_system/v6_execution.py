@@ -41,6 +41,7 @@ from trading_system.exit import ExitManager
 from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
 from trading_system.gate_registry import default_entry_gate_registry
 from trading_system.h4_structure import compute_h4_structure
+from trading_system.health_monitor import evaluate_runtime_health, safe_mode_from_report
 from trading_system.order_state import OrderState, OrderStateStore
 from trading_system.persistence import append_text_line, atomic_write_json, load_json, timed_file_lock
 from trading_system.redaction import redact_sensitive_text
@@ -1226,6 +1227,8 @@ class V6BinanceClient:
             "max_latency_ms": 0.0,
             "last_status_code": None,
             "last_request_at": "",
+            "consecutive_connection_failures": 0,
+            "connection_unavailable": False,
         }
         assert self.config.order_state_file is not None
         self.order_state_store = OrderStateStore(self.config.order_state_file)
@@ -1405,6 +1408,12 @@ class V6BinanceClient:
         health = self._request_health
         request_count = int(health.get("request_count") or 0) + 1
         total_latency = float(health.get("total_latency_ms") or 0.0) + elapsed_ms
+        connection_failed = bool(failed and status_code is None)
+        consecutive_connection_failures = (
+            int(health.get("consecutive_connection_failures") or 0) + 1
+            if connection_failed
+            else 0
+        )
         health.update(
             {
                 "request_count": request_count,
@@ -1415,6 +1424,8 @@ class V6BinanceClient:
                 "max_latency_ms": round(max(float(health.get("max_latency_ms") or 0.0), elapsed_ms), 3),
                 "last_status_code": status_code,
                 "last_request_at": utc_now_iso(),
+                "consecutive_connection_failures": consecutive_connection_failures,
+                "connection_unavailable": consecutive_connection_failures >= 2,
             }
         )
 
@@ -3093,7 +3104,7 @@ class V6ExecutionEngine:
         return version_info.to_dict()
 
     def exchange_request_health(self) -> dict[str, Any]:
-        reader = getattr(self.client, "request_health", None)
+        reader = getattr(getattr(self, "client", None), "request_health", None)
         if not callable(reader):
             return {}
         try:
@@ -3103,6 +3114,39 @@ class V6ExecutionEngine:
             LOGGER.exception("V6 request-health sidecar read failed")
             return {}
         return dict(payload) if isinstance(payload, dict) else {}
+
+    def safe_mode_decisions(self) -> dict[str, dict[str, Any]]:
+        decisions = getattr(self, "_safe_mode_decisions", None)
+        if not isinstance(decisions, dict):
+            return {}
+        return {str(symbol): dict(payload) for symbol, payload in decisions.items() if isinstance(payload, dict)}
+
+    def safe_mode_for_entry(self, signal: V6Signal, state: dict[str, Any]):
+        signal_payload = signal.to_dict() if hasattr(signal, "to_dict") else {}
+        report = evaluate_runtime_health(
+            {
+                "service_running": True,
+                "summary_age_seconds": 0,
+                "order_mode": str(getattr(self.config, "order_mode", "dry_run") or "dry_run"),
+                "submit": bool(getattr(self, "_submit_requested", False)),
+                "signals": [signal_payload],
+                "positions": list(state.get("positions") or []),
+                "exchange_request_health": self.exchange_request_health(),
+                "last_ledger_reconcile": state.get("last_ledger_reconcile") or {},
+                "protective_stop_required": bool(getattr(self.config, "submit_protective_stop", True)),
+            }
+        )
+        decision = safe_mode_from_report(report)
+        decisions = getattr(self, "_safe_mode_decisions", None)
+        if not isinstance(decisions, dict):
+            decisions = {}
+            self._safe_mode_decisions = decisions
+        decisions[str(signal.symbol or "UNKNOWN").upper()] = {
+            **decision.to_dict(),
+            "health_status": report.overall_status,
+            "evaluated_at": report.generated_at,
+        }
+        return decision
 
     def pending_order_reconciliation(self) -> list[dict[str, Any]]:
         reader = getattr(self.client, "pending_order_reconciliation", None)
@@ -3143,6 +3187,8 @@ class V6ExecutionEngine:
     def _run_once_locked(self, *, submit: bool = False, commit_dry_run_state: bool | None = None) -> dict[str, Any]:
         self._market_daily_ma7_reversal_cache = None
         self._smart_signal_cache = None
+        self._submit_requested = bool(submit)
+        self._safe_mode_decisions = {}
         if submit:
             self.client.require_live_trading_confirmation("run_once submit")
         state = self.load_state()
@@ -3687,6 +3733,7 @@ class V6ExecutionEngine:
             "pending_order_reconciliation": self.pending_order_reconciliation(),
             "last_ledger_reconcile": dict(state.get("last_ledger_reconcile") or {}),
             "protective_stop_required": bool(self.config.submit_protective_stop),
+            "safe_mode": self.safe_mode_decisions(),
             "entry_thresholds": {
                 symbol: {
                     "long": self.config.long_entry_threshold_for(symbol),
@@ -6524,6 +6571,8 @@ class V6ExecutionEngine:
             exit_intent = self.exit_intent_if_needed(signal, position, state=state)
             if exit_intent:
                 return exit_intent
+        if self.safe_mode_for_entry(signal, state).block_new_entries:
+            return None
         return self._entry_intent_for_signal(context, state, positions)
 
     def _entry_intent_for_signal(

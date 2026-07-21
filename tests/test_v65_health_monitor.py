@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
 import requests
 
-from trading_system.health_monitor import HealthThresholds, evaluate_runtime_health
-from trading_system.v6_execution import V6BinanceClient, V6ExecutionConfig, V6ExecutionEngine
+from trading_system.health_monitor import HealthThresholds, evaluate_runtime_health, safe_mode_from_report
+from trading_system.trading_context import TradingContext
+from trading_system.v6_execution import V6BinanceClient, V6ExecutionConfig, V6ExecutionEngine, V6OrderIntent, V6Signal
 from scripts.telegram_monitor_v5_v6 import build_alerts
 
 
@@ -129,6 +131,115 @@ def test_missing_protective_stop_is_critical_only_for_submitted_exchange_mode() 
     assert "protective_stop_missing" not in findings_by_code(dry_report)
 
 
+def test_safe_mode_activates_for_each_required_runtime_hazard() -> None:
+    snapshots = []
+
+    missing_stop = healthy_snapshot()
+    missing_stop["positions"][0].pop("protective_stop_order_id")
+    snapshots.append(missing_stop)
+
+    reconcile_mismatch = healthy_snapshot()
+    reconcile_mismatch["last_ledger_reconcile"]["status"] = "mismatch"
+    snapshots.append(reconcile_mismatch)
+
+    stale_data = healthy_snapshot()
+    stale_data["signals"][0]["market_data_freshness"]["stale"] = True
+    snapshots.append(stale_data)
+
+    exchange_error = healthy_snapshot()
+    exchange_error["exchange_request_health"] = {"request_count": 2, "failure_count": 2}
+    snapshots.append(exchange_error)
+
+    for snapshot in snapshots:
+        decision = safe_mode_from_report(evaluate_runtime_health(snapshot, now=NOW))
+        assert decision.active is True
+        assert decision.block_new_entries is True
+        assert decision.allow_risk_actions is True
+        assert decision.trigger_codes
+
+
+def test_safe_mode_does_not_activate_for_warning_only_health() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["summary_age_seconds"] = 240
+
+    decision = safe_mode_from_report(evaluate_runtime_health(snapshot, now=NOW))
+
+    assert decision.active is False
+    assert decision.block_new_entries is False
+    assert decision.allow_risk_actions is True
+
+
+def make_safe_mode_signal(*, stale: bool) -> V6Signal:
+    return V6Signal(
+        symbol="BTCUSDT",
+        computed_at=NOW.isoformat(),
+        price=100.0,
+        side_bias="long",
+        long_probability=0.8,
+        short_probability=0.1,
+        wait_probability=0.1,
+        model_quality_score=0.8,
+        reasons=[],
+        h4={},
+        fifteen_m={},
+        one_m={},
+        mid_retest={},
+        levels={},
+        market_data_freshness={"stale": stale},
+    )
+
+
+def make_safe_mode_engine() -> V6ExecutionEngine:
+    engine = V6ExecutionEngine.__new__(V6ExecutionEngine)
+    engine.config = SimpleNamespace(order_mode="testnet_order", submit_protective_stop=True)
+    engine.client = SimpleNamespace(request_health=lambda: {})
+    engine._submit_requested = True
+    engine.refresh_cross_timeframe_macro_observation = lambda signal, state: None
+    engine.find_positions = lambda state, symbol: list(state.get("positions") or [])
+    engine._entry_intent_for_signal = lambda context, state, positions: V6OrderIntent(
+        action="open_long",
+        symbol=context.symbol,
+        side="BUY",
+        quantity_hint_usdt=100.0,
+        leverage=8,
+        reduce_only=False,
+        entry_price=context.price,
+        stop_loss_price=95.0,
+        take_profit_price=110.0,
+        long_probability=0.8,
+        short_probability=0.1,
+        wait_probability=0.1,
+        rationale="safe-mode-test",
+        generated_at=NOW.isoformat(),
+    )
+    return engine
+
+
+def test_engine_safe_mode_blocks_new_exposure() -> None:
+    engine = make_safe_mode_engine()
+    signal = make_safe_mode_signal(stale=True)
+
+    result = engine.intent_for_context(TradingContext.from_signal(signal, config=engine.config), {"positions": []})
+
+    assert result is None
+    assert engine.safe_mode_decisions()["BTCUSDT"]["active"] is True
+
+
+def test_engine_safe_mode_allows_existing_position_exit() -> None:
+    engine = make_safe_mode_engine()
+    signal = make_safe_mode_signal(stale=True)
+    position = {"symbol": "BTCUSDT", "side": "long", "position_qty": 1.0}
+    expected = SimpleNamespace(action="close_long")
+    engine.exit_intent_if_needed = lambda signal, position, state=None: expected
+
+    result = engine.intent_for_context(
+        TradingContext.from_signal(signal, config=engine.config),
+        {"positions": [position]},
+    )
+
+    assert result is expected
+
+
 def test_request_telemetry_observes_existing_request_without_changing_response(monkeypatch) -> None:
     client = V6BinanceClient(V6ExecutionConfig())
     response = SimpleNamespace(status_code=200)
@@ -157,6 +268,24 @@ def test_request_telemetry_records_failure_and_preserves_exception_contract(monk
         raise AssertionError("request failure must preserve the existing V6ExecutionError contract")
     assert client.request_health()["request_count"] == 1
     assert client.request_health()["failure_count"] == 1
+    assert client.request_health()["connection_unavailable"] is False
+
+
+def test_request_telemetry_marks_consecutive_connection_failures_unavailable(monkeypatch) -> None:
+    client = V6BinanceClient(V6ExecutionConfig(binance_request_retries=1))
+    monkeypatch.setattr(
+        client.session,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.ConnectionError("offline")),
+    )
+
+    for _ in range(2):
+        with pytest.raises(Exception):
+            client._request("GET", "https://example.invalid")
+
+    health = client.request_health()
+    assert health["consecutive_connection_failures"] == 2
+    assert health["connection_unavailable"] is True
 
 
 def test_engine_request_health_sidecar_is_optional() -> None:
