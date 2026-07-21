@@ -29,6 +29,9 @@ class EventWriter:
         runtime_mode: str = "dry_run",
         source: str = "v6_execution",
         strategy_version: str = "6.0-baseline",
+        config_version: str = "",
+        model_version: str = "",
+        config_hash: str = "",
         max_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         self.path = path
@@ -37,6 +40,9 @@ class EventWriter:
         self.runtime_mode = str(runtime_mode or "dry_run")
         self.source = str(source or "v6_execution")
         self.strategy_version = str(strategy_version or "6.0-baseline")
+        self.config_version = str(config_version or "")
+        self.model_version = str(model_version or "")
+        self.config_hash = str(config_hash or "")
         self.max_bytes = max(1024, int(max_bytes))
 
     def _envelope(self, event_type: str, payload: Mapping[str, Any], *, occurred_at: str = "") -> EventEnvelope:
@@ -47,6 +53,9 @@ class EventWriter:
             runtime_mode=self.runtime_mode,
             source=self.source,
             strategy_version=self.strategy_version,
+            config_version=self.config_version,
+            model_version=self.model_version,
+            config_hash=self.config_hash,
             occurred_at=occurred_at,
         )
 
