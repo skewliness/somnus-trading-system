@@ -41,4 +41,3 @@ Secrets and host-specific paths are deliberately excluded. Environment
 variables may select an account or override a value at runtime, but V6.5 must
 not alter any pre-existing default expression. New V6.5 fields may only carry
 architecture metadata, event paths, or monitoring settings.
-
