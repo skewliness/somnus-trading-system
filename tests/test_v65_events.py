@@ -21,6 +21,7 @@ def sample_summary() -> dict:
                 "short_probability": 0.25,
                 "wait_probability": 0.15,
                 "model_quality_score": 0.80,
+                "reasons": ["4H right-side long", "15M MA20 held"],
             }
         ],
         "intents": [
@@ -84,6 +85,10 @@ def test_event_writer_writes_typed_account_scoped_events_and_redacts(tmp_path: P
     assert {row["account_id"] for row in rows} == {"momo2"}
     assert {row["runtime_mode"] for row in rows} == {"live_order"}
     assert all(len(row["event_id"]) == 64 for row in rows)
+    assert all(row["timestamp"] == row["occurred_at"] for row in rows)
+    assert rows[0]["payload"]["signal_reason"] == "4H right-side long; 15M MA20 held"
+    assert rows[1]["payload"]["order_reason"].startswith("structure exit")
+    assert rows[2]["payload"]["exit_reason"].startswith("structure exit")
     assert "must-not-leak" not in path.read_text(encoding="utf-8")
     assert "<redacted>" in path.read_text(encoding="utf-8")
 
@@ -100,6 +105,58 @@ def test_event_id_is_deterministic_for_same_business_event() -> None:
     second = EventEnvelope.create("signal", {"price": 60000.0, "symbol": "BTCUSDT"}, **kwargs)
 
     assert first.event_id == second.event_id
+
+
+def test_fill_event_reads_exchange_identity_from_nested_response(tmp_path: Path) -> None:
+    summary = sample_summary()
+    summary["results"] = [
+        {
+            "status": "submitted",
+            "intent": {"symbol": "BTCUSDT", "action": "open_long"},
+            "response": {
+                "orderId": 9123,
+                "clientOrderId": "client-9123",
+                "status": "FILLED",
+                "executedQty": "0.02",
+                "avgPrice": "60123.4",
+            },
+        }
+    ]
+    summary["signals"] = []
+    summary["intents"] = []
+    summary["positions"] = []
+    path = tmp_path / "events.jsonl"
+
+    EventWriter(path, enabled=True).emit_run_summary(summary)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))["payload"]
+    assert payload["order_id"] == "9123"
+    assert payload["client_order_id"] == "client-9123"
+    assert payload["executed_quantity"] == "0.02"
+    assert payload["average_price"] == "60123.4"
+
+
+def test_fill_event_preserves_explicit_zero_values(tmp_path: Path) -> None:
+    summary = sample_summary()
+    summary["signals"] = []
+    summary["intents"] = []
+    summary["positions"] = []
+    summary["results"] = [
+        {
+            "status": "submitted",
+            "intent": {"symbol": "BTCUSDT", "action": "open_long"},
+            "executed_quantity": 0,
+            "average_price": 0,
+            "response": {"orderId": 9124, "executedQty": "1", "avgPrice": "60123.4"},
+        }
+    ]
+    path = tmp_path / "events.jsonl"
+
+    EventWriter(path, enabled=True).emit_run_summary(summary)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))["payload"]
+    assert payload["executed_quantity"] == 0
+    assert payload["average_price"] == 0
 
 
 def test_event_writer_isolates_accounts_by_file(tmp_path: Path) -> None:

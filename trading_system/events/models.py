@@ -38,6 +38,19 @@ def _compact_identifier(value: Any) -> str:
     return str(value or "").strip()[:160]
 
 
+def _reason_text(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        value = "; ".join(str(item) for item in value if str(item or "").strip())
+    return redact_sensitive_text(value or "")[:1200]
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class SignalEvent:
     symbol: str
@@ -48,6 +61,7 @@ class SignalEvent:
     short_probability: float | None
     wait_probability: float | None
     model_quality_score: float | None
+    signal_reason: str
 
     @classmethod
     def from_summary(cls, row: Mapping[str, Any]) -> "SignalEvent":
@@ -60,6 +74,7 @@ class SignalEvent:
             short_probability=row.get("short_probability"),
             wait_probability=row.get("wait_probability"),
             model_quality_score=row.get("model_quality_score"),
+            signal_reason=_reason_text(row.get("reasons") or row.get("rationale")),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -81,9 +96,11 @@ class OrderEvent:
     close_fraction: float | None
     target_name: str
     rationale: str
+    order_reason: str
 
     @classmethod
     def from_summary(cls, row: Mapping[str, Any]) -> "OrderEvent":
+        rationale = _reason_text(row.get("rationale") or row.get("reason"))
         return cls(
             symbol=_compact_identifier(row.get("symbol")),
             action=_compact_identifier(row.get("action")),
@@ -97,7 +114,8 @@ class OrderEvent:
             take_profit_price=row.get("take_profit_price"),
             close_fraction=row.get("close_fraction"),
             target_name=_compact_identifier(row.get("target_name")),
-            rationale=redact_sensitive_text(row.get("rationale") or row.get("reason") or "")[:1200],
+            rationale=rationale,
+            order_reason=rationale,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -120,15 +138,28 @@ class FillEvent:
     @classmethod
     def from_summary(cls, row: Mapping[str, Any]) -> "FillEvent":
         intent = row.get("intent") if isinstance(row.get("intent"), Mapping) else {}
+        response = row.get("response") if isinstance(row.get("response"), Mapping) else {}
         projection = project_order_result(row)
         return cls(
             symbol=_compact_identifier(row.get("symbol") or intent.get("symbol")),
             action=_compact_identifier(row.get("action") or intent.get("action")),
             status=_compact_identifier(row.get("status")),
-            order_id=_compact_identifier(row.get("order_id")),
-            client_order_id=_compact_identifier(row.get("client_order_id")),
-            executed_quantity=row.get("executed_quantity") or row.get("executed_qty") or row.get("quantity"),
-            average_price=row.get("average_price") or row.get("avg_price") or row.get("price"),
+            order_id=_compact_identifier(_first_present(row.get("order_id"), response.get("orderId"), response.get("algoId"))),
+            client_order_id=_compact_identifier(
+                _first_present(row.get("client_order_id"), response.get("clientOrderId"), response.get("clientAlgoId"))
+            ),
+            executed_quantity=_first_present(
+                row.get("executed_quantity"),
+                row.get("executed_qty"),
+                row.get("quantity"),
+                response.get("executedQty"),
+            ),
+            average_price=_first_present(
+                row.get("average_price"),
+                row.get("avg_price"),
+                row.get("price"),
+                response.get("avgPrice"),
+            ),
             error=redact_sensitive_text(row.get("error") or "")[:1200],
             order_state=projection.current_state,
             order_state_path=tuple(item.to_state for item in projection.transitions),
@@ -153,9 +184,9 @@ class PositionEvent:
         return cls(
             symbol=_compact_identifier(row.get("symbol")),
             side=_compact_identifier(row.get("side")),
-            quantity=row.get("position_qty") or row.get("remaining_quantity") or row.get("quantity"),
+            quantity=_first_present(row.get("position_qty"), row.get("remaining_quantity"), row.get("quantity")),
             entry_price=row.get("entry_price"),
-            current_price=row.get("current_price") or row.get("mark_price"),
+            current_price=_first_present(row.get("current_price"), row.get("mark_price")),
             horizon=_compact_identifier(row.get("horizon")),
             entry_timeframe=_compact_identifier(row.get("entry_timeframe")),
         )
@@ -174,9 +205,11 @@ class ExitEvent:
     close_fraction: float | None
     target_name: str
     reason: str
+    exit_reason: str
 
     @classmethod
     def from_intent(cls, row: Mapping[str, Any]) -> "ExitEvent":
+        reason = _reason_text(row.get("rationale") or row.get("reason"))
         return cls(
             symbol=_compact_identifier(row.get("symbol")),
             action=_compact_identifier(row.get("action")),
@@ -185,21 +218,34 @@ class ExitEvent:
             order_id="",
             close_fraction=row.get("close_fraction"),
             target_name=_compact_identifier(row.get("target_name")),
-            reason=redact_sensitive_text(row.get("rationale") or row.get("reason") or "")[:1200],
+            reason=reason,
+            exit_reason=reason,
         )
 
     @classmethod
     def from_result(cls, row: Mapping[str, Any]) -> "ExitEvent":
         intent = row.get("intent") if isinstance(row.get("intent"), Mapping) else {}
+        response = row.get("response") if isinstance(row.get("response"), Mapping) else {}
+        reason = _reason_text(intent.get("rationale") or row.get("reason") or row.get("error"))
         return cls(
             symbol=_compact_identifier(row.get("symbol") or intent.get("symbol")),
             action=_compact_identifier(row.get("action") or intent.get("action")),
             stage="execution_result",
             status=_compact_identifier(row.get("status")),
-            order_id=_compact_identifier(row.get("order_id") or row.get("client_order_id")),
-            close_fraction=intent.get("close_fraction") or row.get("close_fraction"),
-            target_name=_compact_identifier(intent.get("target_name") or row.get("target_name")),
-            reason=redact_sensitive_text(intent.get("rationale") or row.get("reason") or row.get("error") or "")[:1200],
+            order_id=_compact_identifier(
+                _first_present(
+                    row.get("order_id"),
+                    row.get("client_order_id"),
+                    response.get("orderId"),
+                    response.get("algoId"),
+                    response.get("clientOrderId"),
+                    response.get("clientAlgoId"),
+                )
+            ),
+            close_fraction=_first_present(intent.get("close_fraction"), row.get("close_fraction")),
+            target_name=_compact_identifier(_first_present(intent.get("target_name"), row.get("target_name"))),
+            reason=reason,
+            exit_reason=reason,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -262,4 +308,6 @@ class EventEnvelope:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["timestamp"] = self.occurred_at
+        return payload

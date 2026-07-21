@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from trading_system.errors import log_classified_exception
 from trading_system.events.models import EventEnvelope, ExitEvent, FillEvent, OrderEvent, PositionEvent, SignalEvent
 from trading_system.persistence import file_lock
 
@@ -112,6 +113,6 @@ class EventWriter:
     def safe_emit_run_summary(self, summary: Mapping[str, Any]) -> int:
         try:
             return self.emit_run_summary(summary)
-        except Exception:
-            LOGGER.exception("V6 sidecar event logging failed")
+        except Exception as exc:
+            log_classified_exception(LOGGER, exc, operation="event_writer.emit_run_summary", level=logging.ERROR)
             return 0
