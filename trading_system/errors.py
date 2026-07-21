@@ -11,6 +11,20 @@ from trading_system.redaction import redact_sensitive_text
 
 
 SENSITIVE_KEY_PARTS = ("api_key", "secret", "token", "cookie", "authorization", "password", "signature")
+EXCHANGE_SERVER_ERROR_TOKENS = (
+    "500 internal server error",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "signed request failed 500",
+    "signed request failed 502",
+    "signed request failed 503",
+    "signed request failed 504",
+    "bad gateway",
+    "gateway timeout",
+    "service unavailable",
+    "internal server error",
+)
 
 
 class ErrorCategory(str, Enum):
@@ -135,7 +149,17 @@ def _derived_code(message: str) -> str:
         return "reduce_only_rejected"
     if "no exchange position found" in lowered:
         return "exchange_position_missing"
+    if any(token in lowered for token in EXCHANGE_SERVER_ERROR_TOKENS):
+        return "exchange_server_error"
     return "unclassified_exception"
+
+
+def _is_order_mutation(operation: str, action: str) -> bool:
+    operation_lower = str(operation or "").lower()
+    return bool(action) or any(
+        token in operation_lower
+        for token in ("post /fapi", "delete /fapi", "submit_order", "submit order", "open_order", "close_order", "cancel_order")
+    )
 
 
 def _infer_category(message: str, operation: str, action: str) -> ErrorCategory:
@@ -189,11 +213,18 @@ def classify_exception(
     raw_message = str(exc)
     message = redact_sensitive_text(raw_message)[:2000]
     lowered = raw_message.lower()
-    ambiguous = "-1007" in lowered or "status unknown" in lowered or "timeout waiting for response" in lowered
+    exchange_server_error = any(token in lowered for token in EXCHANGE_SERVER_ERROR_TOKENS)
+    order_mutation = _is_order_mutation(operation, action)
+    ambiguous = (
+        "-1007" in lowered
+        or "status unknown" in lowered
+        or "timeout waiting for response" in lowered
+        or (exchange_server_error and order_mutation)
+    )
     transient = any(
         token in lowered
         for token in ("timeout", "timed out", "429", "418", "too many requests", "name resolution", "connection", "ssl")
-    )
+    ) or exchange_server_error
     category = _infer_category(raw_message, operation, action)
     code = _derived_code(raw_message)
     severity = ErrorSeverity.WARNING if transient else ErrorSeverity.ERROR
@@ -207,6 +238,9 @@ def classify_exception(
             derived = _derived_code(raw_message)
             code = derived if derived != "unclassified_exception" else code
             category = _infer_category(raw_message, operation, action)
+    if exchange_server_error and order_mutation:
+        code = "order_status_unknown"
+        category = ErrorCategory.ORDER
     risk_action = _risk_action_for(
         category=category,
         code=code,
