@@ -35,6 +35,7 @@ from trading_system.close_resolver import (
     resolve_close_quantity as resolve_close_quantity_decision,
 )
 from trading_system.entry_gate_policy import EntryGateFinding, evaluate_entry_gate_findings, finding_from_block
+from trading_system.errors import V6ExecutionError, classify_exception, log_classified_exception
 from trading_system.events import EventWriter
 from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
 from trading_system.gate_registry import default_entry_gate_registry
@@ -1136,10 +1137,6 @@ def canonical_order_mode(raw: str) -> str:
     return aliases.get(value, "dry_run")
 
 
-class V6ExecutionError(RuntimeError):
-    pass
-
-
 @dataclass(slots=True)
 class V6Signal:
     symbol: str
@@ -1813,16 +1810,26 @@ class V6BinanceClient:
                 value = float(payload.get("markPrice") or payload.get("indexPrice") or 0.0)
                 if value > 0:
                     return value
-        except Exception:
-            pass
+        except Exception as exc:
+            log_classified_exception(
+                LOGGER,
+                exc,
+                operation="order_endpoint_mark_price_fallback",
+                symbol=symbol,
+            )
         try:
             payload = self.public_get("/fapi/v1/ticker/24hr", {"symbol": symbol}, order_endpoint=True)
             if isinstance(payload, dict):
                 value = float(payload.get("lastPrice") or payload.get("weightedAvgPrice") or 0.0)
                 if value > 0:
                     return value
-        except Exception:
-            pass
+        except Exception as exc:
+            log_classified_exception(
+                LOGGER,
+                exc,
+                operation="order_endpoint_ticker_fallback",
+                symbol=symbol,
+            )
         return 0.0
 
     def order_endpoint_book_ticker(self, symbol: str) -> dict[str, Any]:
@@ -2849,6 +2856,12 @@ class V6ExecutionEngine:
                     "symbol": symbol,
                     "status": "signal_failed",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "error_record": classify_exception(
+                        exc,
+                        operation="build_signal",
+                        symbol=symbol,
+                        account_id=self.config.instance_name,
+                    ).to_dict(),
                     "logged_at": utc_now_iso(),
                 })
         def compact_signal_for_jsonl(signal_data: dict[str, Any]) -> dict[str, Any]:
@@ -3031,6 +3044,14 @@ class V6ExecutionEngine:
                     "status": "failed",
                     "intent": intent.to_dict(),
                     "error": error_text,
+                    "error_record": classify_exception(
+                        exc,
+                        operation="submit_or_apply_order",
+                        symbol=intent.symbol,
+                        action=intent.action,
+                        account_id=self.config.instance_name,
+                        context={"submit": submit, "order_mode": self.config.order_mode},
+                    ).to_dict(),
                     "submitted_at": utc_now_iso(),
                 }
                 if pre_submit_cancellation:
@@ -5660,8 +5681,15 @@ class V6ExecutionEngine:
             created_at = datetime.fromisoformat(str(guard.get("created_at") or "").replace("Z", "+00:00"))
             if (datetime.now(timezone.utc) - created_at).total_seconds() / 3600.0 > float(self.config.v5_profit_reentry_guard_max_age_hours):
                 return None
-        except Exception:
-            pass
+        except Exception as exc:
+            log_classified_exception(
+                LOGGER,
+                exc,
+                operation="v5_profit_reentry_guard_timestamp_fallback",
+                symbol=signal.symbol,
+                action=action,
+                account_id=self.config.instance_name,
+            )
         exit_price = float(guard.get("exit_price") or 0.0)
         price = float(signal.price)
         if exit_price <= 0 or price <= 0:
