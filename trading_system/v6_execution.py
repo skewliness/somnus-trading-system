@@ -36,7 +36,7 @@ from trading_system.close_resolver import (
 )
 from trading_system.entry_gate_policy import EntryGateFinding, evaluate_entry_gate_findings, finding_from_block
 from trading_system.errors import V6ExecutionError, classify_exception, log_classified_exception, record_caught_exception
-from trading_system.events import EventWriter
+from trading_system.events import EventWriter, derive_trade_id, extract_trade_id
 from trading_system.exit import ExitManager
 from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
 from trading_system.gate_registry import default_entry_gate_registry
@@ -3121,6 +3121,105 @@ class V6ExecutionEngine:
             return {}
         return {str(symbol): dict(payload) for symbol, payload in decisions.items() if isinstance(payload, dict)}
 
+    def ensure_position_trade_id(self, position: dict[str, Any]) -> str:
+        trade_id = extract_trade_id(position)
+        if not trade_id:
+            seed = "|".join(
+                (
+                    str(position.get("opened_at") or position.get("last_exchange_sync_at") or "legacy"),
+                    str(position.get("entry_price") or 0.0),
+                    str(position.get("source") or "local_state"),
+                )
+            )
+            trade_id = derive_trade_id(
+                account_id=str(getattr(self.config, "instance_name", "default") or "default"),
+                symbol=str(position.get("symbol") or "UNKNOWN"),
+                side=str(position.get("side") or "unknown"),
+                seed=seed,
+            )
+        position["trade_id"] = trade_id
+        risk_plan = position.get("risk_plan") if isinstance(position.get("risk_plan"), dict) else {}
+        risk_plan["trade_id"] = trade_id
+        position["risk_plan"] = risk_plan
+        for lot in position.get("lots") or []:
+            if not isinstance(lot, dict):
+                continue
+            lot["trade_id"] = trade_id
+            lot_risk_plan = lot.get("risk_plan") if isinstance(lot.get("risk_plan"), dict) else {}
+            lot_risk_plan["trade_id"] = trade_id
+            lot["risk_plan"] = lot_risk_plan
+        return trade_id
+
+    def ensure_state_trade_ids(self, state: dict[str, Any]) -> bool:
+        changed = False
+        for position in state.get("positions") or []:
+            if not isinstance(position, dict):
+                continue
+            before = (
+                str(position.get("trade_id") or ""),
+                str((position.get("risk_plan") or {}).get("trade_id") or "")
+                if isinstance(position.get("risk_plan"), dict)
+                else "",
+                tuple(
+                    (
+                        str(lot.get("trade_id") or ""),
+                        str((lot.get("risk_plan") or {}).get("trade_id") or "")
+                        if isinstance(lot.get("risk_plan"), dict)
+                        else "",
+                    )
+                    for lot in position.get("lots") or []
+                    if isinstance(lot, dict)
+                ),
+            )
+            self.ensure_position_trade_id(position)
+            after = (
+                str(position.get("trade_id") or ""),
+                str((position.get("risk_plan") or {}).get("trade_id") or ""),
+                tuple(
+                    (
+                        str(lot.get("trade_id") or ""),
+                        str((lot.get("risk_plan") or {}).get("trade_id") or ""),
+                    )
+                    for lot in position.get("lots") or []
+                    if isinstance(lot, dict)
+                ),
+            )
+            if before != after:
+                changed = True
+        return changed
+
+    def ensure_intent_trade_id(self, intent: V6OrderIntent, state: dict[str, Any]) -> str:
+        risk_plan = intent.risk_plan if isinstance(intent.risk_plan, dict) else {}
+        trade_id = extract_trade_id({"risk_plan": risk_plan})
+        side = local_side_for_action(intent.action)
+        if not trade_id:
+            for position in state.get("positions") or []:
+                if not isinstance(position, dict):
+                    continue
+                if (
+                    str(position.get("symbol") or "").upper() == intent.symbol.upper()
+                    and str(position.get("side") or "").lower() == side
+                ):
+                    trade_id = self.ensure_position_trade_id(position)
+                    break
+        if not trade_id:
+            seed = "|".join(
+                (
+                    str(intent.generated_at or ""),
+                    str(intent.entry_price or 0.0),
+                    "position_lifecycle",
+                )
+            )
+            trade_id = derive_trade_id(
+                account_id=str(getattr(self.config, "instance_name", "default") or "default"),
+                symbol=intent.symbol,
+                side=side,
+                seed=seed,
+            )
+        risk_plan["trade_id"] = trade_id
+        intent.risk_plan = risk_plan
+        return trade_id
+
     def safe_mode_for_entry(self, signal: V6Signal, state: dict[str, Any]):
         signal_payload = signal.to_dict() if hasattr(signal, "to_dict") else {}
         report = evaluate_runtime_health(
@@ -3197,6 +3296,7 @@ class V6ExecutionEngine:
             reconcile_result = self.reconcile_state_with_exchange(state)
             if reconcile_result:
                 maintenance.append(reconcile_result)
+        self.ensure_state_trade_ids(state)
         signals: list[V6Signal] = []
         intents: list[V6OrderIntent] = []
         results: list[dict[str, Any]] = []
@@ -3283,6 +3383,7 @@ class V6ExecutionEngine:
                     ),
                 )
         for intent in intents:
+            self.ensure_intent_trade_id(intent, state)
             self.annotate_intent_execution_risk(intent)
             result: dict[str, Any]
             existing_position: dict[str, Any] | None = None
@@ -3720,6 +3821,8 @@ class V6ExecutionEngine:
             maintenance.append(post_action_reconcile)
             if post_action_reconcile.get("status") in {"ok", "repaired"}:
                 state = self.load_state()
+        if self.ensure_state_trade_ids(state):
+            atomic_write_json(self.config.state_file, state)
         summary = {
             "generated_at": utc_now_iso(),
             "order_mode": self.config.order_mode,
@@ -3778,6 +3881,7 @@ class V6ExecutionEngine:
             "signals": compact_signal_dicts,
             "intents": [
                 {
+                    "trade_id": extract_trade_id(item),
                     "symbol": item.get("symbol"),
                     "action": item.get("action"),
                     "side": item.get("side"),
@@ -3792,6 +3896,7 @@ class V6ExecutionEngine:
             ],
             "results": [
                 {
+                    "trade_id": extract_trade_id(item),
                     "symbol": item.get("symbol") or (item.get("intent") or {}).get("symbol") if isinstance(item.get("intent"), dict) else item.get("symbol"),
                     "action": (item.get("intent") or {}).get("action") if isinstance(item.get("intent"), dict) else item.get("action"),
                     "status": item.get("status"),
@@ -3812,6 +3917,7 @@ class V6ExecutionEngine:
             "position_count": len(summary["positions"]),
             "positions": [
                 {
+                    "trade_id": extract_trade_id(item),
                     "symbol": item.get("symbol"),
                     "side": item.get("side"),
                     "position_qty": item.get("position_qty") or item.get("remaining_quantity"),
@@ -12823,6 +12929,7 @@ class V6ExecutionEngine:
             "strategy_id": risk_plan.get("strategy_id") or "",
             "strategy_version": risk_plan.get("strategy_version") or "",
             "strategy_provenance": risk_plan.get("strategy_provenance") or "",
+            "trade_id": risk_plan.get("trade_id") or "",
             "runtime_versions": dict(risk_plan.get("runtime_versions") or {}),
             "strategy_labels": [str(item) for item in risk_plan.get("strategy_labels") or [] if str(item or "")],
             "strategy_label": risk_plan.get("strategy_label") or "",
@@ -12903,6 +13010,7 @@ class V6ExecutionEngine:
         }
         lot = {
             "lot_id": self.lot_id(intent, result, fill_price=fill_price, quantity=quantity),
+            "trade_id": str(risk_plan.get("trade_id") or ""),
             "symbol": intent.symbol,
             "side": "short" if intent.action == "open_short" else "long",
             "status": "open",
@@ -12954,6 +13062,7 @@ class V6ExecutionEngine:
             "lot_id": hashlib.sha1(
                 f"legacy|{position.get('symbol')}|{position.get('side')}|{position.get('opened_at')}|{position.get('entry_price')}".encode("utf-8")
             ).hexdigest()[:16],
+            "trade_id": str(position.get("trade_id") or risk_plan.get("trade_id") or ""),
             "symbol": str(position.get("symbol") or "").upper(),
             "side": str(position.get("side") or "").lower(),
             "status": "open",
@@ -13258,6 +13367,7 @@ class V6ExecutionEngine:
             "lot_id": hashlib.sha1(
                 f"exchange_recovered|{position.get('symbol')}|{position.get('side')}|{utc_now_iso()}|{actual_qty}".encode("utf-8")
             ).hexdigest()[:16],
+            "trade_id": str(position.get("trade_id") or (position.get("risk_plan") or {}).get("trade_id") or ""),
             "symbol": str(position.get("symbol") or "").upper(),
             "side": side,
             "status": "open",
@@ -13315,6 +13425,7 @@ class V6ExecutionEngine:
             "exchange_position": snapshot,
             "last_exchange_sync_at": utc_now_iso(),
         }
+        self.ensure_position_trade_id(position)
         position["lots"] = [self.recovered_lot_from_position(position, actual_qty=qty, reason="exchange_position_missing_from_local_state")]
         self.update_position_layer_summary(position)
         return position
@@ -14767,6 +14878,7 @@ class V6ExecutionEngine:
         return position
 
     def apply_intent_to_state(self, state: dict[str, Any], intent: V6OrderIntent, result: dict[str, Any]) -> None:
+        self.ensure_intent_trade_id(intent, state)
         positions = [item for item in state.get("positions", []) if isinstance(item, dict)]
         if intent.action in {"open_long", "open_short"} and self.submitted_order_has_no_confirmed_position_delta(result):
             expected_side = "short" if intent.action == "open_short" else "long"
@@ -14980,6 +15092,7 @@ class V6ExecutionEngine:
             lot = self.lot_from_open_result(intent, result, fill_price=fill_price, notional=fill_notional)
             strategy_labels = [str(item) for item in (intent.risk_plan or {}).get("strategy_labels") or [] if str(item or "")]
             position = {
+                "trade_id": str((intent.risk_plan or {}).get("trade_id") or ""),
                 "symbol": intent.symbol,
                 "side": "short" if intent.action == "open_short" else "long",
                 "opened_at": result.get("submitted_at") or utc_now_iso(),
