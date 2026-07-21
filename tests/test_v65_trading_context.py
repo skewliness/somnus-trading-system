@@ -42,7 +42,8 @@ def test_context_is_frozen_and_preserves_input_identity() -> None:
 
     assert context.symbol == signal.symbol
     assert context.price == signal.price
-    assert context.market_regime == signal.side_bias
+    assert context.side_bias == signal.side_bias
+    assert context.market_regime == "unknown"
     assert context.signal is signal
     assert context.position is position
     assert context.indicators is signal.indicators
@@ -61,10 +62,42 @@ def test_context_with_position_keeps_all_market_inputs_unchanged() -> None:
 
     assert positioned is not context
     assert positioned.position is position
+    assert positioned.side_bias == context.side_bias
+    assert positioned.market_regime == context.market_regime
     assert positioned.signal is context.signal
     assert positioned.indicators is context.indicators
     assert positioned.features is context.features
     assert positioned.config is context.config
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ({"market_regime": "trend_up"}, "trend_up"),
+        ({"market_regime": {"regime": "risk_off"}}, "risk_off"),
+    ],
+)
+def test_market_regime_is_read_independently_from_signal_bias(source, expected) -> None:
+    signal = make_signal()
+    signal.indicators.update(source)
+
+    context = TradingContext.from_signal(signal, config=object())
+
+    assert context.side_bias == "long"
+    assert context.market_regime == expected
+    assert context.market_regime != context.side_bias
+
+
+def test_explicit_market_regime_takes_precedence_over_indicator_metadata() -> None:
+    base = make_signal()
+    signal = SimpleNamespace(**base.to_dict(), market_regime={"regime": "flash_crash"})
+    signal.indicators = {"market_regime": "range"}
+    signal.levels = base.levels
+
+    context = TradingContext.from_signal(signal, config=object())
+
+    assert context.side_bias == "long"
+    assert context.market_regime == "flash_crash"
 
 
 def test_engine_exit_boundary_passes_trading_context_when_supported() -> None:

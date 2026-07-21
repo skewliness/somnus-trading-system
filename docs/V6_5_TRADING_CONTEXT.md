@@ -1,8 +1,15 @@
 # V6.5 Trading Context
 
-PR6 introduces the frozen `TradingContext` container required by the migration
-plan. It carries the current symbol, price, position, market regime, indicators,
-features, config, and original signal.
+Migration PR6 introduced the frozen `TradingContext` container. Remediation
+PR3 separates its directional bias from its market regime. The context carries
+the current symbol, price, position, directional bias, market regime,
+indicators, features, config, and original signal.
+
+`side_bias` and `market_regime` are deliberately independent. `side_bias`
+preserves the signal's `long` / `short` / `neutral` preference. Market regime
+is read only from explicit regime metadata and otherwise remains `unknown`; it
+never falls back to directional bias. This prevents a long candidate from
+being mislabeled as a trending market without adding or changing a gate.
 
 The context preserves object identity for the signal, position, indicators,
 features, and config. It does not copy, normalize, recalculate, or deep-freeze
