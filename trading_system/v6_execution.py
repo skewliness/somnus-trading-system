@@ -478,6 +478,8 @@ class V6ExecutionConfig:
     min_notional_usdt: float = 300.0
     default_leverage: int = 3
     max_positions: int = 2
+    risk_max_budget_usdt: float = 0.0
+    risk_reference_volatility_pct: float = 0.0
     long_entry_threshold: float = 0.72
     short_entry_threshold: float = 0.72
     symbol_long_entry_thresholds: dict[str, float] = field(default_factory=dict)
@@ -763,6 +765,8 @@ class V6ExecutionConfig:
             min_notional_usdt=_env_float("TS_V6_MIN_NOTIONAL_USDT", 300.0),
             default_leverage=_env_int("TS_V6_DEFAULT_LEVERAGE", 3),
             max_positions=_env_int("TS_V6_MAX_POSITIONS", 2),
+            risk_max_budget_usdt=max(0.0, _env_float("TS_V6_RISK_MAX_BUDGET_USDT", 0.0)),
+            risk_reference_volatility_pct=max(0.0, _env_float("TS_V6_RISK_REFERENCE_VOLATILITY_PCT", 0.0)),
             long_entry_threshold=_env_float("TS_V6_LONG_ENTRY_THRESHOLD", 0.72),
             short_entry_threshold=_env_float("TS_V6_SHORT_ENTRY_THRESHOLD", 0.72),
             symbol_long_entry_thresholds=parse_symbol_float_map(
@@ -12959,6 +12963,7 @@ class V6ExecutionEngine:
             "scale_in": dict(risk_plan.get("scale_in") or {}),
             "execution_account": dict(risk_plan.get("execution_account") or {}),
             "local_risk_budget": dict(risk_plan.get("local_risk_budget") or {}),
+            "risk_engine": dict(risk_plan.get("risk_engine") or {}),
             "v5_candidate_metadata": dict(risk_plan.get("v5_candidate_metadata") or {})
             if isinstance(risk_plan.get("v5_candidate_metadata"), dict)
             else {},

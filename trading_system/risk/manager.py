@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from trading_system.risk.models import RiskAssessment
+from trading_system.risk.models import RiskAssessment, RiskRecommendation
 
 
 class RiskManager:
@@ -138,12 +138,145 @@ class RiskManager:
             leverage=int(intent.leverage or 1),
         )
 
+    @staticmethod
+    def _first_positive_metric(payload: Any, names: tuple[str, ...]) -> float:
+        if not isinstance(payload, dict):
+            return 0.0
+        for name in names:
+            try:
+                value = float(payload.get(name) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return 0.0
+
+    @classmethod
+    def volatility_pct_for_intent(cls, intent: Any, local_budget: dict[str, Any]) -> tuple[float, str]:
+        risk_plan = intent.risk_plan if isinstance(intent.risk_plan, dict) else {}
+        entry_context = risk_plan.get("entry_context") if isinstance(risk_plan.get("entry_context"), dict) else {}
+        names = ("volatility_pct", "realized_volatility_pct", "atr_pct", "bb_width_pct")
+        direct = cls._first_positive_metric(risk_plan, names)
+        if direct > 0:
+            return direct, "risk_plan"
+        contextual = cls._first_positive_metric(entry_context, names)
+        if contextual > 0:
+            return contextual, "entry_context"
+        return max(0.0, float(local_budget.get("stop_distance_pct") or 0.0)), "stop_distance_proxy"
+
+    @staticmethod
+    def assess_trade_risk(
+        *,
+        planned_loss_at_stop_usdt: float,
+        max_risk_budget_usdt: float,
+        volatility_pct: float,
+        reference_volatility_pct: float,
+        leverage: int,
+        volatility_source: str = "unknown",
+    ) -> RiskRecommendation:
+        """Build an advisory score without changing allow/deny or order sizing."""
+
+        planned_loss = max(0.0, float(planned_loss_at_stop_usdt or 0.0))
+        max_budget = max(0.0, float(max_risk_budget_usdt or 0.0))
+        observed_volatility = max(0.0, float(volatility_pct or 0.0))
+        reference_volatility = max(0.01, float(reference_volatility_pct or 0.0))
+        leverage_value = max(1, int(leverage or 1))
+
+        budget_ratio = planned_loss / max_budget if max_budget > 0 else 0.0
+        volatility_ratio = observed_volatility / reference_volatility if observed_volatility > 0 else 0.0
+        budget_score = min(50.0, 30.0 * budget_ratio if budget_ratio <= 1.0 else 30.0 + 20.0 * (budget_ratio - 1.0))
+        volatility_score = min(30.0, 15.0 * volatility_ratio)
+        leverage_score = min(20.0, float(leverage_value))
+        score = round(min(100.0, budget_score + volatility_score + leverage_score), 4)
+
+        if score < 40.0:
+            level, recommendation, score_multiplier = "low", "standard", 1.0
+        elif score < 60.0:
+            level, recommendation, score_multiplier = "medium", "reduced", 0.75
+        elif score < 80.0:
+            level, recommendation, score_multiplier = "high", "defensive", 0.50
+        else:
+            level, recommendation, score_multiplier = "critical", "minimum", 0.25
+        volatility_adjustment = 1.0 if observed_volatility <= reference_volatility else max(
+            0.25,
+            reference_volatility / observed_volatility,
+        )
+        recommended_multiplier = round(min(score_multiplier, volatility_adjustment), 4)
+        reasons: list[str] = []
+        if max_budget > 0 and budget_ratio > 1.0:
+            reasons.append("planned_loss_exceeds_reference_budget")
+        if observed_volatility > reference_volatility:
+            reasons.append("volatility_above_reference")
+        if leverage_value > 8:
+            reasons.append("elevated_leverage")
+        if not reasons:
+            reasons.append("within_reference_risk_envelope")
+        return RiskRecommendation(
+            risk_score=score,
+            risk_level=level,
+            position_recommendation=recommendation,
+            position_size_multiplier=recommended_multiplier,
+            volatility_adjustment=round(volatility_adjustment, 4),
+            max_risk_budget_usdt=round(max_budget, 8),
+            budget_utilization_pct=round(budget_ratio * 100.0, 4),
+            reasons=tuple(reasons),
+            metrics={
+                "planned_loss_at_stop_usdt": round(planned_loss, 8),
+                "volatility_pct": round(observed_volatility, 8),
+                "reference_volatility_pct": round(reference_volatility, 8),
+                "volatility_source": str(volatility_source or "unknown"),
+                "leverage": leverage_value,
+                "score_components": {
+                    "budget": round(budget_score, 4),
+                    "volatility": round(volatility_score, 4),
+                    "leverage": round(leverage_score, 4),
+                },
+            },
+        )
+
+    @classmethod
+    def risk_recommendation_for_intent(
+        cls,
+        config: Any,
+        intent: Any,
+        local_budget: dict[str, Any],
+    ) -> RiskRecommendation:
+        planned_loss = max(0.0, float(local_budget.get("planned_loss_at_stop_usdt") or 0.0))
+        configured_budget = max(0.0, float(getattr(config, "risk_max_budget_usdt", 0.0) or 0.0))
+        if configured_budget <= 0:
+            configured_budget = max(
+                0.0,
+                float(getattr(config, "base_notional_usdt", 0.0) or 0.0)
+                * float(getattr(config, "stop_loss_pct", 0.0) or 0.0),
+            )
+        if configured_budget <= 0:
+            configured_budget = planned_loss
+        volatility_pct, volatility_source = cls.volatility_pct_for_intent(intent, local_budget)
+        reference_volatility_pct = max(
+            0.01,
+            float(getattr(config, "risk_reference_volatility_pct", 0.0) or 0.0)
+            or float(getattr(config, "stop_loss_pct", 0.0) or 0.0) * 100.0
+            or float(local_budget.get("stop_distance_pct") or 0.0)
+            or 1.0,
+        )
+        return cls.assess_trade_risk(
+            planned_loss_at_stop_usdt=planned_loss,
+            max_risk_budget_usdt=configured_budget,
+            volatility_pct=volatility_pct,
+            reference_volatility_pct=reference_volatility_pct,
+            leverage=int(intent.leverage or 1),
+            volatility_source=volatility_source,
+        )
+
     def annotate_intent_execution_risk(self, config: Any, intent: Any) -> None:
         risk_plan = dict(intent.risk_plan or {})
         risk_plan["execution_account"] = self.execution_account_metadata(config)
         risk_plan["exit_control_mode"] = config.exit_control_mode
         if intent.action in {"open_long", "open_short"}:
-            risk_plan["local_risk_budget"] = self.local_risk_budget_for_intent(intent)
+            local_budget = self.local_risk_budget_for_intent(intent)
+            risk_plan["local_risk_budget"] = local_budget
+            intent.risk_plan = risk_plan
+            risk_plan["risk_engine"] = self.risk_recommendation_for_intent(config, intent, local_budget).to_dict()
         intent.risk_plan = risk_plan
 
     @staticmethod
