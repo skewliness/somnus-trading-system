@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "tag": "v6.0-baseline-20260721",
+  "commit": "0aaaaa2dc014becf99ec711531b97d94b49f6c30",
+  "source": {
+    "path": "trading_system/v6_execution.py",
+    "sha256": "2f36b212d36b60267279a984a0c05d2fc3169f7a72730cf0e1066be373bcf40a"
+  },
+  "config": {
+    "field_count": 248,
+    "default_expression_sha256": "0200571484a283d2445b9fab8ef59c0b1963a734b1e2b6180157e83033e91636",
+    "key_defaults": {
+      "base_notional_usdt": "300.0",
+      "min_notional_usdt": "300.0",
+      "default_leverage": "3",
+      "max_positions": "2",
+      "scale_in_enabled": "True",
+      "max_scale_ins_per_position": "3",
+      "stop_loss_pct": "0.03",
+      "take_profit_pct": "0.06",
+      "long_entry_threshold": "0.72",
+      "short_entry_threshold": "0.72",
+      "exit_opposite_threshold": "0.62",
+      "model_path": "DEFAULT_MODEL_PATH"
+    }
+  },
+  "rules": {
+    "intent_for_signal": "b5458d7bc7e11f082fe7e5e65cba3bf051e17bfdba75454236aee2542e296088",
+    "intent_for_technical_entry_signal": "e5c2acad9e7b829befe5c19b35c5a40481582b2ae8b65af533886a5053b5a4fb",
+    "entry_structure_block": "3cc2c51f82b9b2b1c727cbb3843b2008efd6ffd0cfb0e181c1ccddca3255beee",
+    "macro_direction_entry_block": "53abb680596c189a720a111a5c713ad66f947b2f7208cd3217bed27f77c3ca36",
+    "open_intent": "122d4918988de7626552840b3362e17d3c77a93309e2021ff435158a98e6a579",
+    "scale_in_intent_if_needed": "fecd50af53f518986053f77620f1467ece4b3396ca592702c5ff4da2d4b53cd9",
+    "exit_intent_if_needed": "69daa6b18c27c43d3575189c8b330895d090736c906817cab6d7e01bc637bcc2",
+    "stop_take_profit": "c62372b5814e46cd5150b04c90b6f12c116ed1c54a1e875bf173015c4b90d9fb",
+    "apply_intent_to_state": "4c6a2187f0dc5b94a72bce9a5aebc8b06471f5aa36371ebc08fdb43f9349275c",
+    "reconcile_state_with_exchange": "9749ff240331f48e0f69e667fb50633198c017937ffb61a985471c66c2f01c2d"
+  },
+  "baseline_tests": {
+    "passed": 677,
+    "python": "3.11",
+    "duration_seconds": 113.43
+  }
+}
+
