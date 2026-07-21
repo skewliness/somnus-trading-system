@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+from trading_system import v6_execution
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CAPTURE_SCRIPT = ROOT / "scripts" / "capture_v65_exit_regression.py"
@@ -23,10 +25,12 @@ def test_exit_regression_matches_frozen_v6_legacy_oracle(tmp_path: Path) -> None
     capture = load_capture_module()
     fixture = json.loads(INPUT_FIXTURE.read_text(encoding="utf-8"))
     expected = json.loads(LEGACY_EXPECTED.read_text(encoding="utf-8"))
+    original_utc_now_iso = v6_execution.utc_now_iso
     actual = capture.capture_current(ROOT, fixture, work_root=tmp_path)
 
     assert actual["fixture_sha256"] == expected["fixture_sha256"]
     assert actual["cases"] == expected["cases"]
+    assert v6_execution.utc_now_iso is original_utc_now_iso
 
 
 def test_exit_regression_covers_required_priority_collisions() -> None:
