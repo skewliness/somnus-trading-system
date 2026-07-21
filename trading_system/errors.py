@@ -30,6 +30,17 @@ class ErrorSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class ErrorRiskAction(str, Enum):
+    """Operational response already expected at a failed V6 boundary."""
+
+    OBSERVE = "observe"
+    SKIP_SYMBOL = "skip_symbol"
+    BLOCK_ORDER = "block_order"
+    RECONCILE_ORDER = "reconcile_order"
+    HALT_POSITION_MUTATION = "halt_position_mutation"
+    RETRY_RECOVERY = "retry_recovery"
+
+
 class TradingSystemError(RuntimeError):
     category = ErrorCategory.UNKNOWN
     code = "trading_system_error"
@@ -153,6 +164,7 @@ class ErrorRecord:
     severity: str
     transient: bool
     ambiguous_order_status: bool
+    risk_action: str
     exception_type: str
     message: str
     operation: str
@@ -195,6 +207,12 @@ def classify_exception(
             derived = _derived_code(raw_message)
             code = derived if derived != "unclassified_exception" else code
             category = _infer_category(raw_message, operation, action)
+    risk_action = _risk_action_for(
+        category=category,
+        code=code,
+        operation=operation,
+        ambiguous_order_status=ambiguous,
+    )
     return ErrorRecord(
         occurred_at=datetime.now(timezone.utc).isoformat(),
         category=category.value,
@@ -202,6 +220,7 @@ def classify_exception(
         severity=severity.value,
         transient=bool(transient),
         ambiguous_order_status=bool(ambiguous),
+        risk_action=risk_action.value,
         exception_type=type(exc).__name__,
         message=message,
         operation=str(operation or "")[:160],
@@ -210,6 +229,44 @@ def classify_exception(
         account_id=str(account_id or "")[:160],
         context=_safe_context(dict(context or {})),
     )
+
+
+def _risk_action_for(
+    *,
+    category: ErrorCategory,
+    code: str,
+    operation: str,
+    ambiguous_order_status: bool,
+) -> ErrorRiskAction:
+    operation_lower = str(operation or "").lower()
+    if ambiguous_order_status or code == "order_status_unknown":
+        return ErrorRiskAction.RECONCILE_ORDER
+    if category == ErrorCategory.MARKET_DATA:
+        return ErrorRiskAction.SKIP_SYMBOL
+    if category in {ErrorCategory.ORDER, ErrorCategory.RISK}:
+        return ErrorRiskAction.BLOCK_ORDER
+    if category == ErrorCategory.STATE:
+        return ErrorRiskAction.HALT_POSITION_MUTATION
+    if category == ErrorCategory.RECOVERY or "reconcile" in operation_lower:
+        return ErrorRiskAction.RETRY_RECOVERY
+    return ErrorRiskAction.OBSERVE
+
+
+def record_caught_exception(
+    logger: logging.Logger,
+    exc: BaseException,
+    *,
+    operation: str,
+    level: int = logging.DEBUG,
+    **fields: Any,
+) -> ErrorRecord:
+    """Classify and log a caught exception without changing control flow."""
+
+    try:
+        return log_classified_exception(logger, exc, operation=operation, level=level, **fields)
+    except Exception as logging_exc:  # pragma: no cover - logging must never mask the original failure
+        logger.error("failed to classify caught exception operation=%s error=%s", operation, logging_exc)
+        return classify_exception(exc, operation=operation, **fields)
 
 
 def log_classified_exception(
@@ -221,5 +278,6 @@ def log_classified_exception(
     **fields: Any,
 ) -> ErrorRecord:
     record = classify_exception(exc, operation=operation, **fields)
-    logger.log(level, "trade_error=%s", json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")))
+    if logger.isEnabledFor(level):
+        logger.log(level, "trade_error=%s", json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")))
     return record
