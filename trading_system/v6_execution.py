@@ -50,6 +50,7 @@ from trading_system.telegram_whale_features import (
     apply_snapshot_to_features as apply_telegram_whale_snapshot,
     compact_snapshot as compact_telegram_whale_snapshot,
 )
+from trading_system.trading_context import TradingContext
 from trading_system.v6_common.reason_utils import join_reasons
 
 
@@ -2825,6 +2826,15 @@ class V6ExecutionEngine:
             manager = RiskManager(utc_now=utc_now_iso)
             self.risk_manager = manager
         return manager
+
+    def trading_context(
+        self,
+        signal_or_context: V6Signal | TradingContext,
+        position: dict[str, Any] | None = None,
+    ) -> TradingContext:
+        if isinstance(signal_or_context, TradingContext):
+            return signal_or_context if position is None else signal_or_context.with_position(position)
+        return TradingContext.from_signal(signal_or_context, config=self.config, position=position)
 
     def execution_lock_target(self) -> Path:
         return Path(os.getenv("TS_V6_EXECUTION_LOCK_TARGET", str(self.config.state_dir / "v6_execution")))
@@ -6188,21 +6198,26 @@ class V6ExecutionEngine:
             exit_intent = self.exit_intent_if_needed(signal, position, state=state)
             if exit_intent:
                 return exit_intent
-        return self._entry_intent_for_signal(signal, state, positions)
+        context = self.trading_context(signal)
+        return self._entry_intent_for_signal(context, state, positions)
 
     def _entry_intent_for_signal(
         self,
-        signal: V6Signal,
+        signal_or_context: V6Signal | TradingContext,
         state: dict[str, Any],
         positions: list[dict[str, Any]],
     ) -> V6OrderIntent | None:
+        context_input = isinstance(signal_or_context, TradingContext)
+        context = self.trading_context(signal_or_context)
+        signal = context.signal
         at_position_capacity = self.risk_manager_instance().at_position_capacity(
             active_position_count=len(self.active_positions(state)),
             max_positions=self.config.max_positions,
         )
 
         if self.config.technical_entry_only_for(signal.symbol):
-            return self.intent_for_technical_entry_signal(signal, state, positions)
+            technical_input = context if context_input else signal
+            return self.intent_for_technical_entry_signal(technical_input, state, positions)
 
         if signal.wait_probability > self.config.max_wait_probability_for_entry:
             return None
@@ -6218,6 +6233,8 @@ class V6ExecutionEngine:
                 self.apply_entry_structure_block(signal, reversal_block)
                 return None
             if short_same_side:
+                if context_input:
+                    return self.scale_in_intent_if_needed(context.with_position(short_same_side), state=state)
                 return self.scale_in_intent_if_needed(signal, short_same_side, state=state)
             if at_position_capacity:
                 return None
@@ -6231,7 +6248,8 @@ class V6ExecutionEngine:
             if block:
                 self.apply_entry_structure_block(signal, block)
                 return None
-            return self.open_intent(signal, "open_short", entry_context=entry_context)
+            open_input = context if context_input else signal
+            return self.open_intent(open_input, "open_short", entry_context=entry_context)
         long_threshold_met = signal.long_probability >= self.config.long_entry_threshold_for(signal.symbol)
         long_lock = self.manager_reentry_lock_block(signal, state, "open_long")
         long_suppressed = self.entry_cooldown_active(state, signal.symbol, "long") or long_lock is not None
@@ -6243,6 +6261,8 @@ class V6ExecutionEngine:
                 self.apply_entry_structure_block(signal, reversal_block)
                 return None
             if long_same_side:
+                if context_input:
+                    return self.scale_in_intent_if_needed(context.with_position(long_same_side), state=state)
                 return self.scale_in_intent_if_needed(signal, long_same_side, state=state)
             if at_position_capacity:
                 return None
@@ -6256,7 +6276,8 @@ class V6ExecutionEngine:
             if block:
                 self.apply_entry_structure_block(signal, block)
                 return None
-            return self.open_intent(signal, "open_long", entry_context=entry_context)
+            open_input = context if context_input else signal
+            return self.open_intent(open_input, "open_long", entry_context=entry_context)
         final_lock = long_lock if long_threshold_met and long_lock is not None else short_lock if short_threshold_met else None
         if final_lock is not None:
             self.apply_entry_structure_block(signal, final_lock)
@@ -6264,10 +6285,13 @@ class V6ExecutionEngine:
 
     def intent_for_technical_entry_signal(
         self,
-        signal: V6Signal,
+        signal_or_context: V6Signal | TradingContext,
         state: dict[str, Any],
         positions: list[dict[str, Any]],
     ) -> V6OrderIntent | None:
+        context_input = isinstance(signal_or_context, TradingContext)
+        trading_context = self.trading_context(signal_or_context)
+        signal = trading_context.signal
         candidates: list[dict[str, Any]] = []
         last_block: dict[str, Any] | None = None
         at_position_capacity = self.risk_manager_instance().at_position_capacity(
@@ -6312,7 +6336,19 @@ class V6ExecutionEngine:
                 continue
             same_side = self.find_position(state, signal.symbol, side=side)
             if same_side:
-                scale_intent = self.scale_in_intent_if_needed(signal, same_side, require_probability=False, state=state)
+                if context_input:
+                    scale_intent = self.scale_in_intent_if_needed(
+                        trading_context.with_position(same_side),
+                        require_probability=False,
+                        state=state,
+                    )
+                else:
+                    scale_intent = self.scale_in_intent_if_needed(
+                        signal,
+                        same_side,
+                        require_probability=False,
+                        state=state,
+                    )
                 if scale_intent:
                     candidates.append({
                         "action": action,
@@ -6354,7 +6390,8 @@ class V6ExecutionEngine:
         )
         if reason not in signal.reasons:
             signal.reasons.append(reason)
-        return self.open_intent(signal, str(selected["action"]), entry_context=context)
+        open_input = trading_context if context_input else signal
+        return self.open_intent(open_input, str(selected["action"]), entry_context=context)
 
     @staticmethod
     def mixed_structure_direction_state(signal: V6Signal) -> dict[str, Any]:
@@ -8630,11 +8667,13 @@ class V6ExecutionEngine:
 
     def open_intent(
         self,
-        signal: V6Signal,
+        signal_or_context: V6Signal | TradingContext,
         action: str,
         *,
         entry_context: dict[str, Any] | None = None,
     ) -> V6OrderIntent:
+        context = self.trading_context(signal_or_context)
+        signal = context.signal
         side = "SELL" if action == "open_short" else "BUY"
         stop, take_profit, risk_plan = self.stop_take_profit(signal, action)
         if isinstance(entry_context, dict):
@@ -11225,6 +11264,10 @@ class V6ExecutionEngine:
         if manager is None:
             manager = ExitManager(intent_factory=V6OrderIntent, utc_now=utc_now_iso)
             self.exit_manager = manager
+        evaluate_context = getattr(manager, "evaluate_context", None)
+        if callable(evaluate_context):
+            context = self.trading_context(signal, position)
+            return evaluate_context(self, context, state=state)
         return manager.evaluate(self, signal, position, state=state)
 
     @staticmethod
@@ -11312,11 +11355,16 @@ class V6ExecutionEngine:
 
     def scale_in_intent_if_needed(
         self,
-        signal: V6Signal,
-        position: dict[str, Any],
+        signal_or_context: V6Signal | TradingContext,
+        position: dict[str, Any] | None = None,
         require_probability: bool = True,
         state: dict[str, Any] | None = None,
     ) -> V6OrderIntent | None:
+        context = self.trading_context(signal_or_context, position)
+        signal = context.signal
+        if context.position is None:
+            raise TypeError("scale-in context requires a position")
+        position = context.position
         if not self.config.scale_in_enabled:
             return None
         side = str(position.get("side") or "").lower()
