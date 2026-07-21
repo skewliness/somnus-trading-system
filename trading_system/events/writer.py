@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from trading_system.errors import record_caught_exception
+from trading_system.errors import log_classified_exception
 from trading_system.events.models import EventEnvelope, ExitEvent, FillEvent, OrderEvent, PositionEvent, SignalEvent
 from trading_system.persistence import file_lock
 
@@ -114,5 +114,5 @@ class EventWriter:
         try:
             return self.emit_run_summary(summary)
         except Exception as exc:
-            record_caught_exception(LOGGER, exc, operation="event_writer.emit_run_summary", level=logging.ERROR)
+            log_classified_exception(LOGGER, exc, operation="event_writer.emit_run_summary", level=logging.ERROR)
             return 0
