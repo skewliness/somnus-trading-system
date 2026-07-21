@@ -52,6 +52,7 @@ from trading_system.telegram_whale_features import (
 )
 from trading_system.trading_context import TradingContext
 from trading_system.v6_common.reason_utils import join_reasons
+from trading_system.versioning import RuntimeVersionInfo
 
 
 LOGGER = logging.getLogger(__name__)
@@ -451,6 +452,9 @@ class V6ExecutionConfig:
     trade_events_file: Path | None = None
     trade_events_max_bytes: int = 32 * 1024 * 1024
     trade_event_strategy_version: str = "6.0-baseline"
+    strategy_version: str = "6.0-baseline"
+    config_version: str = "v6.5"
+    model_version: str = ""
     kline_cache_dir: Path = DEFAULT_EXECUTION_KLINE_CACHE_DIR
     kline_cache_enabled: bool = True
     public_cache_ttl_seconds: int = 90
@@ -716,6 +720,12 @@ class V6ExecutionConfig:
             trade_events_file=Path(os.getenv("TS_V6_TRADE_EVENTS_FILE", str(state_dir / "trade_events.jsonl"))),
             trade_events_max_bytes=_env_int("TS_V6_TRADE_EVENTS_MAX_BYTES", 32 * 1024 * 1024),
             trade_event_strategy_version=os.getenv("TS_V6_TRADE_EVENT_STRATEGY_VERSION", "6.0-baseline").strip() or "6.0-baseline",
+            strategy_version=os.getenv(
+                "TS_V6_STRATEGY_VERSION",
+                os.getenv("TS_V6_TRADE_EVENT_STRATEGY_VERSION", "6.0-baseline"),
+            ).strip() or "6.0-baseline",
+            config_version=os.getenv("TS_V6_CONFIG_VERSION", "v6.5").strip() or "v6.5",
+            model_version=os.getenv("TS_V6_MODEL_VERSION", "").strip(),
             kline_cache_dir=Path(
                 os.getenv(
                     "TS_V6_KLINE_CACHE_DIR",
@@ -2797,6 +2807,7 @@ class V6ExecutionEngine:
         self.config = config or V6ExecutionConfig.from_env()
         self.config.validate_runtime_isolation()
         self.config.ensure_dirs()
+        self._runtime_version_info = RuntimeVersionInfo.from_config(self.config)
         self.client = V6BinanceClient(self.config)
         self.scorer = V6ModelScorer(self.config.model_path)
         self._market_daily_ma7_reversal_cache: dict[str, Any] | None = None
@@ -2813,7 +2824,10 @@ class V6ExecutionEngine:
             enabled=self.config.trade_event_logging_enabled,
             account_id=self.config.instance_name,
             runtime_mode=self.config.order_mode,
-            strategy_version=self.config.trade_event_strategy_version,
+            strategy_version=self._runtime_version_info.strategy_version,
+            config_version=self._runtime_version_info.config_version,
+            model_version=self._runtime_version_info.model_version,
+            config_hash=self._runtime_version_info.config_hash,
             max_bytes=self.config.trade_events_max_bytes,
         )
 
@@ -2826,6 +2840,13 @@ class V6ExecutionEngine:
             manager = RiskManager(utc_now=utc_now_iso)
             self.risk_manager = manager
         return manager
+
+    def runtime_versions(self) -> dict[str, str]:
+        version_info = getattr(self, "_runtime_version_info", None)
+        if version_info is None:
+            version_info = RuntimeVersionInfo.from_config(self.config)
+            self._runtime_version_info = version_info
+        return version_info.to_dict()
 
     def trading_context(
         self,
@@ -3380,6 +3401,7 @@ class V6ExecutionEngine:
             "signals_file": str(self.config.signals_file),
             "orders_file": str(self.config.orders_file),
             "symbols": self.config.symbols,
+            "runtime_versions": self.runtime_versions(),
             "entry_thresholds": {
                 symbol: {
                     "long": self.config.long_entry_threshold_for(symbol),
@@ -12408,6 +12430,9 @@ class V6ExecutionEngine:
 
     def annotate_intent_execution_risk(self, intent: V6OrderIntent) -> None:
         self.risk_manager_instance().annotate_intent_execution_risk(self.config, intent)
+        if not isinstance(intent.risk_plan, dict):
+            intent.risk_plan = {}
+        intent.risk_plan["runtime_versions"] = self.runtime_versions()
 
     @staticmethod
     def compact_risk_plan_for_lot(risk_plan: dict[str, Any]) -> dict[str, Any]:
@@ -12421,6 +12446,7 @@ class V6ExecutionEngine:
             "strategy_id": risk_plan.get("strategy_id") or "",
             "strategy_version": risk_plan.get("strategy_version") or "",
             "strategy_provenance": risk_plan.get("strategy_provenance") or "",
+            "runtime_versions": dict(risk_plan.get("runtime_versions") or {}),
             "strategy_labels": [str(item) for item in risk_plan.get("strategy_labels") or [] if str(item or "")],
             "strategy_label": risk_plan.get("strategy_label") or "",
             "horizon": risk_plan.get("horizon"),
@@ -12517,6 +12543,7 @@ class V6ExecutionEngine:
             "strategy_id": str(risk_plan.get("strategy_id") or "v6_execution"),
             "strategy_version": str(risk_plan.get("strategy_version") or "v6"),
             "strategy_provenance": str(risk_plan.get("strategy_provenance") or ""),
+            "runtime_versions": dict(risk_plan.get("runtime_versions") or {}),
             "horizon": risk_plan.get("horizon"),
             "entry_timeframe": risk_plan.get("entry_timeframe"),
             "selected_entry_level": dict(selected),
@@ -12565,6 +12592,7 @@ class V6ExecutionEngine:
             "strategy_provenance": str(
                 position.get("strategy_provenance") or risk_plan.get("strategy_provenance") or "legacy_recovered"
             ),
+            "runtime_versions": dict(position.get("runtime_versions") or risk_plan.get("runtime_versions") or {}),
             "horizon": position.get("horizon") or risk_plan.get("horizon"),
             "entry_timeframe": position.get("entry_timeframe") or risk_plan.get("entry_timeframe"),
             "selected_entry_level": (risk_plan.get("entry_context") or {}).get("selected_entry_level") or {},
@@ -14574,6 +14602,7 @@ class V6ExecutionEngine:
                 "source": "v6_execution",
                 "strategy_id": str(intent.risk_plan.get("strategy_id") or "v6_execution"),
                 "strategy_version": str(intent.risk_plan.get("strategy_version") or "v6"),
+                "runtime_versions": dict(intent.risk_plan.get("runtime_versions") or {}),
                 "strategy_labels": strategy_labels,
                 "strategy_label": strategy_labels[0] if strategy_labels else "",
                 "risk_plan": intent.risk_plan,

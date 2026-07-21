@@ -217,6 +217,9 @@ class EventEnvelope:
     runtime_mode: str
     source: str
     strategy_version: str
+    config_version: str
+    model_version: str
+    config_hash: str
     payload: dict[str, Any]
 
     @classmethod
@@ -229,6 +232,9 @@ class EventEnvelope:
         runtime_mode: str,
         source: str,
         strategy_version: str,
+        config_version: str = "",
+        model_version: str = "",
+        config_hash: str = "",
         occurred_at: str = "",
     ) -> "EventEnvelope":
         if event_type not in VALID_EVENT_TYPES:
@@ -243,6 +249,9 @@ class EventEnvelope:
             "runtime_mode": _compact_identifier(runtime_mode),
             "source": _compact_identifier(source),
             "strategy_version": _compact_identifier(strategy_version),
+            "config_version": _compact_identifier(config_version),
+            "model_version": _compact_identifier(model_version),
+            "config_hash": _compact_identifier(config_hash),
             "payload": safe_payload,
         }
         encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
