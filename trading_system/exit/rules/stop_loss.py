@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from trading_system.exit.models import ExitRuleFamily, ExitSignal
+
+
+PRIORITY = 400
+
 
 def matches(intent: Any) -> bool:
     risk_plan = getattr(intent, "risk_plan", {}) if intent is not None else {}
@@ -10,4 +15,14 @@ def matches(intent: Any) -> bool:
         "stop loss touched" in reason
         or "soft stop" in reason
         or (isinstance(risk_plan, dict) and risk_plan.get("v5_soft_stop_exit"))
+    )
+
+
+def evaluate(intent: Any) -> ExitSignal:
+    return ExitSignal(
+        triggered=matches(intent),
+        reason=str(getattr(intent, "rationale", "") or ""),
+        priority=PRIORITY,
+        family=ExitRuleFamily.STOP_LOSS,
+        intent=intent,
     )

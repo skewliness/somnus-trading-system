@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from trading_system.exit import ExitManager, ExitRuleFamily
+from trading_system.exit import ExitManager, ExitRuleFamily, ExitSignal, resolve_exit_signals
+from trading_system.exit.rules import build_exit_signals
 from trading_system.v6_execution import V6ExecutionConfig, V6ExecutionEngine, V6OrderIntent, V6Signal, utc_now_iso
 
 
@@ -80,3 +81,47 @@ def test_rule_families_classify_without_changing_intent() -> None:
 
     assert manager.classify_intent(bb_intent) == ExitRuleFamily.BB_EXIT
     assert manager.classify_intent(trend_intent) == ExitRuleFamily.TREND_EXIT
+
+
+def test_every_exit_rule_returns_structured_signal() -> None:
+    intent = SimpleNamespace(rationale="long stop loss touched", risk_plan={})
+
+    signals = build_exit_signals(intent)
+
+    assert all(isinstance(signal, ExitSignal) for signal in signals)
+    assert all(signal.reason == intent.rationale for signal in signals)
+    assert {signal.family for signal in signals} == set(ExitRuleFamily)
+    selected = resolve_exit_signals(signals)
+    assert selected.triggered is True
+    assert selected.family == ExitRuleFamily.STOP_LOSS
+    assert selected.intent is intent
+
+
+def test_resolver_preserves_existing_classification_priority_and_identity() -> None:
+    intent = SimpleNamespace(
+        rationale="profit guard take profit touched",
+        risk_plan={"partial_take_profit": {"type": "bb_take_profit"}},
+    )
+
+    selected = resolve_exit_signals(build_exit_signals(intent))
+
+    assert selected.family == ExitRuleFamily.PROFIT_GUARD
+    assert selected.priority == 300
+    assert selected.intent is intent
+
+
+def test_resolver_rejects_an_empty_or_untriggered_signal_set() -> None:
+    untriggered = ExitSignal(
+        triggered=False,
+        reason="",
+        priority=1,
+        family=ExitRuleFamily.OTHER,
+        intent=None,
+    )
+
+    try:
+        resolve_exit_signals([untriggered])
+    except ValueError as exc:
+        assert str(exc) == "at least one triggered exit signal is required"
+    else:
+        raise AssertionError("resolver accepted an untriggered signal set")
