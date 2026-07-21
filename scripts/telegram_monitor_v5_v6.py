@@ -36,6 +36,7 @@ from trading_system.binance_public_guard import (
 )
 from trading_system.coin_scout_4h_labeler import CoinScout4HLabeler, INTERVAL_MS
 from trading_system.config import StrategyConfig
+from trading_system.health_monitor import HealthThresholds, evaluate_runtime_health
 from trading_system.v6_execution import V6BinanceClient, V6ExecutionConfig, V6ExecutionEngine, canonical_order_mode
 
 DEFAULT_STATE_FILE = ROOT / "data/trading_system/telegram_monitor/state.json"
@@ -49,6 +50,7 @@ V5_V6_EXECUTION_SUMMARY_FILE = ROOT / "data/trading_system/v5_v6_execution/lates
 V5_V6_EXECUTION_STATE_FILE = ROOT / "data/trading_system/v5_v6_execution/state.json"
 V6_PID_FILE = ROOT / os.getenv("TS_TELEGRAM_V6_PID_FILE", "data/trading_system/v6_execution/v6_execution_loop.pid")
 V6_SUMMARY_FILE = ROOT / os.getenv("TS_TELEGRAM_V6_SUMMARY_FILE", "data/trading_system/v6_execution/latest_run_summary.json")
+V6_HEALTH_REPORT_FILE = ROOT / os.getenv("TS_V65_HEALTH_REPORT_FILE", "data/trading_system/v6_execution/health_report.json")
 V6_DISPLAY_NAME = str(os.getenv("TS_TELEGRAM_V6_DISPLAY_NAME", "V6") or "V6").strip()
 V6_SKIP_DISTILL_ALERTS = str(os.getenv("TS_TELEGRAM_V6_SKIP_DISTILL_ALERTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
 V6_DISTILL_REPORT_FILE = ROOT / "data/trading_system/model_training/v6_continuous_distill/latest_v6_distill_report.json"
@@ -1036,6 +1038,9 @@ def collect_status(args: argparse.Namespace) -> dict[str, Any]:
             "results": v6_results[:10],
             "metrics": v6_metrics,
             "live_ops_total": live_ops.get("total", 0),
+            "exchange_request_health": dict(v6_summary.get("exchange_request_health") or {}),
+            "last_ledger_reconcile": dict(v6_summary.get("last_ledger_reconcile") or {}),
+            "protective_stop_required": bool(v6_summary.get("protective_stop_required", True)),
         },
         "thresholds": {
             "v5_stale_seconds": args.v5_stale_seconds,
@@ -5510,6 +5515,23 @@ def build_alerts(status: dict[str, Any], scope: str = "all") -> list[tuple[str, 
             key = "v6_activity_" + short_hash(stable_v6_activity_fingerprint(v6))
             alerts.append((key, format_v6_activity_details(v6)))
 
+        health = v6.get("runtime_health") if isinstance(v6.get("runtime_health"), dict) else {}
+        duplicate_codes = {"service_stopped", "summary_missing", "summary_stale"}
+        critical = [
+            item
+            for item in health.get("findings") or []
+            if isinstance(item, dict) and item.get("severity") == "critical" and item.get("code") not in duplicate_codes
+        ]
+        if critical:
+            digest = str(health.get("critical_digest") or short_hash(critical))
+            details = "\n".join(f"- {item.get('summary')}" for item in critical[:6])
+            alerts.append(
+                (
+                    f"v6_runtime_health_{digest}",
+                    f"[Somnus\u544a\u8b66] {V6_DISPLAY_NAME}\u8fd0\u884c\u5065\u5eb7\u5f02\u5e38\n{details}",
+                )
+            )
+
     return alerts
 
 
@@ -5691,6 +5713,42 @@ def run_once(args: argparse.Namespace, client: TelegramClient, state: dict[str, 
     prune_v5_trade_activity_state(state, now_ts)
     last_summary = float(state.get("last_summary_sent_at", 0) or 0)
 
+    if not args.disable_runtime_health and scope_enabled(args.scope, "v6"):
+        v6 = status["v6"]
+        health = evaluate_runtime_health(
+            {
+                "service_running": v6.get("running"),
+                "summary_age_seconds": v6.get("summary_age"),
+                "order_mode": v6.get("order_mode"),
+                "submit": v6.get("submit"),
+                "signals": list((v6.get("signals") or {}).values()),
+                "positions": v6.get("positions") or [],
+                "exchange_request_health": v6.get("exchange_request_health") or {},
+                "last_ledger_reconcile": v6.get("last_ledger_reconcile") or {},
+                "protective_stop_required": v6.get("protective_stop_required", True),
+            },
+            thresholds=HealthThresholds(
+                summary_warning_seconds=float(args.v6_stale_seconds),
+                summary_critical_seconds=float(args.v6_health_critical_stale_seconds),
+                request_latency_warning_ms=float(args.v6_health_latency_warning_ms),
+                request_latency_critical_ms=float(args.v6_health_latency_critical_ms),
+            ),
+        ).to_dict()
+        v6["runtime_health"] = health
+        health_digest = short_hash({"overall_status": health.get("overall_status"), "findings": health.get("findings")})
+        critical_digest = str(health.get("critical_digest") or "")
+        if (
+            not args.dry_run
+            and (
+                state.get("last_runtime_health_critical_digest") != critical_digest
+                or now_ts - float(state.get("last_runtime_health_written_at", 0) or 0) >= 60
+            )
+        ):
+            save_json(V6_HEALTH_REPORT_FILE, health)
+            state["last_runtime_health_digest"] = health_digest
+            state["last_runtime_health_critical_digest"] = critical_digest
+            state["last_runtime_health_written_at"] = now_ts
+
     if maybe_send_v5_trade_activity(args, client, state, status, now_ts):
         sent = True
 
@@ -5773,9 +5831,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--v5-stale-seconds", type=int, default=int(os.getenv("TS_TELEGRAM_MONITOR_V5_STALE_SECONDS", "1800")))
     parser.add_argument("--v6-stale-seconds", type=int, default=int(os.getenv("TS_TELEGRAM_MONITOR_V6_STALE_SECONDS", "180")))
     parser.add_argument("--v6-distill-stale-seconds", type=int, default=int(os.getenv("TS_TELEGRAM_MONITOR_V6_DISTILL_STALE_SECONDS", "7200")))
+    parser.add_argument(
+        "--v6-health-critical-stale-seconds",
+        type=int,
+        default=int(os.getenv("TS_V65_HEALTH_CRITICAL_STALE_SECONDS", "600")),
+    )
+    parser.add_argument(
+        "--v6-health-latency-warning-ms",
+        type=float,
+        default=float(os.getenv("TS_V65_HEALTH_LATENCY_WARNING_MS", "3000")),
+    )
+    parser.add_argument(
+        "--v6-health-latency-critical-ms",
+        type=float,
+        default=float(os.getenv("TS_V65_HEALTH_LATENCY_CRITICAL_MS", "10000")),
+    )
     parser.add_argument("--macro-report-times", default=os.getenv("TS_TELEGRAM_MONITOR_MACRO_REPORT_TIMES", "07:30,22:00"))
     parser.add_argument("--daily-news-times", default=os.getenv("TS_TELEGRAM_MONITOR_DAILY_NEWS_TIMES", "09:00"))
     parser.add_argument("--daily-news-lookback-hours", type=int, default=int(os.getenv("TS_TELEGRAM_MONITOR_DAILY_NEWS_LOOKBACK_HOURS", "24")))
+    parser.add_argument(
+        "--disable-runtime-health",
+        action="store_true",
+        default=str(os.getenv("TS_V65_HEALTH_MONITOR_DISABLED", "")).lower() in {"1", "true", "yes", "on"},
+        help="Disable the V6.5 read-only runtime health report and its severe alerts.",
+    )
     parser.add_argument(
         "--disable-summary",
         action="store_true",

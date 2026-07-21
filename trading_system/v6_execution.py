@@ -1209,6 +1209,16 @@ class V6BinanceClient:
         self._position_mode_cache: str | None = None
         self._leverage_bracket_cache: dict[str, Any] = {}
         self._market_data_freshness: dict[str, dict[str, Any]] = {}
+        self._request_health: dict[str, Any] = {
+            "request_count": 0,
+            "failure_count": 0,
+            "total_latency_ms": 0.0,
+            "average_latency_ms": 0.0,
+            "last_latency_ms": 0.0,
+            "max_latency_ms": 0.0,
+            "last_status_code": None,
+            "last_request_at": "",
+        }
 
     def close(self) -> None:
         self.session.close()
@@ -1274,14 +1284,43 @@ class V6BinanceClient:
             return {"symbol": symbol_upper, "stale": False, "stale_sources": [], "updated_at": utc_now_iso()}
         return dict(row)
 
+    def record_request_health(self, *, started_at: float, status_code: int | None, failed: bool) -> None:
+        elapsed_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+        health = self._request_health
+        request_count = int(health.get("request_count") or 0) + 1
+        total_latency = float(health.get("total_latency_ms") or 0.0) + elapsed_ms
+        health.update(
+            {
+                "request_count": request_count,
+                "failure_count": int(health.get("failure_count") or 0) + (1 if failed else 0),
+                "total_latency_ms": total_latency,
+                "average_latency_ms": round(total_latency / request_count, 3),
+                "last_latency_ms": round(elapsed_ms, 3),
+                "max_latency_ms": round(max(float(health.get("max_latency_ms") or 0.0), elapsed_ms), 3),
+                "last_status_code": status_code,
+                "last_request_at": utc_now_iso(),
+            }
+        )
+
+    def request_health(self) -> dict[str, Any]:
+        return {key: value for key, value in self._request_health.items() if key != "total_latency_ms"}
+
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         retries = max(1, int(self.config.binance_request_retries or 1))
         timeout = float(kwargs.pop("timeout", self.config.binance_request_timeout_seconds or 20.0))
         last_exc: requests.RequestException | None = None
         for attempt in range(retries):
+            started_at = time.monotonic()
             try:
-                return self.session.request(method, url, timeout=timeout, **kwargs)
+                response = self.session.request(method, url, timeout=timeout, **kwargs)
+                self.record_request_health(
+                    started_at=started_at,
+                    status_code=response.status_code,
+                    failed=int(response.status_code) >= 400,
+                )
+                return response
             except requests.RequestException as exc:
+                self.record_request_health(started_at=started_at, status_code=None, failed=True)
                 last_exc = exc
                 if attempt + 1 < retries:
                     time.sleep(0.6 * (2 ** attempt))
@@ -2848,6 +2887,17 @@ class V6ExecutionEngine:
             self._runtime_version_info = version_info
         return version_info.to_dict()
 
+    def exchange_request_health(self) -> dict[str, Any]:
+        reader = getattr(self.client, "request_health", None)
+        if not callable(reader):
+            return {}
+        try:
+            payload = reader()
+        except Exception:
+            LOGGER.exception("V6 request-health sidecar read failed")
+            return {}
+        return dict(payload) if isinstance(payload, dict) else {}
+
     def trading_context(
         self,
         signal_or_context: V6Signal | TradingContext,
@@ -3402,6 +3452,9 @@ class V6ExecutionEngine:
             "orders_file": str(self.config.orders_file),
             "symbols": self.config.symbols,
             "runtime_versions": self.runtime_versions(),
+            "exchange_request_health": self.exchange_request_health(),
+            "last_ledger_reconcile": dict(state.get("last_ledger_reconcile") or {}),
+            "protective_stop_required": bool(self.config.submit_protective_stop),
             "entry_thresholds": {
                 symbol: {
                     "long": self.config.long_entry_threshold_for(symbol),
