@@ -13,6 +13,8 @@ V65_ARCHITECTURE_CONFIG_FIELDS = {
     "config_version",
     "model_version",
     "order_state_file",
+    "risk_max_budget_usdt",
+    "risk_reference_volatility_pct",
     "strategy_version",
     "trade_event_logging_enabled",
     "trade_event_strategy_version",
