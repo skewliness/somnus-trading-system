@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "fixed_now": "2026-07-18T21:15:00+00:00",
+  "provenance": {
+    "exchange": "Binance USD-M Futures",
+    "timezone": "UTC",
+    "snapshot": "frozen V6 exit collision cases derived from the BTCUSDT historical compatibility snapshot"
+  },
+  "cases": [
+    {
+      "id": "max_hold_precedes_stop",
+      "signal": {
+        "symbol": "BTCUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 64000.0,
+        "side_bias": "short",
+        "long_probability": 0.24,
+        "short_probability": 0.51,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "BTCUSDT",
+        "side": "long",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 64500.0,
+        "take_profit_price": 70000.0,
+        "risk_plan": {}
+      },
+      "stubs": {"hold_expired": true}
+    },
+    {
+      "id": "stop_precedes_daily_reversal",
+      "signal": {
+        "symbol": "BTCUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 65000.0,
+        "side_bias": "long",
+        "long_probability": 0.52,
+        "short_probability": 0.23,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "BTCUSDT",
+        "side": "short",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 64800.0,
+        "take_profit_price": 61000.0,
+        "risk_plan": {}
+      },
+      "stubs": {"daily_reversal": {"reason": "short daily MA7 reversal"}}
+    },
+    {
+      "id": "daily_reversal_precedes_logic_weakening",
+      "signal": {
+        "symbol": "BTCUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 64800.0,
+        "side_bias": "long",
+        "long_probability": 0.52,
+        "short_probability": 0.23,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "BTCUSDT",
+        "side": "short",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 66000.0,
+        "take_profit_price": 61000.0,
+        "risk_plan": {}
+      },
+      "stubs": {
+        "daily_reversal": {"reason": "short daily MA7 reversal"},
+        "logic_weakening": {"reason": "short original 4H logic weakened"}
+      }
+    },
+    {
+      "id": "logic_weakening_precedes_smart_signal",
+      "signal": {
+        "symbol": "ETHUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 1800.0,
+        "side_bias": "short",
+        "long_probability": 0.24,
+        "short_probability": 0.51,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "ETHUSDT",
+        "side": "long",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 1700.0,
+        "take_profit_price": 1950.0,
+        "risk_plan": {}
+      },
+      "stubs": {
+        "logic_weakening": {"reason": "long original 4H logic weakened"},
+        "smart_signal": {"kind": "full_exit", "reason": "long smart-signal risk guard"}
+      }
+    },
+    {
+      "id": "smart_signal_precedes_roi_take_profit",
+      "signal": {
+        "symbol": "ETHUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 1750.0,
+        "side_bias": "long",
+        "long_probability": 0.51,
+        "short_probability": 0.24,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "ETHUSDT",
+        "side": "short",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 1900.0,
+        "take_profit_price": 1600.0,
+        "risk_plan": {}
+      },
+      "stubs": {
+        "smart_signal": {"kind": "full_exit", "reason": "short smart-signal risk guard"},
+        "roi_take_profit": {
+          "stages": [{"name": "roi_tp_25", "fraction_of_initial": 0.3, "trigger_roi_pct": 25.0}],
+          "close_fraction": 0.3
+        }
+      }
+    },
+    {
+      "id": "roi_precedes_staged_take_profit",
+      "signal": {
+        "symbol": "HYPEUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 61.0,
+        "side_bias": "long",
+        "long_probability": 0.52,
+        "short_probability": 0.23,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "HYPEUSDT",
+        "side": "long",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 55.0,
+        "take_profit_price": 68.0,
+        "risk_plan": {}
+      },
+      "stubs": {
+        "roi_take_profit": {
+          "stages": [{"name": "roi_tp_25", "fraction_of_initial": 0.3, "trigger_roi_pct": 25.0}],
+          "close_fraction": 0.3
+        },
+        "staged_take_profit": {
+          "stages": [{"name": "bb120_mid_15m", "fraction_of_initial": 0.25, "effective_fraction_of_initial": 0.25}],
+          "close_fraction": 0.25
+        }
+      }
+    },
+    {
+      "id": "staged_precedes_fixed_take_profit",
+      "signal": {
+        "symbol": "HYPEUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 53.0,
+        "side_bias": "short",
+        "long_probability": 0.23,
+        "short_probability": 0.52,
+        "wait_probability": 0.25,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "HYPEUSDT",
+        "side": "short",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 65.0,
+        "take_profit_price": 54.0,
+        "risk_plan": {}
+      },
+      "stubs": {
+        "staged_take_profit": {
+          "stages": [{"name": "bb120_mid_15m", "fraction_of_initial": 0.25, "effective_fraction_of_initial": 0.25}],
+          "close_fraction": 0.25
+        }
+      }
+    },
+    {
+      "id": "opposite_probability_fallback",
+      "signal": {
+        "symbol": "BTCUSDT",
+        "computed_at": "2026-07-18T21:15:00+00:00",
+        "price": 64600.0,
+        "side_bias": "short",
+        "long_probability": 0.05,
+        "short_probability": 0.75,
+        "wait_probability": 0.2,
+        "model_quality_score": 0.83,
+        "reasons": [],
+        "h4": {},
+        "fifteen_m": {},
+        "one_m": {},
+        "mid_retest": {},
+        "levels": {}
+      },
+      "position": {
+        "symbol": "BTCUSDT",
+        "side": "long",
+        "notional_usdt": 1000.0,
+        "leverage": 8,
+        "stop_loss_price": 62000.0,
+        "take_profit_price": 70000.0,
+        "risk_plan": {}
+      },
+      "stubs": {"opposite_threshold": 0.62}
+    }
+  ]
+}

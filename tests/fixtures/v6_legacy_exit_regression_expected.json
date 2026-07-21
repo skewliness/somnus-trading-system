@@ -1,0 +1,65 @@
+{
+  "cases": [
+    {
+      "exit_price": 64000.0,
+      "exit_priority": 1000,
+      "exit_reason": "max hold days reached",
+      "id": "max_hold_precedes_stop",
+      "rule": "max_hold"
+    },
+    {
+      "exit_price": 65000.0,
+      "exit_priority": 1000,
+      "exit_reason": "short stop loss touched",
+      "id": "stop_precedes_daily_reversal",
+      "rule": "hard_stop"
+    },
+    {
+      "exit_price": 64800.0,
+      "exit_priority": 970,
+      "exit_reason": "short daily MA7 reversal",
+      "id": "daily_reversal_precedes_logic_weakening",
+      "rule": "daily_reversal"
+    },
+    {
+      "exit_price": 1800.0,
+      "exit_priority": 940,
+      "exit_reason": "long original 4H logic weakened",
+      "id": "logic_weakening_precedes_smart_signal",
+      "rule": "logic_weakening"
+    },
+    {
+      "exit_price": 1750.0,
+      "exit_priority": 950,
+      "exit_reason": "short smart-signal risk guard",
+      "id": "smart_signal_precedes_roi_take_profit",
+      "rule": "smart_signal"
+    },
+    {
+      "exit_price": 61.0,
+      "exit_priority": 930,
+      "exit_reason": "ROI long take profit threshold touched: roi_tp_25 roi=25.00% close_initial=0.30 close_remaining=0.3000",
+      "id": "roi_precedes_staged_take_profit",
+      "rule": "roi_take_profit"
+    },
+    {
+      "exit_price": 53.0,
+      "exit_priority": 920,
+      "exit_reason": "staged short take profit touched with current/delayed 15M volume confirmation: bb120_mid_15m close_initial=0.25 close_remaining=0.2500",
+      "id": "staged_precedes_fixed_take_profit",
+      "rule": "staged_take_profit"
+    },
+    {
+      "exit_price": 64600.0,
+      "exit_priority": 900,
+      "exit_reason": "opposite short probability threshold",
+      "id": "opposite_probability_fallback",
+      "rule": "opposite_probability"
+    }
+  ],
+  "fixture_sha256": "56dbe26a3cb428222c2cde545ef47027148154a8c54e6e24720a446f69bd202b",
+  "schema_version": 1,
+  "source_commit": "0aaaaa2dc014becf99ec711531b97d94b49f6c30",
+  "source_ref": "v6.0-baseline-20260721",
+  "source_sha256": "2f36b212d36b60267279a984a0c05d2fc3169f7a72730cf0e1066be373bcf40a"
+}
