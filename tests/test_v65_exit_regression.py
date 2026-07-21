@@ -53,3 +53,4 @@ def test_exit_regression_covers_required_priority_collisions() -> None:
         assert case["exit_reason"]
         assert case["exit_priority"] > 0
         assert case["exit_price"] > 0
+
