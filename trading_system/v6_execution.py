@@ -43,6 +43,7 @@ from trading_system.gate_registry import default_entry_gate_registry
 from trading_system.h4_structure import compute_h4_structure
 from trading_system.persistence import append_text_line, atomic_write_json, load_json, timed_file_lock
 from trading_system.redaction import redact_sensitive_text
+from trading_system.risk import RiskManager
 from trading_system.telegram_whale_features import (
     DEFAULT_BRIDGE_FILE as DEFAULT_TELEGRAM_WHALE_BRIDGE_FILE,
     TelegramWhaleBridgeReader,
@@ -2804,6 +2805,7 @@ class V6ExecutionEngine:
         self.telegram_whale_bridge = TelegramWhaleBridgeReader(self.config.telegram_whale_bridge_file)
         self.entry_gate_registry = default_entry_gate_registry()
         self.exit_manager = ExitManager(intent_factory=V6OrderIntent, utc_now=utc_now_iso)
+        self.risk_manager = RiskManager(utc_now=utc_now_iso)
         assert self.config.trade_events_file is not None
         self.event_writer = EventWriter(
             self.config.trade_events_file,
@@ -2816,6 +2818,13 @@ class V6ExecutionEngine:
 
     def close(self) -> None:
         self.client.close()
+
+    def risk_manager_instance(self) -> RiskManager:
+        manager = getattr(self, "risk_manager", None)
+        if manager is None:
+            manager = RiskManager(utc_now=utc_now_iso)
+            self.risk_manager = manager
+        return manager
 
     def execution_lock_target(self) -> Path:
         return Path(os.getenv("TS_V6_EXECUTION_LOCK_TARGET", str(self.config.state_dir / "v6_execution")))
@@ -6187,7 +6196,10 @@ class V6ExecutionEngine:
         state: dict[str, Any],
         positions: list[dict[str, Any]],
     ) -> V6OrderIntent | None:
-        at_position_capacity = len(self.active_positions(state)) >= self.config.max_positions
+        at_position_capacity = self.risk_manager_instance().at_position_capacity(
+            active_position_count=len(self.active_positions(state)),
+            max_positions=self.config.max_positions,
+        )
 
         if self.config.technical_entry_only_for(signal.symbol):
             return self.intent_for_technical_entry_signal(signal, state, positions)
@@ -6258,7 +6270,10 @@ class V6ExecutionEngine:
     ) -> V6OrderIntent | None:
         candidates: list[dict[str, Any]] = []
         last_block: dict[str, Any] | None = None
-        at_position_capacity = len(self.active_positions(state)) >= self.config.max_positions
+        at_position_capacity = self.risk_manager_instance().at_position_capacity(
+            active_position_count=len(self.active_positions(state)),
+            max_positions=self.config.max_positions,
+        )
         for action in ("open_short", "open_long"):
             side = "short" if action == "open_short" else "long"
             if self.entry_cooldown_active(state, signal.symbol, side):
@@ -8781,44 +8796,19 @@ class V6ExecutionEngine:
         prevents a known-zero or missing close from briefly removing protection.
         """
 
-        resolver = getattr(self.client, "resolve_close_quantity", None)
-        if not callable(resolver):
-            return {}
-        quantity = str(resolver(intent))
-        decision = (intent.risk_plan or {}).get("close_decision") or {}
-        return {
-            "quantity": quantity,
-            "decision": dict(decision) if isinstance(decision, dict) else {},
-            "checked_at": utc_now_iso(),
-        }
+        return self.risk_manager_instance().preflight_close_quantity(self.client, intent)
 
     @staticmethod
     def is_reduce_only_rejected_error(error_text: str) -> bool:
-        lowered = str(error_text or "").lower()
-        return '"code":-2022' in lowered or "reduceonly order is rejected" in lowered
+        return RiskManager.is_reduce_only_rejected_error(error_text)
 
     @staticmethod
     def is_percent_price_filter_error(error_text: str) -> bool:
-        lowered = str(error_text or "").lower()
-        return '"code":-4131' in lowered or "percent_price filter" in lowered
+        return RiskManager.is_percent_price_filter_error(error_text)
 
     @staticmethod
     def is_status_unknown_error(error_text: str) -> bool:
-        lowered = str(error_text or "").lower()
-        return (
-            '"code":-1007' in lowered
-            or '"code": -1007' in lowered
-            or "signed request failed 500" in lowered
-            or "signed request failed 502" in lowered
-            or "signed request failed 503" in lowered
-            or "signed request failed 504" in lowered
-            or "bad gateway" in lowered
-            or "gateway timeout" in lowered
-            or "service unavailable" in lowered
-            or "internal server error" in lowered
-            or "status unknown" in lowered
-            or "timeout waiting for response" in lowered
-        )
+        return RiskManager.is_status_unknown_error(error_text)
 
     def retry_percent_price_order_after_spike(
         self,
@@ -11424,7 +11414,11 @@ class V6ExecutionEngine:
         add_notional = max(5.0, base_notional * max(0.0, float(self.config.scale_in_notional_fraction)))
         current_notional = float(position.get("notional_usdt") or position.get("original_notional_usdt") or base_notional)
         max_total_notional = base_notional * max(1.0, float(self.config.scale_in_max_total_notional_multiplier))
-        if current_notional + add_notional > max_total_notional + 1e-9:
+        if not self.risk_manager_instance().scale_in_notional_allowed(
+            current_notional=current_notional,
+            add_notional=add_notional,
+            max_total_notional=max_total_notional,
+        ):
             return None
 
         stop, take_profit, risk_plan = self.stop_take_profit(signal, action)
@@ -12329,20 +12323,7 @@ class V6ExecutionEngine:
         return response.get("orderId") or response.get("clientOrderId") if isinstance(response, dict) else None
 
     def execution_account_metadata(self) -> dict[str, Any]:
-        raw_asset_mode = str(self.config.account_asset_mode or "SINGLE_ASSET").strip().upper().replace("-", "_")
-        asset_mode = "MULTI_ASSET" if raw_asset_mode in {"MULTI", "MULTI_ASSET", "MULTI_ASSETS"} else "SINGLE_ASSET"
-        margin_type = str(self.config.margin_type or "ISOLATED").strip().upper().replace("-", "_")
-        virtual_isolation = bool(self.config.virtual_risk_isolation_enabled)
-        return {
-            "instance_name": self.config.instance_name,
-            "account_asset_mode": asset_mode,
-            "exchange_margin_type": margin_type,
-            "exchange_margin_shared": margin_type == "CROSSED",
-            "local_isolation_mode": "virtual_subledger" if virtual_isolation else "exchange_native",
-            "virtual_risk_isolation_enabled": virtual_isolation,
-            "order_mode": self.config.order_mode,
-            "exit_control_mode": self.config.exit_control_mode,
-        }
+        return self.risk_manager_instance().execution_account_metadata(self.config)
 
     @staticmethod
     def local_risk_budget_from_values(
@@ -12354,23 +12335,14 @@ class V6ExecutionEngine:
         notional_usdt: float,
         leverage: int,
     ) -> dict[str, Any]:
-        entry = float(entry_price or 0.0)
-        stop = float(stop_loss_price or 0.0)
-        notional = max(0.0, float(notional_usdt or 0.0))
-        leverage = max(1, int(leverage or 1))
-        stop_distance_pct = abs(stop - entry) / entry if entry > 0 and stop > 0 else 0.0
-        return {
-            "action": action,
-            "side": side,
-            "notional_budget_usdt": round(notional, 8),
-            "initial_margin_budget_usdt": round(notional / leverage, 8),
-            "leverage": leverage,
-            "entry_price": round(entry, 8),
-            "stop_loss_price": round(stop, 8),
-            "stop_distance_pct": round(stop_distance_pct * 100.0, 8),
-            "planned_loss_at_stop_usdt": round(notional * stop_distance_pct, 8),
-            "calculation": "notional_budget_usdt * stop_distance_pct",
-        }
+        return RiskManager.local_risk_budget_from_values(
+            action=action,
+            side=side,
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            notional_usdt=notional_usdt,
+            leverage=leverage,
+        )
 
     @classmethod
     def local_risk_budget_for_intent(
@@ -12380,22 +12352,14 @@ class V6ExecutionEngine:
         entry_price: float | None = None,
         notional_usdt: float | None = None,
     ) -> dict[str, Any]:
-        return cls.local_risk_budget_from_values(
-            action=intent.action,
-            side="short" if intent.action in {"open_short", "close_short"} else "long",
-            entry_price=float(entry_price if entry_price is not None else intent.entry_price or 0.0),
-            stop_loss_price=float(intent.stop_loss_price or 0.0),
-            notional_usdt=float(notional_usdt if notional_usdt is not None else intent.quantity_hint_usdt or 0.0),
-            leverage=int(intent.leverage or 1),
+        return RiskManager.local_risk_budget_for_intent(
+            intent,
+            entry_price=entry_price,
+            notional_usdt=notional_usdt,
         )
 
     def annotate_intent_execution_risk(self, intent: V6OrderIntent) -> None:
-        risk_plan = dict(intent.risk_plan or {})
-        risk_plan["execution_account"] = self.execution_account_metadata()
-        risk_plan["exit_control_mode"] = self.config.exit_control_mode
-        if intent.action in {"open_long", "open_short"}:
-            risk_plan["local_risk_budget"] = self.local_risk_budget_for_intent(intent)
-        intent.risk_plan = risk_plan
+        self.risk_manager_instance().annotate_intent_execution_risk(self.config, intent)
 
     @staticmethod
     def compact_risk_plan_for_lot(risk_plan: dict[str, Any]) -> dict[str, Any]:
