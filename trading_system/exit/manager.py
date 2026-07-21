@@ -6,6 +6,7 @@ from typing import Any, Callable
 from trading_system.exit.models import ExitRuleFamily
 from trading_system.exit.resolver import resolve_exit_signals
 from trading_system.exit.rules import build_exit_signals, classify_exit_intent
+from trading_system.trading_context import TradingContext
 
 
 LEGACY_EXIT_SOURCE_SHA256 = "95b4d8c73f3857d0c8559348a704ea64a6cc5d54f9143af9a54a44c3d84ee9a7"
@@ -30,6 +31,25 @@ class ExitManager:
         *,
         state: dict[str, Any] | None = None,
     ) -> Any | None:
+        context_factory = getattr(engine, "trading_context", None)
+        context = (
+            context_factory(signal, position)
+            if callable(context_factory)
+            else TradingContext.from_signal(signal, config=engine.config, position=position)
+        )
+        return self.evaluate_context(engine, context, state=state)
+
+    def evaluate_context(
+        self,
+        engine: Any,
+        context: TradingContext,
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> Any | None:
+        signal = context.signal
+        if context.position is None:
+            raise TypeError("exit context requires a position")
+        position = context.position
         side = str(position.get("side") or "").lower()
         price = float(signal.price)
         stop_price = float(position.get("stop_loss_price") or 0.0)
