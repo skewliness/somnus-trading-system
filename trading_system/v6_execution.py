@@ -3651,7 +3651,9 @@ class V6ExecutionEngine:
                                 "error": error_text,
                                 "note": "Open action raised after/around submission; exchange position reconcile was run to prevent orphaned or duplicate local positions.",
                             })
-                self.client.reconcile_tracked_order_from_result(failed)
+                reconcile_tracked_order = getattr(self.client, "reconcile_tracked_order_from_result", None)
+                if callable(reconcile_tracked_order):
+                    reconcile_tracked_order(failed)
                 results.append(failed)
                 append_text_line(self.config.orders_file, json.dumps(failed, ensure_ascii=False))
         state["updated_at"] = utc_now_iso()
