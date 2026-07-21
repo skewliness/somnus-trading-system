@@ -176,15 +176,19 @@ def capture_case(v6: Any, fixture: dict[str, Any], case: dict[str, Any], root: P
 
 def capture_current(repo_root: Path, fixture: dict[str, Any], *, work_root: Path) -> dict[str, Any]:
     v6 = import_v6_execution(repo_root)
-    cases = []
-    for index, case in enumerate(fixture["cases"]):
-        cases.append(capture_case(v6, fixture, case, work_root / f"case-{index:02d}"))
-    return {
-        "schema_version": 1,
-        "fixture_sha256": fixture_sha256(fixture),
-        "source_sha256": source_sha256(repo_root),
-        "cases": cases,
-    }
+    original_utc_now_iso = v6.utc_now_iso
+    try:
+        cases = []
+        for index, case in enumerate(fixture["cases"]):
+            cases.append(capture_case(v6, fixture, case, work_root / f"case-{index:02d}"))
+        return {
+            "schema_version": 1,
+            "fixture_sha256": fixture_sha256(fixture),
+            "source_sha256": source_sha256(repo_root),
+            "cases": cases,
+        }
+    finally:
+        v6.utc_now_iso = original_utc_now_iso
 
 
 def parse_args() -> argparse.Namespace:
