@@ -1,4 +1,5 @@
 from scripts.xuejian_proactive_push import event_theme_fingerprint, format_geo_push_batch, geo_news_to_chinese
+from scripts import xuejian_proactive_push
 
 
 def test_format_geo_push_wraps_chinese_news_and_removes_raw_notice() -> None:
@@ -84,3 +85,40 @@ def test_event_theme_fingerprint_dedupes_same_geo_theme_across_symbols() -> None
     }
 
     assert event_theme_fingerprint(btc_item) == event_theme_fingerprint(fuel_item)
+
+
+def test_binance_session_alert_is_sent_once_and_resets_after_recovery(tmp_path, monkeypatch) -> None:
+    alert_file = tmp_path / "binance_session_alert.txt"
+    alert_file.write_text(
+        "\n".join(
+            [
+                "time=2026-07-19T00:00:00Z",
+                "mode=Binance API",
+                "detail=traders=48, ok_private=0, auth_required=48, error_private=0, new_operations=0, new_history=0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    sent: list[str] = []
+    monkeypatch.setattr(xuejian_proactive_push, "BINANCE_SESSION_ALERT_FILE", alert_file)
+    monkeypatch.setattr(xuejian_proactive_push, "send_telegram", lambda text, dry_run=False: sent.append(text))
+    monkeypatch.setattr(xuejian_proactive_push, "log", lambda _message: None)
+    state: dict[str, object] = {}
+
+    assert xuejian_proactive_push.maybe_send_binance_session_alert(state) is True
+    assert len(sent) == 1
+    assert "认证失效=48" in sent[0]
+    assert xuejian_proactive_push.maybe_send_binance_session_alert(state) is False
+    assert len(sent) == 1
+
+    alert_file.unlink()
+    assert xuejian_proactive_push.maybe_send_binance_session_alert(state) is False
+    assert state["binance_session_alert_active"] is False
+    assert state["last_binance_session_alert_fingerprint"] == ""
+
+    alert_file.write_text(
+        "time=2026-07-20T00:00:00Z\nmode=Binance API\ndetail=traders=48, auth_required=48, new_operations=0, new_history=0",
+        encoding="utf-8",
+    )
+    assert xuejian_proactive_push.maybe_send_binance_session_alert(state) is True
+    assert len(sent) == 2

@@ -47,8 +47,10 @@ V5_V6_EXECUTION_REPORT_FILE = ROOT / "data/trading_system/v5_v6_execution/latest
 V5_POSITION_MANAGEMENT_REPORT_FILE = ROOT / "data/trading_system/v5_v6_execution/latest_v5_position_management_report.json"
 V5_V6_EXECUTION_SUMMARY_FILE = ROOT / "data/trading_system/v5_v6_execution/latest_run_summary.json"
 V5_V6_EXECUTION_STATE_FILE = ROOT / "data/trading_system/v5_v6_execution/state.json"
-V6_PID_FILE = ROOT / "data/trading_system/v6_execution/v6_execution_loop.pid"
-V6_SUMMARY_FILE = ROOT / "data/trading_system/v6_execution/latest_run_summary.json"
+V6_PID_FILE = ROOT / os.getenv("TS_TELEGRAM_V6_PID_FILE", "data/trading_system/v6_execution/v6_execution_loop.pid")
+V6_SUMMARY_FILE = ROOT / os.getenv("TS_TELEGRAM_V6_SUMMARY_FILE", "data/trading_system/v6_execution/latest_run_summary.json")
+V6_DISPLAY_NAME = str(os.getenv("TS_TELEGRAM_V6_DISPLAY_NAME", "V6") or "V6").strip()
+V6_SKIP_DISTILL_ALERTS = str(os.getenv("TS_TELEGRAM_V6_SKIP_DISTILL_ALERTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
 V6_DISTILL_REPORT_FILE = ROOT / "data/trading_system/model_training/v6_continuous_distill/latest_v6_distill_report.json"
 V6_DISTILL_HEARTBEAT_FILE = ROOT / "data/trading_system/model_training/v6_continuous_distill/heartbeat.json"
 CHART_DIR = ROOT / "data/trading_system/telegram_monitor/charts"
@@ -4607,18 +4609,25 @@ def merge_exchange_position_with_local(row: dict[str, Any], local_by_symbol_side
     return merged
 
 
-def fetch_v6_exchange_positions(local_positions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+def fetch_v6_exchange_positions(
+    local_positions: list[dict[str, Any]],
+    *,
+    config: V6ExecutionConfig | None = None,
+    source: str = "binance_demo_positionRisk",
+) -> tuple[list[dict[str, Any]], str]:
     local_by_symbol_side = {
         (str(position.get("symbol") or "").upper(), infer_position_side(position)): position
         for position in local_positions
     }
-    client = V6BinanceClient(V6ExecutionConfig.from_env())
+    client = V6BinanceClient(config or V6ExecutionConfig.from_env())
     try:
         rows = client.actual_position_rows()
     finally:
         client.close()
     positions = [merge_exchange_position_with_local(row, local_by_symbol_side) for row in rows]
-    return positions, "binance_demo_positionRisk"
+    for position in positions:
+        position["exchange_source"] = source
+    return positions, source
 
 
 def v5_execution_config_from_env() -> V6ExecutionConfig:
@@ -4686,7 +4695,14 @@ def format_position_line(position: dict[str, Any]) -> str:
     )
 
 
-def build_position_response(target: str, status: dict[str, Any]) -> str:
+def build_position_response(
+    target: str,
+    status: dict[str, Any],
+    *,
+    v6_config: V6ExecutionConfig | None = None,
+    v6_title: str | None = None,
+    v6_exchange_source: str = "binance_demo_positionRisk",
+) -> str:
     if target == "v5":
         title = "[Somnus持仓] V5"
         local_positions = status.get("v5", {}).get("positions") or []
@@ -4697,10 +4713,14 @@ def build_position_response(target: str, status: dict[str, Any]) -> str:
             positions = local_positions
             source_note = f"来源=本地V5状态（交易所读取失败：{zh_error(exc)}）"
     else:
-        title = "[Somnus持仓] V6"
+        title = v6_title or "[Somnus持仓] V6"
         local_positions = status.get("v6", {}).get("positions") or []
         try:
-            positions, source = fetch_v6_exchange_positions(local_positions)
+            positions, source = fetch_v6_exchange_positions(
+                local_positions,
+                config=v6_config,
+                source=v6_exchange_source,
+            )
             source_note = f"来源={source}，回报率=按保证金"
         except Exception as exc:
             positions = local_positions
@@ -4748,6 +4768,15 @@ def zh_rationale(value: Any) -> str:
     return text
 
 
+def format_take_profit_for_intent(intent: dict[str, Any]) -> str:
+    risk_plan = intent.get("risk_plan") if isinstance(intent.get("risk_plan"), dict) else {}
+    manual_mode = str((risk_plan or {}).get("exit_control_mode") or "").strip().lower()
+    manual_env = str(os.getenv("TS_TELEGRAM_V6_MANUAL_TAKE_PROFIT", "0") or "0").strip().lower()
+    if manual_mode == "stop_only_manual_profit" or manual_env in {"1", "true", "yes", "on"}:
+        return "\u4eba\u5de5"
+    return format_price(intent.get("take_profit_price"))
+
+
 def format_execution_intent(intent: dict[str, Any], index: int) -> str:
     risk_plan = intent.get("risk_plan") or {}
     stage = ((risk_plan.get("partial_take_profit") or {}).get("stage") or {}) if isinstance(risk_plan, dict) else {}
@@ -4763,9 +4792,48 @@ def format_execution_intent(intent: dict[str, Any], index: int) -> str:
         f"方向={zh_value(intent.get('side'))} 数量={format_price(intent.get('quantity_hint_usdt'))}U "
         f"杠杆={intent.get('leverage', '--')}x reduceOnly={zh_value(str(bool(intent.get('reduce_only'))).lower())}\n"
         f"  开仓={format_price(intent.get('entry_price'))} 止损={format_price(intent.get('stop_loss_price'))} "
-        f"止盈={format_price(intent.get('take_profit_price'))}{stage_text}\n"
+        f"止盈={format_take_profit_for_intent(intent)}{stage_text}\n"
         f"  理由={compact_text(zh_rationale(intent.get('rationale')))}"
     )
+
+
+def close_decision_from_intent(intent: dict[str, Any]) -> dict[str, Any]:
+    risk_plan = intent.get("risk_plan")
+    if not isinstance(risk_plan, dict):
+        return {}
+    decision = risk_plan.get("close_decision")
+    return decision if isinstance(decision, dict) else {}
+
+
+def zh_close_mode(decision: dict[str, Any]) -> str:
+    mode = str(decision.get("mode") or "")
+    reason = str(decision.get("reason") or "")
+    if mode == "full_flatten":
+        return "粉尘全平" if "dust" in reason else "全平"
+    if mode == "partial":
+        return "部分平仓"
+    if mode == "skip_zero":
+        return "跳过(数量为零)"
+    if mode == "skip_missing_exchange_position":
+        return "跳过(交易所无持仓)"
+    return ""
+
+
+def execution_result_intent(result: dict[str, Any]) -> dict[str, Any]:
+    intent = result.get("intent")
+    return intent if isinstance(intent, dict) else {}
+
+
+def execution_result_response(result: dict[str, Any]) -> dict[str, Any]:
+    response = result.get("response")
+    return response if isinstance(response, dict) else {}
+
+
+def execution_result_identity(result: dict[str, Any]) -> tuple[str, str]:
+    intent = execution_result_intent(result)
+    symbol = str(result.get("symbol") or intent.get("symbol") or "").upper()
+    action = str(result.get("action") or intent.get("action") or "").lower()
+    return symbol, action
 
 
 def format_compact_execution_intent(intent: dict[str, Any]) -> str:
@@ -4780,19 +4848,46 @@ def format_compact_execution_intent(intent: dict[str, Any]) -> str:
             f"{icon} {symbol} {action} "
             f"开仓={format_price(intent.get('entry_price'))} "
             f"止损={format_price(intent.get('stop_loss_price'))} "
-            f"止盈={format_price(intent.get('take_profit_price'))} "
+            f"止盈={format_take_profit_for_intent(intent)} "
             f"理由={rationale}"
         )
+    if action_key in {"close_long", "close_short"}:
+        mode_text = zh_close_mode(close_decision_from_intent(intent))
+        mode_part = f" 模式={mode_text}" if mode_text else ""
+        return f"{icon} {symbol} {action}{mode_part} 数量={quantity}U 理由={rationale}"
     return f"{icon} {symbol} {action} 数量={quantity}U 理由={rationale}"
 
 
 def format_execution_result(result: dict[str, Any], index: int) -> str:
     status = result.get("status") or result.get("submit_status") or "--"
-    symbol = str(result.get("symbol") or result.get("orig_symbol") or "--").upper()
-    action = zh_action(result.get("action"))
-    order_id = result.get("order_id") or result.get("client_order_id") or result.get("protective_stop_order_id") or "--"
-    executed_qty = result.get("executed_qty") or result.get("origQty") or result.get("quantity") or "--"
-    avg_price = result.get("avg_price") or result.get("avgPrice") or result.get("price") or "--"
+    intent = execution_result_intent(result)
+    response = execution_result_response(result)
+    symbol = str(result.get("symbol") or result.get("orig_symbol") or intent.get("symbol") or "--").upper()
+    action = zh_action(result.get("action") or intent.get("action"))
+    order_id = (
+        result.get("order_id")
+        or result.get("client_order_id")
+        or result.get("protective_stop_order_id")
+        or response.get("orderId")
+        or response.get("clientOrderId")
+        or "--"
+    )
+    executed_qty = (
+        result.get("executed_qty")
+        or result.get("origQty")
+        or result.get("quantity")
+        or response.get("executedQty")
+        or response.get("origQty")
+        or "--"
+    )
+    avg_price = (
+        result.get("avg_price")
+        or result.get("avgPrice")
+        or result.get("price")
+        or response.get("avgPrice")
+        or response.get("price")
+        or "--"
+    )
     error = result.get("error") or result.get("message") or result.get("msg") or ""
     base = (
         f"结果{index}: {symbol} {action} 状态={zh_value(status)} "
@@ -4805,9 +4900,31 @@ def format_execution_result(result: dict[str, Any], index: int) -> str:
 
 def format_compact_execution_result(result: dict[str, Any]) -> str:
     status = result.get("status") or result.get("submit_status") or "--"
-    order_id = result.get("order_id") or result.get("client_order_id") or result.get("protective_stop_order_id") or ""
-    executed_qty = result.get("executed_qty") or result.get("origQty") or result.get("quantity") or ""
-    avg_price = result.get("avg_price") or result.get("avgPrice") or result.get("price") or ""
+    response = execution_result_response(result)
+    order_id = (
+        result.get("order_id")
+        or result.get("client_order_id")
+        or result.get("protective_stop_order_id")
+        or response.get("orderId")
+        or response.get("clientOrderId")
+        or ""
+    )
+    executed_qty = (
+        result.get("executed_qty")
+        or result.get("origQty")
+        or result.get("quantity")
+        or response.get("executedQty")
+        or response.get("origQty")
+        or ""
+    )
+    avg_price = (
+        result.get("avg_price")
+        or result.get("avgPrice")
+        or result.get("price")
+        or response.get("avgPrice")
+        or response.get("price")
+        or ""
+    )
     error = result.get("error") or result.get("message") or result.get("msg") or ""
     parts: list[str] = []
     fill = compact_fill_text(executed_qty, avg_price)
@@ -4830,8 +4947,7 @@ def pair_execution_intents_results(
     for result in results:
         if not isinstance(result, dict):
             continue
-        symbol = str(result.get("symbol") or "").upper()
-        action = str(result.get("action") or "").lower()
+        symbol, action = execution_result_identity(result)
         if symbol and action:
             result_queues.setdefault((symbol, action), []).append(result)
         else:
@@ -4856,17 +4972,18 @@ def pair_execution_intents_results(
 def format_v6_activity_details(v6: dict[str, Any]) -> str:
     intents = v6.get("intents") or []
     results = v6.get("results") or []
-    lines = ["☎️ [Somnus执行] V6"]
-    if intents:
-        for idx, intent in enumerate(intents[:5]):
-            line = format_compact_execution_intent(intent)
-            if idx < len(results):
-                line += f"\n{format_compact_execution_result(results[idx])}"
-            lines.append(line)
+    lines = [f"☎️ [Somnus执行] {V6_DISPLAY_NAME}"]
+    if intents or results:
+        for intent, result in pair_execution_intents_results(intents, results)[:5]:
+            if intent:
+                line = format_compact_execution_intent(intent)
+                if result:
+                    line += f"\n{format_compact_execution_result(result)}"
+                lines.append(line)
+            elif result:
+                lines.append(format_compact_execution_result(result))
     else:
         lines.append("下单意图=无")
-        if results:
-            lines.extend(format_compact_execution_result(result) for result in results[:5])
     return "\n".join(lines)
 
 
@@ -4963,11 +5080,21 @@ def format_v5_trade_activity_details(v5: dict[str, Any]) -> str:
     return "\n".join(["☎️ [Somnus执行] V5", *body])
 
 
-def build_chart_image(symbol: str, interval: str, focus_period: int | None = None) -> dict[str, Any]:
+def build_chart_image(
+    symbol: str,
+    interval: str,
+    focus_period: int | None = None,
+    *,
+    execution_scope: str = "default",
+    account_label: str = "",
+) -> dict[str, Any]:
     if not CHART_RENDER_SCRIPT.exists():
         raise RuntimeError(f"图表渲染脚本不存在：{CHART_RENDER_SCRIPT}")
     focus = focus_period if focus_period and focus_period > 0 else None
     suffix = f"bb{focus}" if focus else "kline"
+    if execution_scope == "live":
+        safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "-", account_label).strip("-").lower() or "live"
+        suffix = f"{suffix}_{safe_label}"
     output = CHART_DIR / f"{symbol.lower()}_{interval}_{suffix}_{int(time.time())}.png"
     command = [
         sys.executable,
@@ -4981,6 +5108,10 @@ def build_chart_image(symbol: str, interval: str, focus_period: int | None = Non
     ]
     if focus:
         command.extend(["--focus-period", str(focus)])
+    if execution_scope == "live":
+        command.extend(["--execution-scope", "live"])
+        if account_label:
+            command.extend(["--account-label", account_label])
     result = subprocess.run(
         command,
         cwd=str(ROOT),
@@ -5011,21 +5142,29 @@ def format_chart_caption(payload: dict[str, Any]) -> str:
     symbol = str(payload.get("symbol") or "").upper()
     interval = str(payload.get("interval") or "").upper()
     focus_period = payload.get("focus_period")
+    execution_scope = str(payload.get("execution_scope") or "default").lower()
+    account_label = str(payload.get("account_label") or "").strip()
+    scope_title = ""
+    if execution_scope == "live":
+        scope_title = f" · V6 LIVE {account_label}" if account_label else " · V6 LIVE"
     title = f"{symbol} {interval} BB{focus_period}" if focus_period else f"{symbol} {interval}"
+    title += scope_title
     lines = [
         f"[Somnus图表] {title}",
         f"价格={format_price(payload.get('price'))} K线数={payload.get('bars', '--')}｜K线来源={payload.get('kline_source') or 'Binance实时刷新'}",
     ]
     signal = payload.get("v6") or {}
     if signal:
+        analysis_title = "V6 LIVE" if execution_scope == "live" else "V6"
         lines.append(
-            f"V6={zh_value(signal.get('side_bias'))} "
+            f"{analysis_title}={zh_value(signal.get('side_bias'))} "
             f"多={number(float(signal.get('long_probability') or 0) * 100, 2)}% "
             f"空={number(float(signal.get('short_probability') or 0) * 100, 2)}% "
             f"等待={number(float(signal.get('wait_probability') or 0) * 100, 2)}%"
         )
     else:
-        lines.append("V6=暂无该币最新分析")
+        analysis_title = "V6 LIVE" if execution_scope == "live" else "V6"
+        lines.append(f"{analysis_title}=暂无该币最新分析")
     return "\n".join(lines)
 
 
@@ -5058,6 +5197,10 @@ def build_command_response(text: str) -> str:
 
 
 def handle_telegram_commands(args: argparse.Namespace, client: TelegramClient, state: dict[str, Any]) -> int:
+    # V5/V6 bots are push-only. Interactive commands belong to Hermes/Xuejian,
+    # and this code-level boundary must hold even if launch arguments drift.
+    if str(args.scope or "").strip().lower() in {"v5", "v6"}:
+        return 0
     if args.disable_commands:
         return 0
     if args.dry_run:
@@ -5266,6 +5409,56 @@ def summary_dedupe_digest(message: str, scope: str) -> str:
     })
 
 
+def execution_error_code(error: Any) -> str:
+    text = str(error or "")
+    for pattern in (
+        r'"code"\s*:\s*(-?\d+)',
+        r"\bcode\s*(?:[=:]\s*)?(-?\d+)",
+        r"(?<!\d)(-\d{3,6})(?!\d)",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return type(error).__name__ if error else ""
+
+
+def stable_execution_intent(intent: Any) -> dict[str, Any]:
+    item = intent if isinstance(intent, dict) else {}
+    risk_plan = item.get("risk_plan") if isinstance(item.get("risk_plan"), dict) else {}
+    close_decision = risk_plan.get("close_decision") if isinstance(risk_plan.get("close_decision"), dict) else {}
+    return {
+        "symbol": str(item.get("symbol") or "").upper(),
+        "action": str(item.get("action") or "").lower(),
+        "side": str(item.get("side") or "").upper(),
+        "target_name": str(item.get("target_name") or ""),
+        "close_fraction": item.get("close_fraction"),
+        "entry_price": item.get("entry_price"),
+        "quantity_hint_usdt": item.get("quantity_hint_usdt"),
+        "close_mode": close_decision.get("mode"),
+        "close_reason": close_decision.get("reason"),
+    }
+
+
+def stable_execution_result(result: Any) -> dict[str, Any]:
+    item = result if isinstance(result, dict) else {}
+    intent = item.get("intent") if isinstance(item.get("intent"), dict) else item
+    response = item.get("response") if isinstance(item.get("response"), dict) else {}
+    return {
+        "status": str(item.get("status") or item.get("submit_status") or "").lower(),
+        "intent": stable_execution_intent(intent),
+        "order_id": item.get("order_id") or item.get("client_order_id") or response.get("orderId") or response.get("clientOrderId"),
+        "error_code": execution_error_code(item.get("error")),
+    }
+
+
+def stable_v6_activity_fingerprint(v6: dict[str, Any]) -> dict[str, Any]:
+    """Build an activity identity that excludes timestamps and volatile text."""
+    return {
+        "intents": [stable_execution_intent(item) for item in v6.get("intents") or []],
+        "results": [stable_execution_result(item) for item in v6.get("results") or []],
+    }
+
+
 def build_alerts(status: dict[str, Any], scope: str = "all") -> list[tuple[str, str]]:
     alerts: list[tuple[str, str]] = []
     v5 = status["v5"]
@@ -5300,21 +5493,21 @@ def build_alerts(status: dict[str, Any], scope: str = "all") -> list[tuple[str, 
 
     if scope_enabled(scope, "v6"):
         if not v6["running"]:
-            alerts.append(("v6_down", "[Somnus告警] V6执行循环已停止"))
+            alerts.append(("v6_down", f"[Somnus告警] {V6_DISPLAY_NAME}执行循环已停止"))
         v6_distill_activity_age = v6.get("distill_activity_age")
-        if not v6.get("distill_running") and (
+        if not V6_SKIP_DISTILL_ALERTS and not v6.get("distill_running") and (
             v6_distill_activity_age is None or v6_distill_activity_age > thresholds["v6_distill_stale_seconds"]
         ):
             alerts.append(("v6_distill_down", "[Somnus告警] V6蒸馏/训练循环已停止"))
         if (v6.get("summary_age") or 0) > thresholds["v6_stale_seconds"]:
-            alerts.append(("v6_stale", f"[Somnus告警] V6执行摘要已过期：延迟={format_age(v6.get('summary_age'))}"))
-        if (v6.get("distill_age") or 0) > thresholds["v6_distill_stale_seconds"] and (
+            alerts.append(("v6_stale", f"[Somnus告警] {V6_DISPLAY_NAME}执行摘要已过期：延迟={format_age(v6.get('summary_age'))}"))
+        if not V6_SKIP_DISTILL_ALERTS and (v6.get("distill_age") or 0) > thresholds["v6_distill_stale_seconds"] and (
             v6_distill_activity_age is None or v6_distill_activity_age > thresholds["v6_distill_stale_seconds"]
         ):
             alerts.append(("v6_distill_stale", f"[Somnus告警] V6蒸馏报告/心跳已过期：报告延迟={format_age(v6.get('distill_age'))} 活动延迟={format_age(v6_distill_activity_age)}"))
 
         if v6.get("intent_count", 0) > 0 or v6.get("result_count", 0) > 0:
-            key = "v6_activity_" + short_hash({"intents": v6.get("intents"), "results": v6.get("results")})
+            key = "v6_activity_" + short_hash(stable_v6_activity_fingerprint(v6))
             alerts.append((key, format_v6_activity_details(v6)))
 
     return alerts

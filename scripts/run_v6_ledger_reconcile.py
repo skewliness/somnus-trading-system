@@ -55,7 +55,7 @@ def v6_execution_lock_context(config: V6ExecutionConfig):
     lock_target = Path(os.getenv("TS_V6_EXECUTION_LOCK_TARGET", str(config.state_dir / "v6_execution")))
     return timed_file_lock(
         lock_target,
-        timeout_seconds=float(os.getenv("TS_V6_LEDGER_EXECUTION_LOCK_TIMEOUT_SECONDS", "5")),
+        timeout_seconds=float(os.getenv("TS_V6_LEDGER_EXECUTION_LOCK_TIMEOUT_SECONDS", "45")),
         poll_seconds=float(os.getenv("TS_V6_EXECUTION_LOCK_POLL_SECONDS", "0.25")),
     )
 
@@ -185,9 +185,9 @@ def run_reconcile(*, check_only: bool, tolerance: float) -> dict[str, Any]:
             append_text_line(history_file, json.dumps(report, ensure_ascii=False))
             return report
 
-        exchange_rows_before = engine.client.actual_position_rows()
-        exchange_before = summarize_exchange_rows(exchange_rows_before, engine.client)
         with v6_execution_lock_context(config):
+            exchange_rows_before = engine.client.actual_position_rows()
+            exchange_before = summarize_exchange_rows(exchange_rows_before, engine.client)
             with file_lock(config.state_file):
                 state = normalize_state(load_json(config.state_file, default={}, lock=False))
                 local_before = summarize_local_positions(state, engine)

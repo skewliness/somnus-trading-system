@@ -323,6 +323,14 @@ class CoinFeatures:
     short_1m_upper_pressure_max: float = 0.5
     short_15m_bb96_position: float = 0.5
 
+    # === Telegram Hyperdash liquidation flow (bounded auxiliary features) ===
+    telegram_whale_actual_score_60m: float = 0.0
+    telegram_whale_imminent_score_60m: float = 0.0
+    telegram_whale_combined_score_60m: float = 0.0
+    telegram_whale_combined_score_24h: float = 0.0
+    telegram_whale_activity_score_24h: float = 0.0
+    telegram_whale_freshness_score: float = 0.0
+
     def to_feature_vector(self) -> list[float]:
         """转换为模型输入向量"""
         return [
@@ -415,6 +423,13 @@ class CoinFeatures:
             self.short_4h_mid_retest_distance_min_pct,
             self.short_1m_upper_pressure_max,
             self.short_15m_bb96_position,
+            # Telegram Hyperdash liquidation flow
+            self.telegram_whale_actual_score_60m,
+            self.telegram_whale_imminent_score_60m,
+            self.telegram_whale_combined_score_60m,
+            self.telegram_whale_combined_score_24h,
+            self.telegram_whale_activity_score_24h,
+            self.telegram_whale_freshness_score,
         ]
 
     @staticmethod
@@ -457,6 +472,10 @@ class CoinFeatures:
             "bb105_mid_4h_distance_pct", "bb672_mid_4h_distance_pct", "bb1440_mid_4h_distance_pct",
             "bb105_upper_1m_distance_pct", "bb300_upper_1m_distance_pct", "bb96_upper_15m_distance_pct",
             "short_4h_mid_retest_distance_min_pct", "short_1m_upper_pressure_max", "short_15m_bb96_position",
+            # Telegram Hyperdash liquidation flow
+            "telegram_whale_actual_score_60m", "telegram_whale_imminent_score_60m",
+            "telegram_whale_combined_score_60m", "telegram_whale_combined_score_24h",
+            "telegram_whale_activity_score_24h", "telegram_whale_freshness_score",
         ]
 
 
@@ -703,6 +722,26 @@ class CoinScoutModel:
         self.feature_engine = FeatureEngine()
         self.is_trained = False
 
+    def _compatible_model_input(self, features: CoinFeatures) -> np.ndarray:
+        values = [float(value) for value in features.to_feature_vector()]
+        expected = getattr(self.model, "n_features_in_", None)
+        if expected is None:
+            num_feature = getattr(self.model, "num_feature", None)
+            if callable(num_feature):
+                try:
+                    expected = int(num_feature())
+                except (TypeError, ValueError):
+                    expected = None
+        try:
+            expected_count = int(expected) if expected is not None else len(values)
+        except (TypeError, ValueError):
+            expected_count = len(values)
+        if expected_count < len(values):
+            values = values[:expected_count]
+        elif expected_count > len(values):
+            values.extend([0.0] * (expected_count - len(values)))
+        return np.asarray([values], dtype=float)
+
     def train(
         self,
         features_list: list[CoinFeatures],
@@ -719,10 +758,21 @@ class CoinScoutModel:
         feature_names = CoinFeatures.feature_names()
         all_labels = sorted(int(label) for label in np.unique(y))
 
-        # 时间序列 split
-        split_idx = int(len(X) * (1 - validation_ratio))
-        X_train, X_val = X[:split_idx], X[split_idx:]
-        y_train, y_val = y[:split_idx], y[split_idx:]
+        if not 0.0 <= validation_ratio < 1.0:
+            raise ValueError("validation_ratio must be in [0, 1)")
+
+        # Ablation/replay callers already own the out-of-sample split. A zero
+        # ratio means fit every supplied row instead of silently dropping the
+        # newest 20% into a second internal validation set.
+        has_validation = validation_ratio > 0.0
+        if has_validation:
+            split_idx = int(len(X) * (1 - validation_ratio))
+            X_train, X_val = X[:split_idx], X[split_idx:]
+            y_train, y_val = y[:split_idx], y[split_idx:]
+        else:
+            X_train, y_train = X, y
+            X_val = np.empty((0, X.shape[1]), dtype=X.dtype)
+            y_val = np.empty((0,), dtype=y.dtype)
 
         # 处理类别不平衡
         unique, counts = np.unique(y_train, return_counts=True)
@@ -737,7 +787,11 @@ class CoinScoutModel:
             import lightgbm as lgb
 
             train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
-            val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_names, reference=train_data)
+            val_data = (
+                lgb.Dataset(X_val, label=y_val, feature_name=feature_names, reference=train_data)
+                if has_validation
+                else None
+            )
 
             params = {
                 'objective': 'binary' if len(all_labels) == 2 and set(all_labels) <= {0, 1} else 'multiclass',
@@ -758,15 +812,23 @@ class CoinScoutModel:
             if params["objective"] == "multiclass":
                 params["num_class"] = len(all_labels)
 
-            self.model = lgb.train(
-                params, train_data, valid_sets=[val_data],
-                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
-            )
-            raw_pred = self.model.predict(X_val)
-            if params["objective"] == "binary":
-                y_pred = (np.asarray(raw_pred) >= 0.5).astype(int)
+            if has_validation:
+                self.model = lgb.train(
+                    params, train_data, valid_sets=[val_data],
+                    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+                )
+                raw_pred = self.model.predict(X_val)
+                if params["objective"] == "binary":
+                    y_pred = (np.asarray(raw_pred) >= 0.5).astype(int)
+                else:
+                    y_pred = np.argmax(raw_pred, axis=1)
             else:
-                y_pred = np.argmax(raw_pred, axis=1)
+                self.model = lgb.train(
+                    params,
+                    train_data,
+                    callbacks=[lgb.log_evaluation(0)],
+                )
+                y_pred = np.asarray([], dtype=int)
             importance = dict(zip(feature_names, self.model.feature_importance().tolist()))
             model_path = self.model_dir / "coin_scout_model.txt"
             self.model.save_model(str(model_path))
@@ -781,7 +843,7 @@ class CoinScoutModel:
                 subsample=0.85, min_samples_leaf=3, random_state=42,
             )
             self.model.fit(X_train, y_train)
-            y_pred = self.model.predict(X_val)
+            y_pred = self.model.predict(X_val) if has_validation else np.asarray([], dtype=int)
             importance = dict(zip(feature_names, self.model.feature_importances_.tolist()))
 
             import pickle
@@ -790,15 +852,18 @@ class CoinScoutModel:
                 pickle.dump(self.model, fh)
 
         # 评估（labels 参数确保即使 val 中缺少某些类别也不报错）
-        present_labels = sorted(set(y_val) | set(y_pred))
-        target_names = [CoinLabel.label_name(int(label)) for label in present_labels]
-        report = classification_report(
-            y_val, y_pred,
-            labels=present_labels,
-            target_names=target_names,
-            output_dict=True,
-            zero_division=0,
-        )
+        if has_validation:
+            present_labels = sorted(set(y_val) | set(y_pred))
+            target_names = [CoinLabel.label_name(int(label)) for label in present_labels]
+            report = classification_report(
+                y_val, y_pred,
+                labels=present_labels,
+                target_names=target_names,
+                output_dict=True,
+                zero_division=0,
+            )
+        else:
+            report = {}
 
         self.is_trained = True
 
@@ -818,7 +883,7 @@ class CoinScoutModel:
             return {"status": "error", "message": "model not trained"}
 
         try:
-            X = np.array([features.to_feature_vector()])
+            X = self._compatible_model_input(features)
 
             # 判断模型类型并做预测
             model_type = type(self.model).__name__

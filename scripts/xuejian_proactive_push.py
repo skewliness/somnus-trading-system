@@ -4,6 +4,7 @@
 Responsibilities:
 - Push major geopolitical events from OpenNews WSS bridge.
 - Push BTC/ETH macro report once per day at 09:00 Beijing time.
+- Notify when the 12-hour V6 distill cycle detects an expired Binance login.
 
 This script only reads Somnus intelligence files and sends Telegram messages
 through Xuejian's bot token. It does not submit orders or mutate V5/V6 ledgers.
@@ -33,6 +34,7 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/Users/ma7/.hermes"))
 BRIDGE_FILE = ROOT / "data/trading_system/skill_bridges/opennews_wss.json"
 STATE_FILE = ROOT / "data/trading_system/hermes_intel/xuejian_proactive_push_state.json"
 LOG_FILE = ROOT / "data/trading_system/logs/xuejian_proactive_push.log"
+BINANCE_SESSION_ALERT_FILE = ROOT / "data/trading_system/model_training/v6_continuous_distill/binance_session_alert.txt"
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 GEO_EVENT_FINGERPRINT_TTL_SECONDS = int(os.environ.get("XUEJIAN_GEO_DEDUPE_TTL_SECONDS", str(6 * 3600)))
 
@@ -122,6 +124,8 @@ def load_state() -> dict[str, Any]:
             "sent_geo_event_keys": [],
             "sent_geo_event_fingerprints": [],
             "last_macro_beijing_date": "",
+            "last_binance_session_alert_fingerprint": "",
+            "binance_session_alert_active": False,
         }
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -131,6 +135,8 @@ def load_state() -> dict[str, Any]:
             "sent_geo_event_keys": [],
             "sent_geo_event_fingerprints": [],
             "last_macro_beijing_date": "",
+            "last_binance_session_alert_fingerprint": "",
+            "binance_session_alert_active": False,
         }
 
 
@@ -356,6 +362,82 @@ def load_wss_signals() -> list[dict[str, Any]]:
     return [item for item in signals if isinstance(item, dict)]
 
 
+def load_binance_session_alert(path: Path | None = None) -> dict[str, str] | None:
+    path = path or BINANCE_SESSION_ALERT_FILE
+    if not path.exists():
+        return None
+    try:
+        raw_text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as exc:
+        log(f"binance_session_alert_read_error={type(exc).__name__}: {str(exc)[:160]}")
+        return None
+    if not raw_text:
+        return None
+    alert: dict[str, str] = {"raw_text": raw_text}
+    for raw_line in raw_text.splitlines():
+        if "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        alert[key.strip()] = value.strip()
+    return alert
+
+
+def binance_session_alert_fingerprint(alert: dict[str, str]) -> str:
+    return hashlib.sha1(str(alert.get("raw_text") or "").encode("utf-8")).hexdigest()
+
+
+def alert_detail_counter(detail: str, key: str) -> str:
+    match = re.search(rf"(?:^|[ ,]){re.escape(key)}=(\d+)", detail)
+    return match.group(1) if match else "--"
+
+
+def format_binance_session_alert(alert: dict[str, str]) -> str:
+    detail = str(alert.get("detail") or "")
+    return "\n".join(
+        [
+            "🔐【Binance 登录状态异常】",
+            "V6 本轮 12 小时蒸馏无法读取 Binance 私有聪明钱数据。",
+            "",
+            f"检查时间={alert.get('time') or '--'}",
+            f"模式={alert.get('mode') or '--'}",
+            (
+                f"交易员={alert_detail_counter(detail, 'traders')}｜"
+                f"认证失效={alert_detail_counter(detail, 'auth_required')}｜"
+                f"新增操作={alert_detail_counter(detail, 'new_operations')}｜"
+                f"新增持仓历史={alert_detail_counter(detail, 'new_history')}"
+            ),
+            "",
+            "请重新登录 Binance 并更新抓取登录态。Hyper 采集和训练仍会继续，但 Binance 数据会停留在旧快照。",
+        ]
+    )
+
+
+def maybe_send_binance_session_alert(state: dict[str, Any], *, dry_run: bool = False) -> bool:
+    alert = load_binance_session_alert()
+    if alert is None:
+        if not dry_run and state.get("binance_session_alert_active"):
+            state["binance_session_alert_active"] = False
+            state["last_binance_session_alert_fingerprint"] = ""
+        return False
+
+    # The distill loop refreshes this file every failed 12-hour cycle. Treat
+    # consecutive failures as one outage and notify again only after recovery.
+    if state.get("binance_session_alert_active"):
+        return False
+
+    fingerprint = binance_session_alert_fingerprint(alert)
+    if fingerprint == str(state.get("last_binance_session_alert_fingerprint") or ""):
+        return False
+
+    send_telegram(format_binance_session_alert(alert), dry_run=dry_run)
+    if not dry_run:
+        state["last_binance_session_alert_fingerprint"] = fingerprint
+        state["binance_session_alert_active"] = True
+        state["last_binance_session_alert_sent_at"] = utc_now().isoformat()
+    log(f"sent_binance_session_alert mode={alert.get('mode') or '--'} dry_run={dry_run}")
+    return True
+
+
 def send_telegram(text: str, *, dry_run: bool = False) -> None:
     token, chat_id = load_telegram_config()
     if dry_run:
@@ -491,12 +573,21 @@ def maybe_send_daily_macro(state: dict[str, Any], *, dry_run: bool = False, forc
 
 def run_once(args: argparse.Namespace) -> int:
     state = load_state()
+    binance_alert_sent = maybe_send_binance_session_alert(state, dry_run=args.dry_run)
+    if binance_alert_sent and not args.dry_run:
+        save_state(state)
     geo_count = process_geo_events(state, dry_run=args.dry_run, max_age_minutes=args.geo_max_age_minutes)
     macro_sent = maybe_send_daily_macro(state, dry_run=args.dry_run, force=args.force_macro)
     if not args.dry_run:
         save_state(state)
     if args.dry_run:
-        print(json.dumps({"geo_sent": geo_count, "macro_sent": macro_sent}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {"binance_alert_sent": binance_alert_sent, "geo_sent": geo_count, "macro_sent": macro_sent},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     return 0
 
 

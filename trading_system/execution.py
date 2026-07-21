@@ -3092,7 +3092,7 @@ class PaperExecutionEngine:
             self._has_repeated_signal_4h_support(snapshot)
             and self._has_retest_signal_marker(snapshot)
             and (snapshot.price_position_7d is None or snapshot.price_position_7d >= self.config.retest_add_min_price_position)
-            and (snapshot.breakout_distance_7d is None or snapshot.breakout_distance_7d <= self.config.repeated_signal_4h_max_breakout_distance)
+            and (snapshot.breakout_distance_7d is None or snapshot.breakout_distance_7d <= self.config.retest_add_max_breakout_distance)
         )
 
     def _has_first_signal_source_support(self, snapshot: MarketSnapshot) -> bool:

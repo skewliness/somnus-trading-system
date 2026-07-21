@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import scripts.telegram_monitor_v5_v6 as tg
 from scripts.telegram_monitor_v5_v6 import (
@@ -92,6 +93,52 @@ def test_v5_v6_execution_titles_use_phone_emoji() -> None:
             ]
         }
     ).splitlines()[0] == "☎️ [Somnus执行] V5"
+
+
+def test_v6_activity_pairs_results_by_symbol_and_action_not_list_index() -> None:
+    intents = [
+        {"symbol": "BTCUSDT", "action": "open_long", "risk_plan": {}, "rationale": "btc"},
+        {"symbol": "ETHUSDT", "action": "open_short", "risk_plan": {}, "rationale": "eth"},
+    ]
+    results = [
+        {"symbol": "ETHUSDT", "action": "open_short", "status": "submitted", "order_id": "eth-order"},
+        {"symbol": "BTCUSDT", "action": "open_long", "status": "submitted", "order_id": "btc-order"},
+    ]
+
+    message = format_v6_activity_details({"intents": intents, "results": results})
+    lines = message.splitlines()
+
+    assert "BTCUSDT" in lines[1]
+    assert "btc-order" in lines[2]
+    assert "ETHUSDT" in lines[3]
+    assert "eth-order" in lines[4]
+
+
+def test_v6_activity_pairs_real_nested_execution_results_and_shows_fill() -> None:
+    intents = [
+        {"symbol": "BTCUSDT", "action": "open_long", "risk_plan": {}, "rationale": "btc"},
+        {"symbol": "ETHUSDT", "action": "open_short", "risk_plan": {}, "rationale": "eth"},
+    ]
+    results = [
+        {
+            "status": "submitted",
+            "intent": {"symbol": "ETHUSDT", "action": "open_short"},
+            "response": {"orderId": "eth-order", "executedQty": "0.25", "avgPrice": "2000"},
+        },
+        {
+            "status": "submitted",
+            "intent": {"symbol": "BTCUSDT", "action": "open_long"},
+            "response": {"orderId": "btc-order", "executedQty": "0.01", "avgPrice": "65000"},
+        },
+    ]
+
+    message = format_v6_activity_details({"intents": intents, "results": results})
+    lines = message.splitlines()
+
+    assert "BTCUSDT" in lines[1]
+    assert lines[2] == "成交=0.01@65000.00 订单=btc-order 执行=✅"
+    assert "ETHUSDT" in lines[3]
+    assert lines[4] == "成交=0.25@2000.00 订单=eth-order 执行=✅"
 
 
 def test_report_position_line_outputs_only_plain_pnl_ratio_not_source_or_amount() -> None:
@@ -224,3 +271,13 @@ def test_fetch_command_klines_refreshes_api_instead_of_command_cache(monkeypatch
 
     assert rows == fresh_rows
     assert calls and calls[0]["force_refresh"] is True
+
+
+def test_v5_v6_bots_are_push_only_even_when_command_flag_is_enabled() -> None:
+    class PushOnlyClient:
+        def get_updates(self, *args, **kwargs):
+            raise AssertionError("V5/V6 bot must not poll interactive Telegram updates")
+
+    for scope in ("v5", "v6"):
+        args = SimpleNamespace(scope=scope, disable_commands=False, dry_run=False)
+        assert tg.handle_telegram_commands(args, PushOnlyClient(), {}) == 0

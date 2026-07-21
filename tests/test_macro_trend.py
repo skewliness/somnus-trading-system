@@ -7,16 +7,21 @@ from trading_system.persistence import atomic_write_json
 
 
 class FakeClient:
-    def __init__(self, btc_closes=None, eth_closes=None, error: Exception | None = None) -> None:
+    def __init__(self, btc_closes=None, eth_closes=None, btc_hourly_closes=None, error: Exception | None = None) -> None:
         self.btc_closes = btc_closes or []
         self.eth_closes = eth_closes or []
+        self.btc_hourly_closes = btc_hourly_closes
         self.error = error
 
     def get_json(self, _path, params=None):
         if self.error:
             raise self.error
         symbol = (params or {}).get("symbol")
-        closes = self.btc_closes if symbol == "BTCUSDT" else self.eth_closes
+        interval = (params or {}).get("interval")
+        if symbol == "BTCUSDT" and interval == "1h" and self.btc_hourly_closes is not None:
+            closes = self.btc_hourly_closes
+        else:
+            closes = self.btc_closes if symbol == "BTCUSDT" else self.eth_closes
         return [[index, "0", "0", "0", str(close), "0"] for index, close in enumerate(closes)]
 
 
@@ -25,6 +30,7 @@ def test_compute_macro_trend_uses_btc_primary_high_confidence(tmp_path):
     client = FakeClient(
         btc_closes=[float(100 + index) for index in range(30)],
         eth_closes=[float(200 + index) for index in range(30)],
+        btc_hourly_closes=[float(100 + index) for index in range(700)],
     )
 
     signal = compute_macro_trend(client, cache_file=cache_file)

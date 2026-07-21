@@ -88,16 +88,86 @@ class V6ExecutionConfigTest(unittest.TestCase):
         self.assertEqual(config.kline_limit_for_interval("15m"), 4707)
         self.assertEqual(config.kline_limit_for_interval("4h"), 4707)
         self.assertEqual(config.kline_limit_for_interval("1d"), 4707)
+
         self.assertTrue(config.kline_cache_enabled)
         self.assertEqual(config.kline_cache_dir, Path("data/trading_system/cache/execution_klines"))
         self.assertEqual(config.closed_trade_review_queue_file, Path("data/trading_system/v6_execution/closed_trade_review_queue.jsonl"))
         self.assertEqual(config.post_trade_training_samples_file, Path("data/trading_system/v6_execution/post_trade_training_samples.jsonl"))
         self.assertEqual(config.public_mark_price_ttl_seconds, 120)
         self.assertEqual(config.public_ticker_24h_ttl_seconds, 300)
+        self.assertEqual(config.exchange_info_cache_ttl_seconds, 180)
+        self.assertTrue(config.close_resolver_enabled)
+        self.assertTrue(config.close_intent_coalescing_enabled)
         self.assertEqual(config.kline_refresh_interval_seconds_for_interval("1m"), 20)
         self.assertEqual(config.kline_refresh_interval_seconds_for_interval("15m"), 120)
         self.assertEqual(config.kline_refresh_interval_seconds_for_interval("4h"), 600)
         self.assertEqual(config.kline_refresh_interval_seconds_for_interval("1d"), 1800)
+
+    def test_symbol_notional_multiplier_reduces_configured_base_for_zec(self) -> None:
+        env = {
+            "TS_V6_BASE_NOTIONAL_USDT": "1000",
+            "TS_V6_MIN_NOTIONAL_USDT": "1000",
+            "TS_V6_DEFAULT_LEVERAGE": "8",
+            "TS_V6_SYMBOL_NOTIONAL_MULTIPLIERS": "ZECUSDT:0.60",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = V6ExecutionConfig.from_env()
+
+        self.assertEqual(config.default_leverage, 8)
+        self.assertEqual(config.base_notional_for("BTCUSDT"), 1000.0)
+        self.assertEqual(config.base_notional_for("ZECUSDT"), 600.0)
+        self.assertEqual(config.base_notional_for("zec"), 600.0)
+
+    def test_zec_open_intent_keeps_600_notional_when_soft_gate_reduces_size(self) -> None:
+        config = V6ExecutionConfig(
+            symbols=["ZECUSDT"],
+            base_notional_usdt=1000.0,
+            min_notional_usdt=1000.0,
+            default_leverage=8,
+            symbol_notional_multipliers={"ZECUSDT": 0.60},
+            technical_entry_only_symbols=("ZECUSDT",),
+            entry_gate_policy_v2_enabled=True,
+            entry_gate_min_notional_multiplier=1.0,
+            smart_signal_risk_guard_enabled=False,
+        )
+        engine = V6ExecutionEngine(config)
+        signal = SimpleNamespace(
+            symbol="ZECUSDT",
+            price=500.0,
+            levels={
+                "nearest_supports": [("bb120_mid_4h", 480.0)],
+                "nearest_resistances": [("bb300_upper_4h", 540.0)],
+                "all_supports": [("bb120_mid_4h", 480.0)],
+                "all_resistances": [("bb300_upper_4h", 540.0)],
+                "structure_entry_scan": {"long_candidate_count": 1},
+            },
+            long_probability=0.7,
+            short_probability=0.1,
+            wait_probability=0.2,
+            indicators={},
+            reasons=["test fixed ZEC size"],
+        )
+        try:
+            intent = engine.open_intent(
+                signal,
+                "open_long",
+                entry_context={
+                    "entry_gate_policy_v2": {
+                        "allowed": True,
+                        "notional_multiplier": 0.30,
+                    }
+                },
+            )
+            normal_intent = engine.open_intent(signal, "open_long")
+        finally:
+            engine.close()
+
+        self.assertEqual(intent.leverage, 8)
+        self.assertEqual(intent.quantity_hint_usdt, 600.0)
+        self.assertEqual(intent.risk_plan["configured_base_notional_usdt"], 1000.0)
+        self.assertEqual(intent.risk_plan["symbol_notional_multiplier"], 0.60)
+        self.assertEqual(intent.risk_plan["symbol_base_notional_usdt"], 600.0)
+        self.assertEqual(normal_intent.quantity_hint_usdt, 600.0)
 
     def test_v6_symbol_entry_thresholds_override_default_thresholds(self) -> None:
         env = {
@@ -135,6 +205,183 @@ class V6ExecutionConfigTest(unittest.TestCase):
         )
         self.assertTrue(V6ExecutionEngine.is_status_unknown_error("Binance signed request failed 504: Gateway Timeout"))
         self.assertFalse(V6ExecutionEngine.is_status_unknown_error('Binance signed request failed 400: {"code":-4131}'))
+
+
+class V6PositionCapScaleInTest(unittest.TestCase):
+    def test_existing_same_side_position_can_scale_in_when_position_cap_is_reached(self) -> None:
+        config = V6ExecutionConfig(
+            symbols=["BTCUSDT", "ETHUSDT"],
+            order_mode="dry_run",
+            max_positions=2,
+            long_entry_threshold=0.45,
+            short_entry_threshold=0.45,
+            technical_entry_only_symbols=("BTCUSDT",),
+        )
+        engine = V6ExecutionEngine(config)
+        signal = V6Signal(
+            symbol="BTCUSDT",
+            computed_at="2026-07-20T05:13:24+00:00",
+            price=64161.47,
+            side_bias="long",
+            long_probability=0.46,
+            short_probability=0.46,
+            wait_probability=0.08,
+            model_quality_score=1.0,
+            reasons=[],
+            h4={},
+            fifteen_m={},
+            one_m={},
+            mid_retest={},
+            levels={},
+        )
+        btc_position = {
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "position_qty": 0.002,
+            "entry_price": 64454.2,
+            "current_price": 64161.47,
+            "notional_usdt": 128.32,
+        }
+        state = {
+            "positions": [
+                btc_position,
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "long",
+                    "position_qty": 0.058,
+                    "entry_price": 1859.67,
+                    "current_price": 1850.0,
+                    "notional_usdt": 107.3,
+                },
+            ]
+        }
+        expected_intent = V6OrderIntent(
+            action="scale_in",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=False,
+            entry_price=64161.47,
+            stop_loss_price=63486.16,
+            take_profit_price=65000.0,
+            long_probability=0.46,
+            short_probability=0.46,
+            wait_probability=0.08,
+            rationale="test scale-in at position cap",
+            generated_at="2026-07-20T05:13:24+00:00",
+        )
+        try:
+            with (
+                patch.object(engine, "manager_reentry_lock_block", return_value=None),
+                patch.object(engine, "manager_reversal_entry_block", return_value=None),
+                patch.object(engine, "macro_direction_entry_block", return_value=None),
+                patch.object(engine, "scale_in_intent_if_needed", return_value=expected_intent) as technical_scale_in,
+            ):
+                technical_intent = engine._entry_intent_for_signal(signal, state, [btc_position])
+            self.assertIs(technical_intent, expected_intent)
+            technical_scale_in.assert_called_once_with(
+                signal,
+                btc_position,
+                require_probability=False,
+                state=state,
+            )
+
+            config.technical_entry_only_symbols = ()
+            with (
+                patch.object(engine, "manager_reentry_lock_block", return_value=None),
+                patch.object(engine, "manager_reversal_entry_block", return_value=None),
+                patch.object(engine, "scale_in_intent_if_needed", return_value=expected_intent) as probability_scale_in,
+            ):
+                probability_intent = engine._entry_intent_for_signal(signal, state, [btc_position])
+            self.assertIs(probability_intent, expected_intent)
+            probability_scale_in.assert_called_once_with(signal, btc_position, state=state)
+
+            btc_position["scale_in_count"] = config.max_scale_ins_per_position
+            config.technical_entry_only_symbols = ("BTCUSDT",)
+            with (
+                patch.object(engine, "manager_reentry_lock_block", return_value=None),
+                patch.object(engine, "manager_reversal_entry_block", return_value=None),
+                patch.object(engine, "macro_direction_entry_block", return_value=None),
+            ):
+                self.assertIsNone(engine._entry_intent_for_signal(signal, state, [btc_position]))
+
+            config.technical_entry_only_symbols = ()
+            with (
+                patch.object(engine, "manager_reentry_lock_block", return_value=None),
+                patch.object(engine, "manager_reversal_entry_block", return_value=None),
+            ):
+                self.assertIsNone(engine._entry_intent_for_signal(signal, state, [btc_position]))
+        finally:
+            engine.close()
+
+    def test_position_cap_still_blocks_a_new_symbol(self) -> None:
+        config = V6ExecutionConfig(
+            symbols=["BTCUSDT", "ETHUSDT", "ZECUSDT"],
+            order_mode="dry_run",
+            max_positions=2,
+            long_entry_threshold=0.45,
+            short_entry_threshold=0.45,
+        )
+        engine = V6ExecutionEngine(config)
+        signal = V6Signal(
+            symbol="ZECUSDT",
+            computed_at="2026-07-20T05:13:24+00:00",
+            price=550.0,
+            side_bias="long",
+            long_probability=0.70,
+            short_probability=0.10,
+            wait_probability=0.20,
+            model_quality_score=1.0,
+            reasons=[],
+            h4={},
+            fifteen_m={},
+            one_m={},
+            mid_retest={},
+            levels={},
+        )
+        state = {
+            "positions": [
+                {
+                    "symbol": "BTCUSDT",
+                    "side": "long",
+                    "position_qty": 0.002,
+                    "entry_price": 64454.2,
+                    "current_price": 64161.47,
+                    "notional_usdt": 128.32,
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "long",
+                    "position_qty": 0.058,
+                    "entry_price": 1859.67,
+                    "current_price": 1850.0,
+                    "notional_usdt": 107.3,
+                },
+            ]
+        }
+        try:
+            with (
+                patch.object(engine, "manager_reentry_lock_block", return_value=None),
+                patch.object(engine, "manager_reversal_entry_block", return_value=None),
+                patch.object(engine, "open_intent") as open_intent,
+            ):
+                self.assertIsNone(engine._entry_intent_for_signal(signal, state, []))
+            open_intent.assert_not_called()
+
+            config.technical_entry_only_symbols = ("ZECUSDT",)
+            with (
+                patch.object(engine, "manager_reentry_lock_block", return_value=None),
+                patch.object(engine, "manager_reversal_entry_block", return_value=None),
+                patch.object(engine, "macro_direction_entry_block", return_value=None),
+                patch.object(engine, "technical_entry_ready", return_value=(True, None, {})) as technical_ready,
+                patch.object(engine, "open_intent") as technical_open_intent,
+            ):
+                self.assertIsNone(engine._entry_intent_for_signal(signal, state, []))
+            technical_ready.assert_not_called()
+            technical_open_intent.assert_not_called()
+        finally:
+            engine.close()
 
 
 class V6LiveTradingGateTest(unittest.TestCase):
@@ -185,6 +432,27 @@ class V6LiveTradingGateTest(unittest.TestCase):
         self.assertEqual(result, {"status": "ok"})
         self.assertEqual(captured["method"], "POST")
         self.assertIn("signature=", str(captured["data"]))
+
+    def test_exchange_info_cache_is_shared_across_short_lived_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = V6ExecutionConfig(
+                order_mode="dry_run",
+                kline_cache_dir=Path(tmp),
+                exchange_info_cache_ttl_seconds=180,
+            )
+            payload = {"symbols": [{"symbol": "BTCUSDT", "status": "TRADING"}]}
+            first = V6BinanceClient(config)
+            second = V6BinanceClient(config)
+            try:
+                with patch.object(first, "public_get", return_value=payload) as first_get:
+                    self.assertEqual(first.exchange_info(), payload)
+                with patch.object(second, "public_get", side_effect=AssertionError("disk cache should be used")) as second_get:
+                    self.assertEqual(second.exchange_info(), payload)
+                first_get.assert_called_once()
+                second_get.assert_not_called()
+            finally:
+                first.close()
+                second.close()
 
 
 class V6DailyTrendTwoStepExitTest(unittest.TestCase):
@@ -317,6 +585,328 @@ class V6ExecutionStateTest(unittest.TestCase):
         )
         return V6ExecutionEngine(config)
 
+    def test_confirmed_manager_full_close_creates_reentry_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = V6ExecutionConfig(
+                symbols=["BTCUSDT"],
+                order_mode="dry_run",
+                state_dir=root,
+                state_file=root / "state.json",
+                signals_file=root / "signals.jsonl",
+                orders_file=root / "orders.jsonl",
+                wal_file=root / "execution_wal.jsonl",
+                latest_summary_file=root / "latest_run_summary.json",
+                closed_trade_review_queue_file=root / "closed_trade_review_queue.jsonl",
+                post_trade_training_samples_file=root / "post_trade_training_samples.jsonl",
+                close_resolver_enabled=False,
+            )
+            engine = V6ExecutionEngine(config)
+            state = {
+                "positions": [{
+                    "symbol": "BTCUSDT",
+                    "side": "short",
+                    "entry_price": 100.0,
+                    "position_qty": 1.0,
+                    "notional_usdt": 100.0,
+                    "leverage": 8,
+                    "risk_plan": {"horizon": "4h_trend", "entry_timeframe": "4h"},
+                }],
+                "journal": [],
+            }
+            intent = V6OrderIntent(
+                action="close_short",
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity_hint_usdt=100.0,
+                leverage=8,
+                reduce_only=True,
+                entry_price=99.0,
+                stop_loss_price=103.0,
+                take_profit_price=90.0,
+                long_probability=0.6,
+                short_probability=0.2,
+                wait_probability=0.2,
+                rationale="short original 4H logic weakened for 2 closed 4H candles",
+                generated_at="2026-07-19T00:00:00+00:00",
+                risk_plan={"logic_weakening_exit": {"status": "exit_ready", "timeframe": "4h"}},
+            )
+            try:
+                engine.apply_intent_to_state(
+                    state,
+                    intent,
+                    {
+                        "status": "submitted",
+                        "submitted_at": "2026-07-19T00:00:01+00:00",
+                        "response": {"orderId": 123, "avgPrice": "99.0", "executedQty": "1.0"},
+                        "position_reconcile": {
+                            "confirmation_state": "confirmed",
+                            "action": "close_short",
+                            "after_state": "flat",
+                            "delta_qty_abs": 1.0,
+                        },
+                    },
+                )
+            finally:
+                engine.close()
+
+        self.assertEqual(state["positions"], [])
+        lock = state["manager_reentry_locks"]["BTCUSDT:short"]
+        self.assertEqual(lock["reason_type"], "logic_weakening_exit")
+        self.assertEqual(lock["timeframe"], "4h")
+        self.assertEqual(lock["close_order_id"], 123)
+        observation = state["manager_reversal_observations"]["BTCUSDT"]
+        self.assertEqual(observation["closed_side"], "short")
+        self.assertEqual(observation["target_side"], "long")
+        self.assertEqual(observation["close_order_id"], 123)
+
+    def test_unconfirmed_manager_close_does_not_create_reentry_lock(self) -> None:
+        engine = self.make_engine()
+        state = {
+            "positions": [{"symbol": "BTCUSDT", "side": "long", "position_qty": 1.0, "entry_price": 100.0}],
+            "journal": [],
+        }
+        intent = V6OrderIntent(
+            action="close_long",
+            symbol="BTCUSDT",
+            side="SELL",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=True,
+            entry_price=99.0,
+            stop_loss_price=97.0,
+            take_profit_price=110.0,
+            long_probability=0.2,
+            short_probability=0.6,
+            wait_probability=0.2,
+            rationale="long original 4H logic weakened for 2 closed 4H candles",
+            generated_at="2026-07-19T00:00:00+00:00",
+            risk_plan={"logic_weakening_exit": {"status": "exit_ready", "timeframe": "4h"}},
+        )
+        try:
+            engine.apply_intent_to_state(
+                state,
+                intent,
+                {
+                    "status": "submitted_no_position_delta",
+                    "submitted_at": "2026-07-19T00:00:01+00:00",
+                    "position_reconcile": {
+                        "confirmation_state": "unconfirmed",
+                        "action": "close_long",
+                        "after_state": "open",
+                        "delta_qty_abs": 0.0,
+                    },
+                },
+            )
+        finally:
+            engine.close()
+
+        self.assertEqual(len(state["positions"]), 1)
+        self.assertFalse(state.get("manager_reentry_locks"))
+        self.assertFalse(state.get("manager_reversal_observations"))
+
+    def test_v5_overlay_manager_close_does_not_create_v6_reentry_lock_by_default(self) -> None:
+        engine = self.make_engine()
+        engine.config.v5_overlay_rules_enabled = True
+        engine.config.technical_entry_only_symbols = ("BTCUSDT",)
+        position = {"symbol": "BTCUSDT", "side": "short", "position_qty": 1.0, "entry_price": 100.0}
+        intent = V6OrderIntent(
+            action="close_short",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=True,
+            entry_price=99.0,
+            stop_loss_price=103.0,
+            take_profit_price=90.0,
+            long_probability=0.6,
+            short_probability=0.2,
+            wait_probability=0.2,
+            rationale="short original 4H logic weakened for 2 closed 4H candles",
+            generated_at="2026-07-19T00:00:00+00:00",
+            risk_plan={"logic_weakening_exit": {"status": "exit_ready", "timeframe": "4h"}},
+        )
+        state = {"manager_reentry_locks": {}, "manager_reentry_lock_history": []}
+        result = {
+            "status": "submitted",
+            "submitted_at": "2026-07-19T00:00:01+00:00",
+            "response": {"orderId": 456, "avgPrice": "99.0", "executedQty": "1.0"},
+        }
+        try:
+            lock = engine.register_manager_reentry_lock(state, position, intent, result)
+        finally:
+            engine.close()
+
+        self.assertIsNone(lock)
+        self.assertFalse(state["manager_reentry_locks"])
+        self.assertFalse(state.get("manager_reversal_observations"))
+
+    def test_confirmed_opposite_open_completes_manager_reversal_observation(self) -> None:
+        engine = self.make_engine()
+        state = {
+            "positions": [],
+            "journal": [],
+            "manager_reversal_observations": {
+                "BTCUSDT": {
+                    "symbol": "BTCUSDT",
+                    "closed_side": "short",
+                    "target_side": "long",
+                    "reason_type": "logic_weakening_exit",
+                    "created_at": "2026-07-19T00:00:00+00:00",
+                    "minimum_until": "2026-07-19T04:00:00+00:00",
+                    "expires_at": "2099-07-22T00:00:00+00:00",
+                }
+            },
+            "manager_reversal_observation_history": [],
+        }
+        intent = V6OrderIntent(
+            action="open_long",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=False,
+            entry_price=101.0,
+            stop_loss_price=98.0,
+            take_profit_price=110.0,
+            long_probability=0.6,
+            short_probability=0.2,
+            wait_probability=0.2,
+            rationale="confirmed manager reversal",
+            generated_at="2026-07-19T08:00:00+00:00",
+            risk_plan={
+                "horizon": "4h_trend",
+                "entry_timeframe": "4h",
+                "manager_reversal_confirmation": {"approved": True},
+            },
+        )
+        result = {
+            "status": "submitted",
+            "submitted_at": "2026-07-19T08:00:01+00:00",
+            "response": {"orderId": 789, "avgPrice": "101.0", "executedQty": "1.0"},
+            "position_reconcile": {
+                "confirmation_state": "confirmed",
+                "action": "open_long",
+                "delta_qty_abs": 1.0,
+                "after": {
+                    "position_amt": "1.0",
+                    "entry_price": "101.0",
+                    "mark_price": "101.0",
+                    "notional": "101.0",
+                },
+            },
+        }
+        try:
+            engine.apply_intent_to_state(state, intent, result)
+        finally:
+            engine.close()
+
+        self.assertEqual(len(state["positions"]), 1)
+        self.assertFalse(state["manager_reversal_observations"])
+        event = state["manager_reversal_observation_history"][-1]
+        self.assertEqual(event["event"], "completed")
+        self.assertEqual(event["open_order_id"], 789)
+
+    def test_unconfirmed_open_keeps_manager_reversal_observation(self) -> None:
+        engine = self.make_engine()
+        observation = {
+            "symbol": "BTCUSDT",
+            "closed_side": "short",
+            "target_side": "long",
+            "reason_type": "logic_weakening_exit",
+            "created_at": "2026-07-19T00:00:00+00:00",
+            "minimum_until": "2026-07-19T04:00:00+00:00",
+            "expires_at": "2099-07-22T00:00:00+00:00",
+        }
+        state = {
+            "positions": [],
+            "journal": [],
+            "manager_reversal_observations": {"BTCUSDT": observation},
+            "manager_reversal_observation_history": [],
+        }
+        intent = V6OrderIntent(
+            action="open_long",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=False,
+            entry_price=101.0,
+            stop_loss_price=98.0,
+            take_profit_price=110.0,
+            long_probability=0.6,
+            short_probability=0.2,
+            wait_probability=0.2,
+            rationale="unconfirmed manager reversal",
+            generated_at="2026-07-19T08:00:00+00:00",
+        )
+        try:
+            engine.apply_intent_to_state(
+                state,
+                intent,
+                {
+                    "status": "submitted_no_position_delta",
+                    "submitted_at": "2026-07-19T08:00:01+00:00",
+                    "position_reconcile": {
+                        "confirmation_state": "unconfirmed",
+                        "action": "open_long",
+                        "delta_qty_abs": 0.0,
+                    },
+                },
+            )
+        finally:
+            engine.close()
+
+        self.assertEqual(state["manager_reversal_observations"]["BTCUSDT"], observation)
+        self.assertFalse(state["manager_reversal_observation_history"])
+
+    def test_confirmed_old_side_reopen_cancels_manager_reversal_observation(self) -> None:
+        engine = self.make_engine()
+        state = {
+            "manager_reversal_observations": {
+                "BTCUSDT": {
+                    "symbol": "BTCUSDT",
+                    "closed_side": "short",
+                    "target_side": "long",
+                    "reason_type": "logic_weakening_exit",
+                    "created_at": "2026-07-19T00:00:00+00:00",
+                    "minimum_until": "2026-07-19T04:00:00+00:00",
+                    "expires_at": "2099-07-22T00:00:00+00:00",
+                }
+            },
+            "manager_reversal_observation_history": [],
+        }
+        intent = V6OrderIntent(
+            action="open_short",
+            symbol="BTCUSDT",
+            side="SELL",
+            quantity_hint_usdt=100.0,
+            leverage=8,
+            reduce_only=False,
+            entry_price=99.0,
+            stop_loss_price=102.0,
+            take_profit_price=90.0,
+            long_probability=0.2,
+            short_probability=0.6,
+            wait_probability=0.2,
+            rationale="old side revalidated",
+            generated_at="2026-07-19T08:00:00+00:00",
+        )
+        try:
+            engine.complete_manager_reversal_observation_after_open(
+                state,
+                intent,
+                {"submitted_at": "2026-07-19T08:00:01+00:00", "response": {"orderId": 790}},
+            )
+        finally:
+            engine.close()
+
+        self.assertFalse(state["manager_reversal_observations"])
+        event = state["manager_reversal_observation_history"][-1]
+        self.assertEqual(event["event"], "cancelled")
+        self.assertEqual(event["resolve_reason"], "closed_side_revalidated_and_reopened")
+
     def test_strategy_dust_position_is_ignored_for_entry_and_scale_in(self) -> None:
         config = V6ExecutionConfig(
             dust_position_notional_usdt=1.0,
@@ -342,6 +932,122 @@ class V6ExecutionStateTest(unittest.TestCase):
         self.assertEqual(state["positions"][0]["strategy_status"], "dust_ignored")
         self.assertTrue(state["positions"][0]["strategy_dust_ignored"])
         engine.close()
+
+    def test_v5_staged_entry_uses_dedicated_order_floor_instead_of_v6_base_floor(self) -> None:
+        config = V6ExecutionConfig(
+            symbols=["ALTUSDT"],
+            base_notional_usdt=510.0,
+            min_notional_usdt=510.0,
+            v5_overlay_rules_enabled=True,
+            v5_staged_entry_enabled=True,
+            v5_initial_entry_notional_fraction=0.30,
+            v5_staged_entry_min_notional_usdt=5.0,
+            smart_signal_risk_guard_enabled=False,
+        )
+        engine = V6ExecutionEngine(config)
+        signal = SimpleNamespace(
+            symbol="ALTUSDT",
+            price=100.0,
+            levels={
+                "nearest_supports": [("bb210_lower_15m", 95.0)],
+                "nearest_resistances": [("bb96_mid_15m", 105.0)],
+                "all_supports": [("bb210_lower_15m", 95.0)],
+                "all_resistances": [("bb96_mid_15m", 105.0)],
+                "structure_entry_scan": {"long_candidate_count": 1},
+            },
+            long_probability=0.7,
+            short_probability=0.1,
+            wait_probability=0.2,
+            indicators={},
+            reasons=["test staged entry"],
+        )
+        try:
+            intent = engine.open_intent(signal, "open_long")
+        finally:
+            engine.close()
+
+        self.assertAlmostEqual(intent.quantity_hint_usdt, 153.0)
+        self.assertEqual(intent.risk_plan["v5_staged_entry"]["order_min_notional_usdt"], 5.0)
+        self.assertEqual(intent.risk_plan["v5_staged_entry"]["initial_notional_usdt"], 153.0)
+
+    def test_v5_overlay_uses_structured_risk_flags_not_reason_text(self) -> None:
+        config = V6ExecutionConfig(
+            v5_overlay_rules_enabled=True,
+            v5_block_unclean_15m_ma20_initial_entry=True,
+        )
+        engine = V6ExecutionEngine(config)
+        signal = SimpleNamespace(
+            symbol="ALTUSDT",
+            price=100.0,
+            reasons=["这段文案可以任意修改"],
+            fifteen_m={},
+            mid_retest={},
+            levels={},
+            model_quality_score=0.5,
+            indicators={
+                "entry_risk_flags": {
+                    "schema_version": 1,
+                    "ma20_trend_broken_or_mixed": True,
+                    "mixed_bb_structure": False,
+                    "avoid_chasing_4h_mids": False,
+                    "low_model_quality": False,
+                }
+            },
+        )
+        try:
+            blocked = engine.v5_overlay_entry_block(signal, "open_long", {"selected_entry_level": {}})
+        finally:
+            engine.close()
+
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked["reason"], "v5_wait_clean_15m_ma20_pullback")
+
+    def test_intents_for_signal_returns_risk_reductions_for_both_hedge_sides(self) -> None:
+        engine = self.make_engine()
+        signal = SimpleNamespace(symbol="BTCUSDT")
+        state = {
+            "positions": [
+                {"symbol": "BTCUSDT", "side": "long", "position_qty": 1.0, "entry_price": 100.0, "notional_usdt": 100.0},
+                {"symbol": "BTCUSDT", "side": "short", "position_qty": 1.0, "entry_price": 100.0, "notional_usdt": 100.0},
+            ]
+        }
+
+        def close_for_position(
+            _signal: Any,
+            position: dict[str, Any],
+            *,
+            state: dict[str, Any] | None = None,
+        ) -> V6OrderIntent:
+            self.assertIsNotNone(state)
+            side = str(position["side"])
+            action = f"close_{side}"
+            return V6OrderIntent(
+                action=action,
+                symbol="BTCUSDT",
+                side="SELL" if side == "long" else "BUY",
+                quantity_hint_usdt=100.0,
+                leverage=8,
+                reduce_only=True,
+                entry_price=100.0,
+                stop_loss_price=0.0,
+                take_profit_price=0.0,
+                long_probability=0.5,
+                short_probability=0.5,
+                wait_probability=0.0,
+                rationale="risk reduction",
+                generated_at="2026-07-18T00:00:00+00:00",
+            )
+
+        try:
+            with (
+                patch.object(engine, "refresh_cross_timeframe_macro_observation", return_value=None),
+                patch.object(engine, "exit_intent_if_needed", side_effect=close_for_position),
+            ):
+                intents = engine.intents_for_signal(signal, state)
+        finally:
+            engine.close()
+
+        self.assertEqual([item.action for item in intents], ["close_long", "close_short"])
 
     def test_exchange_snapshot_below_strategy_dust_threshold_is_dust(self) -> None:
         config = V6ExecutionConfig(
@@ -818,14 +1524,14 @@ class V6ExecutionStateTest(unittest.TestCase):
         scan = engine.structure_entry_scan(
             100.0,
             [
-                ("bb96_lower_15m", 99.0),
+                ("bb96_lower_15m", 99.6),
                 ("bb120_mid_15m", 100.5),
-                ("bb210_upper_4h", 101.0),
+                ("bb210_upper_4h", 100.4),
                 ("bb300_lower_1d", 90.0),
             ],
             [
                 ("ma20_15m", 99.5),
-                ("ma60_4h", 101.5),
+                ("ma60_4h", 100.6),
                 ("ma20_1d", 99.0),
             ],
         )
@@ -1230,14 +1936,19 @@ class V6ExecutionStateTest(unittest.TestCase):
         scan = engine.structure_entry_scan(
             100.0,
             [
-                ("bb96_upper_15m", 102.0),
-                ("bb120_upper_15m", 102.1),
+                ("bb96_upper_15m", 100.4),
+                ("bb120_upper_15m", 100.6),
+                ("bb210_mid_15m", 100.7),
+                ("bb300_mid_15m", 100.9),
+                ("bb672_upper_15m", 99.2),
+                ("bb1440_upper_15m", 98.8),
+                ("bb1920_lower_4h", 100.8),
+                ("bb2880_lower_4h", 101.2),
                 ("bad_name", 100.0),
-                ("bb210_mid_15m", 0.0),
             ],
             [
-                ("ma20_15m", 98.0392156863),
-                ("ma60_4h", 97.9),
+                ("ma20_15m", 99.3),
+                ("ma60_4h", 99.1),
                 ("ma20_1d", 100.0),
                 ("not_ma", 100.0),
             ],
@@ -1246,13 +1957,23 @@ class V6ExecutionStateTest(unittest.TestCase):
 
         near_names = {item["name"] for item in scan["near_levels"]}
         self.assertIn("bb96_upper_15m", near_names)
+        self.assertIn("bb210_mid_15m", near_names)
+        self.assertIn("bb672_upper_15m", near_names)
+        self.assertIn("bb1920_lower_4h", near_names)
         self.assertIn("ma20_15m", near_names)
         self.assertNotIn("bb120_upper_15m", near_names)
+        self.assertNotIn("bb300_mid_15m", near_names)
+        self.assertNotIn("bb1440_upper_15m", near_names)
+        self.assertNotIn("bb2880_lower_4h", near_names)
         self.assertNotIn("ma60_4h", near_names)
         self.assertNotIn("ma20_1d", near_names)
         self.assertNotIn("bad_name", near_names)
-        self.assertEqual(scan["long_candidate_count"], 1)
-        self.assertEqual(scan["short_candidate_count"], 1)
+        self.assertEqual(scan["long_candidate_count"], 2)
+        self.assertEqual(scan["short_candidate_count"], 3)
+        self.assertEqual(
+            scan["near_pct_by_structure"],
+            {"rebound_rejection": 0.5, "mid_ma_retest": 0.8, "breakout_breakdown": 1.0},
+        )
 
     def test_mid_retest_state_uses_shared_4h_mids(self) -> None:
         engine = self.make_engine()
@@ -2005,6 +2726,58 @@ class V6ExecutionStateTest(unittest.TestCase):
         self.assertEqual(result["leverage"]["response"]["leverage"], 3)
         self.assertEqual(result["protective_stop"]["response"]["algoId"], 200)
 
+    def test_manual_profit_mode_submits_close_position_stop_without_fixed_quantity(self) -> None:
+        config = V6ExecutionConfig(
+            order_mode="testnet_order",
+            demo_api_key="key",
+            demo_api_secret="secret",
+            exit_control_mode="stop_only_manual_profit",
+        )
+        client = V6BinanceClient(config)
+        client.resolve_price = lambda symbol, price: "97"  # type: ignore[method-assign]
+        client.current_position_mode = lambda: "hedge"  # type: ignore[method-assign]
+        submitted = []
+
+        def fake_signed_request(method, endpoint, params):
+            submitted.append((method, endpoint, dict(params)))
+            return {
+                "algoId": 201,
+                "algoStatus": "NEW",
+                "clientAlgoId": "manual-profit-stop",
+                "closePosition": True,
+            }
+
+        client.signed_request = fake_signed_request  # type: ignore[method-assign]
+        intent = V6OrderIntent(
+            action="open_long",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity_hint_usdt=1000.0,
+            leverage=8,
+            reduce_only=False,
+            entry_price=100.0,
+            stop_loss_price=97.0,
+            take_profit_price=110.0,
+            long_probability=0.7,
+            short_probability=0.1,
+            wait_probability=0.2,
+            rationale="manual profit account",
+            generated_at="2026-07-21T00:00:00+00:00",
+        )
+
+        result = client.submit_protective_stop(intent, quantity="10")
+        client.close()
+
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(len(submitted), 1)
+        method, endpoint, params = submitted[0]
+        self.assertEqual((method, endpoint), ("POST", "/fapi/v1/algoOrder"))
+        self.assertEqual(params["side"], "SELL")
+        self.assertEqual(params["positionSide"], "LONG")
+        self.assertEqual(params["closePosition"], "true")
+        self.assertNotIn("quantity", params)
+        self.assertNotIn("reduceOnly", params)
+
     def test_open_order_closes_immediately_when_exchange_stop_fails(self) -> None:
         config = V6ExecutionConfig(order_mode="testnet_order", demo_api_key="key", demo_api_secret="secret")
         client = V6BinanceClient(config)
@@ -2394,6 +3167,160 @@ class V6ExecutionStateTest(unittest.TestCase):
         self.assertEqual(fake_client.cancelled, [("HYPEUSDT", 200)])
         self.assertEqual(fake_client.submitted, [("HYPEUSDT", "0.65")])
         self.assertEqual(position["protective_stop_order_id"], 301)
+
+    def test_manual_profit_close_position_stop_survives_partial_manual_reduce(self) -> None:
+        engine = self.make_engine()
+        engine.config.order_mode = "testnet_order"
+        engine.config.exit_control_mode = "stop_only_manual_profit"
+        position = {
+            "symbol": "HYPEUSDT",
+            "side": "long",
+            "protective_stop_order_id": 400,
+            "stop_loss_price": 61.221,
+            "entry_price": 62.144,
+            "take_profit_price": 70.0,
+            "notional_usdt": 700.0,
+            "leverage": 8,
+        }
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.cancelled = []
+                self.submitted = []
+
+            def signed_params(self):
+                return {}
+
+            def signed_request(self, method, endpoint, params):
+                if endpoint == "/fapi/v1/openAlgoOrders":
+                    return [{
+                        "symbol": "HYPEUSDT",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "orderType": "STOP_MARKET",
+                        "quantity": "0",
+                        "triggerPrice": "61.221",
+                        "reduceOnly": False,
+                        "closePosition": True,
+                        "algoStatus": "NEW",
+                        "algoId": 400,
+                    }]
+                raise AssertionError(endpoint)
+
+            def quantity_rules(self, symbol):
+                return 0.01, 0.01
+
+            def resolve_price(self, symbol, price):
+                return "61.221"
+
+            def cancel_order(self, symbol, order_id):
+                self.cancelled.append((symbol, order_id))
+                return {"status": "submitted", "response": {"algoId": order_id}}
+
+            def submit_protective_stop(self, intent, quantity=None):
+                self.submitted.append((intent.symbol, quantity))
+                raise AssertionError("matching closePosition stop must not be replaced")
+
+            def protective_stop_precheck(self, intent):
+                return {"checked": True, "would_immediately_trigger": False}
+
+            def close(self):
+                pass
+
+        fake_client = FakeClient()
+        engine.client = fake_client  # type: ignore[assignment]
+        actions = engine.sync_protective_stops_with_exchange(
+            [position],
+            {("HYPEUSDT", "long"): {"symbol": "HYPEUSDT", "positionAmt": "8.04", "positionSide": "LONG"}},
+        )
+        engine.close()
+
+        self.assertEqual(actions, [])
+        self.assertEqual(fake_client.cancelled, [])
+        self.assertEqual(fake_client.submitted, [])
+        self.assertEqual(position["protective_stop_order_id"], 400)
+        self.assertTrue(position["protective_stop_close_position"])
+
+    def test_manual_profit_sync_replaces_quantity_bound_stop(self) -> None:
+        engine = self.make_engine()
+        engine.config.order_mode = "testnet_order"
+        engine.config.exit_control_mode = "stop_only_manual_profit"
+        position = {
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "protective_stop_order_id": 500,
+            "stop_loss_price": 63501.7,
+            "entry_price": 65498.6,
+            "take_profit_price": 70000.0,
+            "notional_usdt": 980.0,
+            "leverage": 8,
+        }
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.cancelled = []
+                self.submitted = []
+
+            def signed_params(self):
+                return {}
+
+            def signed_request(self, method, endpoint, params):
+                if endpoint == "/fapi/v1/openAlgoOrders":
+                    return [{
+                        "symbol": "BTCUSDT",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "orderType": "STOP_MARKET",
+                        "quantity": "0.015",
+                        "triggerPrice": "63501.7",
+                        "reduceOnly": True,
+                        "closePosition": False,
+                        "algoStatus": "NEW",
+                        "algoId": 500,
+                    }]
+                raise AssertionError(endpoint)
+
+            def quantity_rules(self, symbol):
+                return 0.001, 0.001
+
+            def resolve_price(self, symbol, price):
+                return "63501.7"
+
+            def cancel_order(self, symbol, order_id):
+                self.cancelled.append((symbol, order_id))
+                return {"status": "submitted", "response": {"algoId": order_id}}
+
+            def submit_protective_stop(self, intent, quantity=None):
+                self.submitted.append((intent.symbol, quantity))
+                return {
+                    "status": "submitted",
+                    "response": {
+                        "algoId": 501,
+                        "clientAlgoId": "close-position-stop",
+                        "algoStatus": "NEW",
+                        "closePosition": True,
+                    },
+                }
+
+            def protective_stop_precheck(self, intent):
+                return {"checked": True, "would_immediately_trigger": False}
+
+            def close(self):
+                pass
+
+        fake_client = FakeClient()
+        engine.client = fake_client  # type: ignore[assignment]
+        actions = engine.sync_protective_stops_with_exchange(
+            [position],
+            {("BTCUSDT", "long"): {"symbol": "BTCUSDT", "positionAmt": "0.015", "positionSide": "LONG"}},
+        )
+        engine.close()
+
+        self.assertEqual(fake_client.cancelled, [("BTCUSDT", 500)])
+        self.assertEqual(fake_client.submitted, [("BTCUSDT", "0.015")])
+        self.assertEqual([item["action"] for item in actions], ["cancel_stale_protective_stop", "submit_protective_stop"])
+        self.assertEqual(position["protective_stop_order_id"], 501)
+        self.assertTrue(position["protective_stop_close_position"])
 
 
 if __name__ == "__main__":
