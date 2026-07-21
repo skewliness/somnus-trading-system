@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Mapping
+from uuid import uuid4
 
-from trading_system.errors import StateError
+from trading_system.errors import StateError, classify_exception
+from trading_system.persistence import atomic_write_json, file_lock, load_json
 
 
 class OrderState(str, Enum):
@@ -63,6 +66,8 @@ ALLOWED_TRANSITIONS = {
         OrderState.CANCEL_PENDING,
         OrderState.CANCELLED,
         OrderState.EXPIRED,
+        OrderState.RECONCILED_FILLED,
+        OrderState.RECONCILED_NOT_FILLED,
     },
     OrderState.PARTIAL_FILLED: {
         OrderState.FILLED,
@@ -76,6 +81,7 @@ ALLOWED_TRANSITIONS = {
         OrderState.CANCELLED,
         OrderState.PARTIAL_FILLED,
         OrderState.FILLED,
+        OrderState.REJECTED,
         OrderState.UNKNOWN_PENDING_RECONCILE,
         OrderState.FAILED,
     },
@@ -137,6 +143,269 @@ class OrderStateMachine:
         self.state = target
         self.transitions.append(transition)
         return transition
+
+
+ORDER_STATE_SCHEMA_VERSION = 1
+PENDING_RECOVERY_STATES = {
+    OrderState.SUBMITTED,
+    OrderState.PARTIAL_FILLED,
+    OrderState.CANCEL_PENDING,
+    OrderState.UNKNOWN_PENDING_RECONCILE,
+}
+
+
+def _record_requires_reconciliation(record: Mapping[str, Any]) -> bool:
+    """Return whether a persisted order needs exchange-authoritative recovery.
+
+    Normal orders acknowledged as ``NEW`` can still fill after a process
+    restart, so they remain pending. A protective stop is intentionally a
+    long-lived acknowledged order and is reconciled by the dedicated stop
+    synchronizer instead.
+    """
+
+    try:
+        state = OrderState(str(record.get("current_state") or ""))
+    except ValueError:
+        return False
+    if state in PENDING_RECOVERY_STATES:
+        return True
+    action = str(record.get("action") or "").lower()
+    return state == OrderState.ACKED and not action.startswith("protective_stop_")
+
+
+class OrderStateStore:
+    """Durable sidecar for order lifecycles.
+
+    The sidecar never decides whether an order should be placed. It records the
+    existing execution path and keeps ambiguous outcomes available for exchange
+    reconciliation after a process restart.
+    """
+
+    def __init__(self, path: Path, *, max_records: int = 5000) -> None:
+        self.path = Path(path)
+        self.max_records = max(100, int(max_records))
+
+    @staticmethod
+    def _empty_payload() -> dict[str, Any]:
+        return {
+            "schema_version": ORDER_STATE_SCHEMA_VERSION,
+            "updated_at": "",
+            "orders": {},
+        }
+
+    def _load_unlocked(self) -> dict[str, Any]:
+        payload = load_json(self.path, self._empty_payload(), lock=False)
+        if not isinstance(payload, dict):
+            payload = self._empty_payload()
+        orders = payload.get("orders")
+        if not isinstance(orders, dict):
+            orders = {}
+        payload["schema_version"] = ORDER_STATE_SCHEMA_VERSION
+        payload["orders"] = orders
+        return payload
+
+    @staticmethod
+    def _copy(value: Any) -> Any:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _prune(self, payload: dict[str, Any]) -> None:
+        orders = payload.get("orders") or {}
+        if len(orders) <= self.max_records:
+            return
+        unresolved = {
+            key: value
+            for key, value in orders.items()
+            if isinstance(value, Mapping) and _record_requires_reconciliation(value)
+        }
+        terminal = [
+            (key, value)
+            for key, value in orders.items()
+            if key not in unresolved
+        ]
+        terminal.sort(key=lambda item: str(item[1].get("updated_at") or ""), reverse=True)
+        remaining = max(0, self.max_records - len(unresolved))
+        payload["orders"] = {**unresolved, **dict(terminal[:remaining])}
+
+    def _write_unlocked(self, payload: dict[str, Any]) -> None:
+        payload["updated_at"] = self._now()
+        self._prune(payload)
+        atomic_write_json(self.path, payload, lock=False)
+
+    @staticmethod
+    def _transition_record(record: dict[str, Any], target: OrderState, event: str, *, occurred_at: str = "") -> None:
+        current = OrderState(str(record.get("current_state") or OrderState.CREATED.value))
+        machine = OrderStateMachine(initial_state=current)
+        transition = machine.transition(target, event, occurred_at=occurred_at)
+        transitions = list(record.get("transitions") or [])
+        transitions.append(transition.to_dict())
+        record["current_state"] = machine.state.value
+        record["terminal"] = machine.state in TERMINAL_STATES
+        record["transitions"] = transitions
+        record["updated_at"] = transition.occurred_at
+
+    def begin_order(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        request: Mapping[str, Any] | None = None,
+        order_key: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        key = str(order_key or f"attempt:{uuid4().hex}")[:160]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(self.path):
+            payload = self._load_unlocked()
+            orders = payload["orders"]
+            existing = orders.get(key)
+            if isinstance(existing, dict):
+                result = self._copy(existing)
+                result["duplicate"] = True
+                return result
+            now = self._now()
+            record = {
+                "order_key": key,
+                "exchange_order_id": "",
+                "client_order_id": "",
+                "symbol": str(symbol or "").upper()[:40],
+                "action": str(action or "")[:80],
+                "current_state": OrderState.CREATED.value,
+                "terminal": False,
+                "created_at": now,
+                "updated_at": now,
+                "request": self._copy(dict(request or {})),
+                "response": {},
+                "last_error": {},
+                "metadata": self._copy(dict(metadata or {})),
+                "transitions": [],
+            }
+            orders[key] = record
+            self._write_unlocked(payload)
+            return self._copy(record)
+
+    def get(self, order_key: str) -> dict[str, Any] | None:
+        with file_lock(self.path):
+            payload = self._load_unlocked()
+            record = payload["orders"].get(str(order_key))
+            return self._copy(record) if isinstance(record, dict) else None
+
+    def transition(self, order_key: str, target: OrderState, event: str, *, occurred_at: str = "") -> dict[str, Any]:
+        with file_lock(self.path):
+            payload = self._load_unlocked()
+            record = payload["orders"].get(str(order_key))
+            if not isinstance(record, dict):
+                raise StateError(f"order state record not found: {order_key}", code="order_state_record_missing")
+            self._transition_record(record, target, event, occurred_at=occurred_at)
+            self._write_unlocked(payload)
+            return self._copy(record)
+
+    def mark_submitted(self, order_key: str, *, occurred_at: str = "") -> dict[str, Any]:
+        return self.transition(order_key, OrderState.SUBMITTED, "submission_attempted", occurred_at=occurred_at)
+
+    def apply_exchange_response(
+        self,
+        order_key: str,
+        response: Mapping[str, Any] | None,
+        *,
+        occurred_at: str = "",
+        force_state: OrderState | None = None,
+    ) -> dict[str, Any]:
+        response_dict = dict(response or {})
+        target = force_state or _fill_state({"response": response_dict})
+        timestamp = str(occurred_at or self._now())
+        with file_lock(self.path):
+            payload = self._load_unlocked()
+            record = payload["orders"].get(str(order_key))
+            if not isinstance(record, dict):
+                raise StateError(f"order state record not found: {order_key}", code="order_state_record_missing")
+            current = OrderState(str(record.get("current_state") or OrderState.CREATED.value))
+            if current == OrderState.CREATED:
+                self._transition_record(record, OrderState.SUBMITTED, "submission_attempted", occurred_at=timestamp)
+                current = OrderState.SUBMITTED
+            if target in {OrderState.PARTIAL_FILLED, OrderState.FILLED, OrderState.CANCELLED, OrderState.EXPIRED}:
+                if current == OrderState.SUBMITTED:
+                    self._transition_record(record, OrderState.ACKED, "exchange_acknowledged", occurred_at=timestamp)
+                    current = OrderState.ACKED
+                if target == OrderState.CANCELLED and current != OrderState.CANCEL_PENDING:
+                    self._transition_record(record, OrderState.CANCEL_PENDING, "exchange_cancel_pending", occurred_at=timestamp)
+            exchange_status = _exchange_status({"response": response_dict}) or target.value
+            self._transition_record(
+                record,
+                target,
+                f"exchange_status:{exchange_status}",
+                occurred_at=timestamp,
+            )
+            record["response"] = self._copy(response_dict)
+            exchange_id = response_dict.get("orderId") or response_dict.get("algoId")
+            client_id = response_dict.get("clientOrderId")
+            if exchange_id not in (None, ""):
+                record["exchange_order_id"] = str(exchange_id)[:160]
+            if client_id not in (None, ""):
+                record["client_order_id"] = str(client_id)[:160]
+            self._write_unlocked(payload)
+            return self._copy(record)
+
+    def mark_submission_exception(self, order_key: str, exc: BaseException, *, operation: str) -> dict[str, Any]:
+        error = classify_exception(exc, operation=operation)
+        message = error.message.lower()
+        explicit_rejection = error.code in {
+            "invalid_symbol",
+            "reduce_only_rejected",
+        } or (" 400:" in f" {message}" and not error.ambiguous_order_status)
+        transport_ambiguous = error.ambiguous_order_status or error.code in {
+            "network_timeout",
+            "dns_failure",
+            "tls_failure",
+        } or any(token in message for token in ("502 bad gateway", "503", "504", "connection aborted"))
+        target = (
+            OrderState.REJECTED
+            if explicit_rejection
+            else OrderState.UNKNOWN_PENDING_RECONCILE
+            if transport_ambiguous
+            else OrderState.FAILED
+        )
+        with file_lock(self.path):
+            payload = self._load_unlocked()
+            record = payload["orders"].get(str(order_key))
+            if not isinstance(record, dict):
+                raise StateError(f"order state record not found: {order_key}", code="order_state_record_missing")
+            if OrderState(str(record.get("current_state") or OrderState.CREATED.value)) == OrderState.CREATED:
+                self._transition_record(record, OrderState.SUBMITTED, "submission_attempted")
+            self._transition_record(record, target, f"submission_exception:{error.code}")
+            record["last_error"] = error.to_dict()
+            self._write_unlocked(payload)
+            return self._copy(record)
+
+    def ensure_external_order(self, *, symbol: str, order_id: int | str, action: str = "cancel_order") -> dict[str, Any]:
+        key = f"exchange:{str(symbol).upper()}:{order_id}"[:160]
+        record = self.begin_order(symbol=symbol, action=action, order_key=key, metadata={"external_order": True})
+        state = OrderState(str(record.get("current_state") or OrderState.CREATED.value))
+        if state == OrderState.CREATED:
+            record = self.mark_submitted(key)
+            record = self.transition(key, OrderState.ACKED, "external_order_observed")
+        return record
+
+    def mark_cancel_pending(self, order_key: str) -> dict[str, Any]:
+        return self.transition(order_key, OrderState.CANCEL_PENDING, "cancel_requested")
+
+    def reconcile(self, order_key: str, *, filled: bool, event: str = "exchange_reconciled") -> dict[str, Any]:
+        target = OrderState.RECONCILED_FILLED if filled else OrderState.RECONCILED_NOT_FILLED
+        return self.transition(order_key, target, event)
+
+    def pending_reconciliation(self) -> list[dict[str, Any]]:
+        with file_lock(self.path):
+            payload = self._load_unlocked()
+            pending = [
+                self._copy(record)
+                for record in payload["orders"].values()
+                if isinstance(record, dict) and _record_requires_reconciliation(record)
+            ]
+        pending.sort(key=lambda item: str(item.get("updated_at") or ""))
+        return pending
 
 
 def _order_key(row: Mapping[str, Any]) -> str:
@@ -227,7 +496,17 @@ def project_order_result(row: Mapping[str, Any]) -> OrderStateProjection:
     elif status in {"status_unknown_position_still_open", "status_unknown_closed_reconciled"}:
         machine.transition(OrderState.SUBMITTED, "submission_attempted", occurred_at=occurred_at)
         machine.transition(OrderState.UNKNOWN_PENDING_RECONCILE, "exchange_status_unknown", occurred_at=occurred_at)
-        machine.transition(OrderState.RECONCILED_FILLED, "exchange_position_reconciled", occurred_at=occurred_at)
+        action = str((row.get("intent") or {}).get("action") or "") if isinstance(row.get("intent"), Mapping) else ""
+        reconciled_filled = (
+            status == "status_unknown_closed_reconciled" and action in {"close_long", "close_short"}
+        ) or (
+            status == "status_unknown_position_still_open" and action in {"open_long", "open_short"}
+        )
+        machine.transition(
+            OrderState.RECONCILED_FILLED if reconciled_filled else OrderState.RECONCILED_NOT_FILLED,
+            "exchange_position_reconciled",
+            occurred_at=occurred_at,
+        )
     elif status == "status_unknown_no_position":
         machine.transition(OrderState.SUBMITTED, "submission_attempted", occurred_at=occurred_at)
         machine.transition(OrderState.UNKNOWN_PENDING_RECONCILE, "exchange_status_unknown", occurred_at=occurred_at)

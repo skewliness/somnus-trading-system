@@ -41,6 +41,7 @@ from trading_system.exit import ExitManager
 from trading_system.gann_feature import compute_gann_feature, gann_position_multiplier
 from trading_system.gate_registry import default_entry_gate_registry
 from trading_system.h4_structure import compute_h4_structure
+from trading_system.order_state import OrderState, OrderStateStore
 from trading_system.persistence import append_text_line, atomic_write_json, load_json, timed_file_lock
 from trading_system.redaction import redact_sensitive_text
 from trading_system.risk import RiskManager
@@ -443,6 +444,7 @@ class V6ExecutionConfig:
     entry_gate_events_file: Path = DEFAULT_STATE_DIR / "entry_gate_events.jsonl"
     entry_gate_events_max_bytes: int = 20 * 1024 * 1024
     orders_file: Path = DEFAULT_STATE_DIR / "orders.jsonl"
+    order_state_file: Path | None = None
     wal_file: Path = DEFAULT_STATE_DIR / "execution_wal.jsonl"
     latest_summary_file: Path = DEFAULT_STATE_DIR / "latest_run_summary.json"
     closed_trade_review_queue_file: Path = DEFAULT_STATE_DIR / "closed_trade_review_queue.jsonl"
@@ -676,6 +678,8 @@ class V6ExecutionConfig:
             self.manual_exchange_action_audit_file = self.state_dir / "manual_exchange_actions.jsonl"
         if self.trade_events_file is None:
             self.trade_events_file = self.state_dir / "trade_events.jsonl"
+        if self.order_state_file is None:
+            self.order_state_file = self.state_dir / "order_states.json"
 
     @classmethod
     def from_env(cls) -> "V6ExecutionConfig":
@@ -709,6 +713,7 @@ class V6ExecutionConfig:
             entry_gate_events_file=Path(os.getenv("TS_V6_ENTRY_GATE_EVENTS_FILE", str(state_dir / "entry_gate_events.jsonl"))),
             entry_gate_events_max_bytes=_env_int("TS_V6_ENTRY_GATE_EVENTS_MAX_BYTES", 20 * 1024 * 1024),
             orders_file=Path(os.getenv("TS_V6_ORDERS_FILE", str(state_dir / "orders.jsonl"))),
+            order_state_file=Path(os.getenv("TS_V6_ORDER_STATE_FILE", str(state_dir / "order_states.json"))),
             wal_file=Path(os.getenv("TS_V6_EXECUTION_WAL_FILE", str(state_dir / "execution_wal.jsonl"))),
             latest_summary_file=Path(os.getenv("TS_V6_LATEST_SUMMARY_FILE", str(state_dir / "latest_run_summary.json"))),
             closed_trade_review_queue_file=Path(os.getenv("TS_V6_CLOSED_TRADE_REVIEW_QUEUE_FILE", str(state_dir / "closed_trade_review_queue.jsonl"))),
@@ -1004,6 +1009,8 @@ class V6ExecutionConfig:
         self.signals_file.parent.mkdir(parents=True, exist_ok=True)
         self.entry_gate_events_file.parent.mkdir(parents=True, exist_ok=True)
         self.orders_file.parent.mkdir(parents=True, exist_ok=True)
+        assert self.order_state_file is not None
+        self.order_state_file.parent.mkdir(parents=True, exist_ok=True)
         self.wal_file.parent.mkdir(parents=True, exist_ok=True)
         self.latest_summary_file.parent.mkdir(parents=True, exist_ok=True)
         self.closed_trade_review_queue_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1020,6 +1027,7 @@ class V6ExecutionConfig:
             self.signals_file,
             self.entry_gate_events_file,
             self.orders_file,
+            self.order_state_file or (self.state_dir / "order_states.json"),
             self.wal_file,
             self.latest_summary_file,
             self.closed_trade_review_queue_file,
@@ -1219,9 +1227,117 @@ class V6BinanceClient:
             "last_status_code": None,
             "last_request_at": "",
         }
+        assert self.config.order_state_file is not None
+        self.order_state_store = OrderStateStore(self.config.order_state_file)
 
     def close(self) -> None:
         self.session.close()
+
+    def _order_state_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return getattr(self.order_state_store, method)(*args, **kwargs)
+        except Exception as exc:
+            record_caught_exception(
+                LOGGER,
+                exc,
+                operation=f"order_state.{method}",
+                level=logging.WARNING,
+                account_id=self.config.instance_name,
+            )
+            return None
+
+    def submit_tracked_order(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        endpoint: str,
+        params: dict[str, Any],
+    ) -> tuple[Any, str, dict[str, Any]]:
+        request = {key: value for key, value in params.items() if key not in {"timestamp", "signature"}}
+        created = self._order_state_call(
+            "begin_order",
+            symbol=symbol,
+            action=action,
+            request=request,
+            metadata={"endpoint": endpoint, "order_mode": self.config.order_mode},
+        )
+        order_key = str((created or {}).get("order_key") or "")
+        if order_key:
+            self._order_state_call("mark_submitted", order_key)
+        try:
+            payload = self.signed_request("POST", endpoint, params)
+        except Exception as exc:
+            record_caught_exception(
+                LOGGER,
+                exc,
+                operation=f"POST {endpoint}",
+                level=logging.WARNING,
+                symbol=symbol,
+                action=action,
+                account_id=self.config.instance_name,
+            )
+            if order_key:
+                snapshot = self._order_state_call(
+                    "mark_submission_exception",
+                    order_key,
+                    exc,
+                    operation=f"POST {endpoint}",
+                )
+                try:
+                    setattr(exc, "order_state_key", order_key)
+                    setattr(exc, "order_state_snapshot", snapshot or {})
+                except (AttributeError, TypeError):
+                    pass
+            raise
+        snapshot = {}
+        if order_key:
+            snapshot = self._order_state_call(
+                "apply_exchange_response",
+                order_key,
+                payload if isinstance(payload, dict) else {},
+            ) or {}
+        return payload, order_key, snapshot
+
+    def pending_order_reconciliation(self) -> list[dict[str, Any]]:
+        return self._order_state_call("pending_reconciliation") or []
+
+    def reconcile_tracked_order_from_result(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        order_key = str(result.get("order_state_key") or "")
+        if not order_key:
+            return None
+        snapshot = self._order_state_call("get", order_key) or {}
+        if snapshot.get("current_state") != OrderState.UNKNOWN_PENDING_RECONCILE.value:
+            if snapshot:
+                result["order_state"] = snapshot
+            return snapshot or None
+        intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+        action = str(intent.get("action") or "")
+        status = str(result.get("status") or "")
+        reconciled_filled: bool | None = None
+        if status == "status_unknown_no_position":
+            reconciled_filled = False
+        elif status == "status_unknown_position_still_open":
+            reconciled_filled = action in {"open_long", "open_short"}
+        elif status == "status_unknown_closed_reconciled":
+            reconciled_filled = action in {"close_long", "close_short"}
+        elif status == "failed_open_reconciled":
+            side = "short" if action == "open_short" else "long"
+            symbol = str(intent.get("symbol") or "").upper()
+            expected = f"{symbol}:{side}".upper()
+            reconcile = result.get("reconcile") if isinstance(result.get("reconcile"), dict) else {}
+            actual = {str(item).upper() for item in reconcile.get("actual_positions") or []}
+            reconciled_filled = expected in actual
+        if reconciled_filled is None:
+            return snapshot
+        reconciled = self._order_state_call(
+            "reconcile",
+            order_key,
+            filled=reconciled_filled,
+            event=f"engine_reconcile:{status}",
+        ) or snapshot
+        result["order_state"] = reconciled
+        return reconciled
 
     @staticmethod
     def _url_host(url: str) -> str:
@@ -2476,7 +2592,12 @@ class V6BinanceClient:
             params["positionSide"] = position_side_for_action(intent.action, intent.side)
         elif intent.reduce_only:
             params["reduceOnly"] = "true"
-        payload = self.signed_request("POST", "/fapi/v1/order", params)
+        payload, order_state_key, order_state_snapshot = self.submit_tracked_order(
+            symbol=intent.symbol,
+            action=intent.action,
+            endpoint="/fapi/v1/order",
+            params=params,
+        )
         payload = self.enrich_order_fill_payload(intent.symbol, payload)
         result = {
             "status": "submitted",
@@ -2486,6 +2607,9 @@ class V6BinanceClient:
             "response": payload,
             "submitted_at": utc_now_iso(),
         }
+        if order_state_key:
+            result["order_state_key"] = order_state_key
+            result["order_state"] = order_state_snapshot
         if margin_type_result is not None:
             result["margin_type"] = margin_type_result
         if leverage_result is not None:
@@ -2621,13 +2745,22 @@ class V6BinanceClient:
             params["quantity"] = quantity or self.resolve_quantity(intent.symbol, intent.quantity_hint_usdt, intent.entry_price)
             if position_mode != "hedge":
                 params["reduceOnly"] = "true"
-        payload = self.signed_request("POST", "/fapi/v1/algoOrder", params)
-        return {
+        payload, order_state_key, order_state_snapshot = self.submit_tracked_order(
+            symbol=intent.symbol,
+            action=f"protective_stop_{'long' if intent.action == 'open_long' else 'short'}",
+            endpoint="/fapi/v1/algoOrder",
+            params=params,
+        )
+        result = {
             "status": "submitted",
             "request": {k: v for k, v in params.items() if k not in {"timestamp", "signature"}},
             "response": payload,
             "submitted_at": utc_now_iso(),
         }
+        if order_state_key:
+            result["order_state_key"] = order_state_key
+            result["order_state"] = order_state_snapshot
+        return result
 
     def protective_stop_precheck(self, intent: V6OrderIntent) -> dict[str, Any]:
         if intent.action not in {"open_long", "open_short"}:
@@ -2662,11 +2795,57 @@ class V6BinanceClient:
         }
 
     def cancel_order(self, symbol: str, order_id: int | str) -> dict[str, Any]:
-        payload = self.signed_request("DELETE", "/fapi/v1/algoOrder", {
+        tracked = self._order_state_call(
+            "ensure_external_order",
+            symbol=symbol,
+            order_id=order_id,
+            action="cancel_protective_stop",
+        ) or {}
+        order_state_key = str(tracked.get("order_key") or "")
+        if order_state_key:
+            self._order_state_call("mark_cancel_pending", order_state_key)
+        params = {
             "algoId": str(order_id),
             **self.signed_params(),
-        })
-        return {"status": "submitted", "response": payload, "submitted_at": utc_now_iso()}
+        }
+        try:
+            payload = self.signed_request("DELETE", "/fapi/v1/algoOrder", params)
+        except Exception as exc:
+            record_caught_exception(
+                LOGGER,
+                exc,
+                operation="DELETE /fapi/v1/algoOrder",
+                level=logging.WARNING,
+                symbol=symbol,
+                action="cancel_protective_stop",
+                account_id=self.config.instance_name,
+            )
+            if order_state_key:
+                snapshot = self._order_state_call(
+                    "mark_submission_exception",
+                    order_state_key,
+                    exc,
+                    operation="DELETE /fapi/v1/algoOrder",
+                )
+                try:
+                    setattr(exc, "order_state_key", order_state_key)
+                    setattr(exc, "order_state_snapshot", snapshot or {})
+                except (AttributeError, TypeError):
+                    pass
+            raise
+        snapshot = {}
+        if order_state_key:
+            snapshot = self._order_state_call(
+                "apply_exchange_response",
+                order_state_key,
+                payload if isinstance(payload, dict) else {},
+                force_state=OrderState.CANCELLED,
+            ) or {}
+        result = {"status": "submitted", "response": payload, "submitted_at": utc_now_iso()}
+        if order_state_key:
+            result["order_state_key"] = order_state_key
+            result["order_state"] = snapshot
+        return result
 
     def submit_reduce_only_close_for_unprotected_open(self, intent: V6OrderIntent, quantity: str) -> dict[str, Any]:
         close_action = "close_short" if intent.action == "open_short" else "close_long"
@@ -2684,13 +2863,22 @@ class V6BinanceClient:
             params["positionSide"] = position_side_for_action(close_action, close_side)
         else:
             params["reduceOnly"] = "true"
-        payload = self.signed_request("POST", "/fapi/v1/order", params)
-        return {
+        payload, order_state_key, order_state_snapshot = self.submit_tracked_order(
+            symbol=intent.symbol,
+            action=close_action,
+            endpoint="/fapi/v1/order",
+            params=params,
+        )
+        result = {
             "status": "submitted",
             "request": {k: v for k, v in params.items() if k not in {"timestamp", "signature"}},
             "response": payload,
             "submitted_at": utc_now_iso(),
         }
+        if order_state_key:
+            result["order_state_key"] = order_state_key
+            result["order_state"] = order_state_snapshot
+        return result
 
     def adjust_open_stop_after_fill(self, intent: V6OrderIntent, payload: Any) -> dict[str, Any] | None:
         if intent.action not in {"open_long", "open_short"}:
@@ -2915,6 +3103,17 @@ class V6ExecutionEngine:
             LOGGER.exception("V6 request-health sidecar read failed")
             return {}
         return dict(payload) if isinstance(payload, dict) else {}
+
+    def pending_order_reconciliation(self) -> list[dict[str, Any]]:
+        reader = getattr(self.client, "pending_order_reconciliation", None)
+        if not callable(reader):
+            return []
+        try:
+            payload = reader()
+        except Exception as exc:
+            record_caught_exception(LOGGER, exc, operation="pending_order_reconciliation")
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
 
     def trading_context(
         self,
@@ -3164,6 +3363,10 @@ class V6ExecutionEngine:
                     ).to_dict(),
                     "submitted_at": utc_now_iso(),
                 }
+                order_state_key = str(getattr(exc, "order_state_key", "") or "")
+                if order_state_key:
+                    failed["order_state_key"] = order_state_key
+                    failed["order_state"] = dict(getattr(exc, "order_state_snapshot", {}) or {})
                 if pre_submit_cancellation:
                     failed["pre_submit_cancelled_protective_stop"] = pre_submit_cancellation
                 if close_preflight:
@@ -3459,6 +3662,9 @@ class V6ExecutionEngine:
                                 "error": error_text,
                                 "note": "Open action raised after/around submission; exchange position reconcile was run to prevent orphaned or duplicate local positions.",
                             })
+                reconcile_tracked_order = getattr(self.client, "reconcile_tracked_order_from_result", None)
+                if callable(reconcile_tracked_order):
+                    reconcile_tracked_order(failed)
                 results.append(failed)
                 append_text_line(self.config.orders_file, json.dumps(failed, ensure_ascii=False))
         state["updated_at"] = utc_now_iso()
@@ -3478,6 +3684,7 @@ class V6ExecutionEngine:
             "symbols": self.config.symbols,
             "runtime_versions": self.runtime_versions(),
             "exchange_request_health": self.exchange_request_health(),
+            "pending_order_reconciliation": self.pending_order_reconciliation(),
             "last_ledger_reconcile": dict(state.get("last_ledger_reconcile") or {}),
             "protective_stop_required": bool(self.config.submit_protective_stop),
             "entry_thresholds": {

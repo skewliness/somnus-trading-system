@@ -205,25 +205,28 @@ def run_reconcile(*, check_only: bool, tolerance: float) -> dict[str, Any]:
                         sync_exchange_side_effects=False,
                     )
                 )
-                if not check_only and reconcile_result and reconcile_result.get("status") == "ok":
-                    state["updated_at"] = utc_now_iso()
-                    state["last_ledger_reconcile"] = {
-                        "status": "ok",
-                        "synced_at": utc_now_iso(),
-                        "script": "scripts/run_v6_ledger_reconcile.py",
-                    }
-                    atomic_write_json(config.state_file, state, lock=False)
                 local_after = summarize_local_positions(state, engine)
-
-        exchange_after = summarize_exchange_rows(engine.client.actual_position_rows(), engine.client)
-        after_mismatches = compare_local_exchange(local_after, exchange_after, tolerance=tolerance)
-        status = "ok"
-        if reconcile_result and reconcile_result.get("status") == "failed":
-            status = "failed"
-        elif after_mismatches:
-            status = "mismatch"
-        elif before_mismatches and not check_only:
-            status = "repaired"
+            exchange_after = summarize_exchange_rows(engine.client.actual_position_rows(), engine.client)
+            after_mismatches = compare_local_exchange(local_after, exchange_after, tolerance=tolerance)
+            status = "ok"
+            if reconcile_result and reconcile_result.get("status") == "failed":
+                status = "failed"
+            elif after_mismatches:
+                status = "mismatch"
+            elif before_mismatches and not check_only:
+                status = "repaired"
+            if not check_only and reconcile_result and reconcile_result.get("status") == "ok":
+                synced_at = utc_now_iso()
+                state["updated_at"] = synced_at
+                state["last_ledger_reconcile"] = {
+                    "status": status,
+                    "synced_at": synced_at,
+                    "script": "scripts/run_v6_ledger_reconcile.py",
+                    "before_mismatch_count": len(before_mismatches),
+                    "after_mismatch_count": len(after_mismatches),
+                }
+                with file_lock(config.state_file):
+                    atomic_write_json(config.state_file, state, lock=False)
         report = {
             "event": "v6_ledger_reconcile",
             "status": status,
